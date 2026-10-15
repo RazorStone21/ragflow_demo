@@ -58,6 +58,15 @@ class Settings(BaseSettings):
     demo_tenant_id: str = Field(default="demo", min_length=1, max_length=64)
     demo_user_id: str = Field(default="demo_user", min_length=1, max_length=64)
     sse_heartbeat_s: int = Field(default=15, ge=1, le=120)
+    readyz_timeout_s: float = Field(
+        default=3.0, gt=0, le=30, description="就绪探针单次检查超时（CLAUDE.md 11.6）"
+    )
+    max_question_chars: int = Field(
+        default=2000,
+        ge=1,
+        le=20000,
+        description="单次提问最大字符数（超出由 HTTP 边界拒绝，避免超长输入冲击检索与模型成本）",
+    )
 
     # --- PostgreSQL（LangGraph checkpoint / store）---
     postgres_dsn: SecretStr = Field(description="postgresql://user:pass@host:port/db")

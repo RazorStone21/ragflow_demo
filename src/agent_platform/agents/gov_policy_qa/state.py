@@ -15,6 +15,7 @@ State 只放**编排必需**的信息：对话消息、检索证据、判定元�
 
 from __future__ import annotations
 
+from enum import StrEnum
 from typing import Annotated, Any, TypedDict
 
 from langchain_core.messages import AnyMessage, HumanMessage
@@ -33,12 +34,30 @@ NODE_RETRIEVE_EVIDENCE = "retrieve_evidence"
 NODE_GENERATE_ANSWER = "generate_answer"
 NODE_ANSWER_WITHOUT_EVIDENCE = "answer_without_evidence"
 
-# 答案状态（稳定字符串，供 API 与断言使用）
-STATUS_PENDING = "pending"
-STATUS_ANSWERED = "answered"
-STATUS_INSUFFICIENT_EVIDENCE = "insufficient_evidence"
-STATUS_CITATION_MISSING = "citation_missing"
-STATUS_GUARDRAIL_BLOCKED = "guardrail_blocked"
+
+class AnswerStatus(StrEnum):
+    """答案状态（稳定枚举，供图状态、API DTO 与断言共用）。
+
+    CLAUDE.md 3.3 要求「模型与枚举集中定义、跨层复用，不得在多处重复定义同义结构」，
+    故 API 层的响应 DTO 直接引用本枚举，而非在 ``api/schemas/`` 里再写一份字面量。
+
+    ``StrEnum`` 成员与 ``str`` 相等，因此 ``GovPolicyQaState.answer_status`` 仍标注为
+    ``str``，既有节点与本仓库既有测试的字符串比较全部继续成立。
+    """
+
+    PENDING = "pending"
+    ANSWERED = "answered"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    CITATION_MISSING = "citation_missing"
+    GUARDRAIL_BLOCKED = "guardrail_blocked"
+
+
+# 既有的 STATUS_* 常量名保留为别名：节点、测试与外部导入一律不受影响
+STATUS_PENDING = AnswerStatus.PENDING
+STATUS_ANSWERED = AnswerStatus.ANSWERED
+STATUS_INSUFFICIENT_EVIDENCE = AnswerStatus.INSUFFICIENT_EVIDENCE
+STATUS_CITATION_MISSING = AnswerStatus.CITATION_MISSING
+STATUS_GUARDRAIL_BLOCKED = AnswerStatus.GUARDRAIL_BLOCKED
 
 
 def merge_evidence(current: list[EvidenceItem], update: list[EvidenceItem]) -> list[EvidenceItem]:
@@ -153,6 +172,7 @@ __all__: list[str] = [
     "STATUS_GUARDRAIL_BLOCKED",
     "STATUS_INSUFFICIENT_EVIDENCE",
     "STATUS_PENDING",
+    "AnswerStatus",
     "GovPolicyQaState",
     "initial_state",
     "latest_user_question",

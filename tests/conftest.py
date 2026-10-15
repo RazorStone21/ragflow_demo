@@ -7,15 +7,33 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import httpx
 import pytest
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.store.memory import InMemoryStore
 from pydantic import SecretStr
 
-if TYPE_CHECKING:
-    from langchain_core.messages import UsageMetadata
-
+from agent_platform.agents.gov_policy_qa.graph import build_graph
+from agent_platform.agents.gov_policy_qa.state import AGENT_NAME
+from agent_platform.api.container import AppDeps, ReadinessCheck
+from agent_platform.knowledge.retriever import REASON_NO_CANDIDATES, REASON_SUFFICIENT
+from agent_platform.knowledge.schemas import EvidenceItem, RetrievalMeta, RetrievalOutcome
+from agent_platform.main import API_PREFIX, create_app
 from agent_platform.settings import Settings
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
+    from fastapi import FastAPI
+    from langchain_core.messages import UsageMetadata
+    from langgraph.graph.state import CompiledStateGraph
+    from langgraph.store.base import BaseStore
 
 #: 会被测试污染/干扰的进程环境变量（构造 Settings 前清理）
 _ENV_VARS_TO_CLEAR = (
@@ -73,11 +91,13 @@ class FakeChatModel:
         chunks: list[str] | None = None,
         raises: BaseException | None = None,
         usage: UsageMetadata | None = None,
+        delay_s: float = 0.0,
     ) -> None:
         self.reply = reply
         self.chunks = chunks
         self.raises = raises
         self.usage = usage
+        self.delay_s = delay_s
         self.calls: list[Any] = []
         self.stream_calls: int = 0
 
@@ -105,5 +125,262 @@ class FakeChatModel:
             raise self.raises
         parts = self.chunks if self.chunks is not None else [self.reply]
         for index, part in enumerate(parts):
+            if self.delay_s:
+                await asyncio.sleep(self.delay_s)
             is_last = index == len(parts) - 1
             yield AIMessageChunk(content=part, usage_metadata=self.usage if is_last else None)
+
+
+# ---------------------------------------------------------------------------
+# RAG 场景的共享 fake 与构造器（单元测试用，全部离线且确定）
+# ---------------------------------------------------------------------------
+
+TEST_QUESTION = "新能源电价机制如何确定？"
+"""测试通用问题（与 ``tests/unit/test_agent_graph.py`` 同源，便于对照）。"""
+
+CITED_REPLY = "依据《电价办法》第3条[1]。"
+"""带合法引用的默认模型回答。
+
+必须带 ``[1]``：``generate_answer`` 在输出边界做**确定性**引用校验，
+不带引用的文本会被判为 ``citation_missing`` 并整体替换为兜底文案（NO-12）。
+默认 fake 若用无引用文本，所有"正常路径"用例都会悄悄跑在兜底分支上。
+"""
+
+
+class FakeRetriever:
+    """满足 ``Retriever`` 契约的确定性检索器。
+
+    Args:
+        outcome: 首个检索结果。
+        more: 后续调用的结果（逐个消费）；不传则每次返回 ``outcome``。
+        raises: 抛出的异常（模拟向量库/嵌入服务故障）。
+        delay_s: 每次检索前的等待时长（用于心跳等时序用例）。
+    """
+
+    def __init__(
+        self,
+        outcome: RetrievalOutcome,
+        *more: RetrievalOutcome,
+        raises: BaseException | None = None,
+        delay_s: float = 0.0,
+    ) -> None:
+        self.outcomes = [outcome, *more]
+        self.raises = raises
+        self.delay_s = delay_s
+        self.calls: list[tuple[str, str]] = []
+
+    async def search(
+        self, query: str, *, tenant_id: str, dataset_id: str | None = None
+    ) -> RetrievalOutcome:
+        """记录 ``(问题, 租户)`` 后返回预设结果（或抛出预设异常）。"""
+        del dataset_id
+        self.calls.append((query, tenant_id))
+        if self.delay_s:
+            await asyncio.sleep(self.delay_s)
+        if self.raises is not None:
+            raise self.raises
+        if len(self.outcomes) > 1:
+            return self.outcomes.pop(0)
+        return self.outcomes[0]
+
+
+def make_evidence(chunk_id: str, score: float = 0.9) -> EvidenceItem:
+    """构造一条带完整引用信息的证据（CLAUDE.md 7.4：无引用不得作为事实结论）。"""
+    return EvidenceItem(
+        chunk_id=chunk_id,
+        content=f"第 {chunk_id} 段：居民电价按年度核定并公示。",
+        score=score,
+        document_name="新能源电价政策.pdf",
+        page_numbers=[3],
+        source_uri="gov_doc/新能源电价政策.pdf",
+    )
+
+
+def sufficient_outcome(*chunk_ids: str) -> RetrievalOutcome:
+    """构造"证据充足"的检索结果（锚定 ``generate_answer`` 分支）。"""
+    evidence = [make_evidence(chunk_id) for chunk_id in (chunk_ids or ("c1",))]
+    return RetrievalOutcome(
+        evidence=evidence,
+        meta=RetrievalMeta(
+            query=TEST_QUESTION,
+            candidate_count=len(evidence),
+            evidence_count=len(evidence),
+            top_score=evidence[0].score,
+            score_threshold=0.3,
+            is_sufficient=True,
+            reason=REASON_SUFFICIENT,
+            rerank_applied=False,
+        ),
+    )
+
+
+def insufficient_outcome() -> RetrievalOutcome:
+    """构造"无证据"的检索结果（降级分支，非异常，NO-12）。"""
+    return RetrievalOutcome(
+        evidence=[],
+        meta=RetrievalMeta(
+            query=TEST_QUESTION,
+            candidate_count=0,
+            evidence_count=0,
+            top_score=None,
+            score_threshold=0.3,
+            is_sufficient=False,
+            reason=REASON_NO_CANDIDATES,
+            rerank_applied=False,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# API 层装配（CLAUDE.md 9.3：单测用内存实现走真实启停路径，不触碰外部服务）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ApiStack:
+    """一套内存版应用装配。
+
+    ``store`` 用内存实现而非 Postgres：单测不依赖外部服务（CLAUDE.md 9.3）；
+    幂等命名空间与租户隔离的**语义**仍逐字复用生产实现（``api/idempotency.py``）。
+    """
+
+    settings: Settings
+    graph: CompiledStateGraph[Any, Any, Any, Any]
+    store: BaseStore
+    retriever: Any
+    """注入的检索器（fake）；类型为 Any 是因为 ``AppDeps`` 声明的是具体 ``Retriever``。"""
+    chat: Any
+    """注入的模型（fake）；同上。"""
+    agent_name: str
+    readiness_checks: tuple[ReadinessCheck, ...]
+
+
+def build_api_stack(
+    settings: Settings,
+    *,
+    retriever: Any = None,
+    chat: Any = None,
+    readiness_checks: tuple[ReadinessCheck, ...] | None = None,
+) -> ApiStack:
+    """装配一套内存版依赖：内存 checkpointer + 内存 store + fake 检索器/模型。
+
+    ``InMemorySaver`` 仅供单测（NO-08：生产长流程必须 PostgresSaver）。
+    """
+    resolved_retriever = retriever if retriever is not None else FakeRetriever(sufficient_outcome())
+    resolved_chat = chat if chat is not None else FakeChatModel(CITED_REPLY)
+    store = InMemoryStore()
+    graph = build_graph(
+        retriever=resolved_retriever,  # type: ignore[arg-type]  # 注入 fake（CLAUDE.md 9.3）
+        chat=resolved_chat,
+        chat_logical_name=settings.primary_chat_model,
+        checkpointer=InMemorySaver(),
+        store=store,
+        guardrail=None,
+    )
+    if readiness_checks is None:
+        readiness_checks = (ReadinessCheck(name="postgres", probe=_always_ready),)
+    return ApiStack(
+        settings=settings,
+        graph=graph,
+        store=store,
+        retriever=resolved_retriever,
+        chat=resolved_chat,
+        agent_name=AGENT_NAME,
+        readiness_checks=readiness_checks,
+    )
+
+
+async def _always_ready() -> None:
+    """恒通过的就绪探针（默认值）。"""
+    return
+
+
+def build_test_app(stack: ApiStack) -> FastAPI:
+    """用给定装配构造 ASGI 应用（走真实 ``create_app`` 与 lifespan）。"""
+
+    @asynccontextmanager
+    async def _deps(_settings: Settings) -> AsyncIterator[AppDeps]:
+        # 忽略传入的 settings：容器里已持有同一份，避免出现两个配置来源
+        del _settings
+        yield AppDeps(
+            settings=stack.settings,
+            graph=stack.graph,
+            store=stack.store,
+            agent_name=stack.agent_name,
+            retriever=stack.retriever,
+            chat=stack.chat,
+            chat_logical_name=stack.settings.primary_chat_model,
+            guardrail=None,
+            readiness_checks=stack.readiness_checks,
+        )
+
+    return create_app(settings=stack.settings, deps_factory=_deps)
+
+
+@dataclass
+class ApiHarness:
+    """已启动的测试客户端与其背后的装配。"""
+
+    client: httpx.AsyncClient
+    stack: ApiStack
+    app: FastAPI
+
+    @property
+    def auth_headers(self) -> dict[str, str]:
+        """合法 Bearer 头（租户由服务端配置解析，不由前端传入，NO-19）。"""
+        return {
+            "Authorization": f"Bearer {self.stack.settings.agent_api_bearer_token.get_secret_value()}"
+        }
+
+    async def create_thread(self) -> str:
+        """经 API 创建一个真实会话（走 POST /threads + 鉴权），返回 thread_id。"""
+        response = await self.client.post(f"{API_PREFIX}/threads", headers=self.auth_headers)
+        assert response.status_code == 201, response.text
+        return str(response.json()["thread_id"])
+
+
+OpenApi = Callable[..., AbstractAsyncContextManager["ApiHarness"]]
+"""``api_factory`` 返回的开启器签名（供测试文件标注用）。"""
+
+
+@pytest.fixture
+def api_factory(fake_settings: Settings) -> OpenApi:
+    """返回一个开启器：``async with api_factory(...) as api:``。
+
+    走真实 lifespan（``app.router.lifespan_context``）——``httpx.ASGITransport``
+    **不会**自动运行 lifespan，不显式进入就会得到 `/readyz` 500（deps 未注入）。
+
+    传输层固定 ``raise_app_exceptions=False``：Starlette 的 ``ServerErrorMiddleware``
+    在调用 500 处理器之后**仍会重新抛出**异常，为 True 时断言到的是异常而非响应。
+    """
+
+    @asynccontextmanager
+    async def _open(
+        *,
+        settings: Settings | None = None,
+        retriever: Any = None,
+        chat: Any = None,
+        readiness_checks: tuple[ReadinessCheck, ...] | None = None,
+    ) -> AsyncIterator[ApiHarness]:
+        resolved = settings if settings is not None else fake_settings
+        stack = build_api_stack(
+            resolved, retriever=retriever, chat=chat, readiness_checks=readiness_checks
+        )
+        app = build_test_app(stack)
+        transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(
+                transport=transport, base_url="http://testserver", timeout=30.0
+            ) as client,
+        ):
+            yield ApiHarness(client=client, stack=stack, app=app)
+
+    return _open
+
+
+@pytest.fixture
+async def api(api_factory: OpenApi) -> AsyncIterator[ApiHarness]:
+    """默认装配的已启动客户端（多数用例只需这一个）。"""
+    async with api_factory() as harness:
+        yield harness
