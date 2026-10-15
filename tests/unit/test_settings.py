@@ -10,7 +10,9 @@ from agent_platform.settings import Settings, load_settings
 _REQUIRED = ("AGENT_API_BEARER_TOKEN", "POSTGRES_DSN", "LITELLM_API_KEY", "RAGFLOW_API_KEY")
 
 
-def test_missing_required_env_fails_fast_with_variable_names(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_missing_required_env_fails_fast_with_variable_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """缺失必填项时抛 ConfigurationError，且错误信息列出全部缺失变量名。"""
     for name in _REQUIRED:
         monkeypatch.delenv(name, raising=False)

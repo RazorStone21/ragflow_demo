@@ -58,6 +58,7 @@ def build_retry(
     *,
     initial_wait_s: float = 0.5,
     max_wait_s: float = 20.0,
+    retryable: Callable[[BaseException], bool] = is_retryable,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """构造 tenacity 重试装饰器（指数退避 + 抖动 + 有界）。
 
@@ -65,13 +66,16 @@ def build_retry(
         max_attempts: 总尝试次数（含首次；<1 时按 1 处理）。
         initial_wait_s: 首次退避基准秒数。
         max_wait_s: 单次退避上限秒数。
+        retryable: 判定异常是否可重试的谓词；默认 ``is_retryable``。
+            仅当某类下游异常无法用 HTTP 语义表达时（如 pymilvus 的
+            ``MilvusException``）才传入定制谓词，且必须保证被重试的操作幂等。
 
     Returns:
         可用于同步或异步函数的 ``tenacity`` 重试装饰器；重试耗尽后重抛原异常
         （``reraise=True``），由调用方转换为平台异常。
     """
     return tenacity.retry(
-        retry=tenacity.retry_if_exception(is_retryable),
+        retry=tenacity.retry_if_exception(retryable),
         wait=tenacity.wait_exponential_jitter(
             multiplier=initial_wait_s, max=max_wait_s, jitter=initial_wait_s
         ),

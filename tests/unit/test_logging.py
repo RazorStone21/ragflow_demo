@@ -35,8 +35,13 @@ def test_renders_single_line_json_with_standard_fields() -> None:
 def test_context_fields_injected_via_contextvar() -> None:
     """request_id/thread_id/tenant_id/run_id 经上下文注入到输出。"""
     record = logging.LogRecord(
-        name="test.logger", level=logging.INFO, pathname=__file__, lineno=1,
-        msg="x", args=(), exc_info=None,
+        name="test.logger",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="x",
+        args=(),
+        exc_info=None,
     )
     with log_context(request_id="req-9", thread_id="t:u:s", tenant_id="tenant_a"):
         payload = _render(record)
@@ -49,8 +54,13 @@ def test_context_fields_injected_via_contextvar() -> None:
 def test_context_restored_after_block() -> None:
     """离开上下文后字段不残留（避免跨请求串号）。"""
     record = logging.LogRecord(
-        name="test.logger", level=logging.INFO, pathname=__file__, lineno=1,
-        msg="x", args=(), exc_info=None,
+        name="test.logger",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="x",
+        args=(),
+        exc_info=None,
     )
     with log_context(request_id="req-a"):
         pass
@@ -60,8 +70,13 @@ def test_context_restored_after_block() -> None:
 def test_sensitive_extra_keys_are_redacted() -> None:
     """键名含 key/token/secret/password 的额外字段不得落盘。"""
     record = logging.LogRecord(
-        name="test.logger", level=logging.INFO, pathname=__file__, lineno=1,
-        msg="gateway call", args=(), exc_info=None,
+        name="test.logger",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="gateway call",
+        args=(),
+        exc_info=None,
     )
     record.api_key = "sk-real-secret-value"  # 模拟第三方库写入的敏感 extra 字段
     record.duration_ms = 12.5

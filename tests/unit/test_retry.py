@@ -21,7 +21,7 @@ def _http_status_error(status_code: int) -> httpx.HTTPStatusError:
     return httpx.HTTPStatusError(f"status {status_code}", request=request, response=response)
 
 
-class TimeErrorWithStatus(Exception):
+class TimeErrorWithStatus(Exception):  # noqa: N818  # 模拟第三方 SDK 的异常类名，不入本仓异常层级
     """模拟第三方 SDK 异常（带 status_code 属性）。"""
 
     def __init__(self, status_code: int) -> None:

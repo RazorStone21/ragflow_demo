@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -49,9 +48,9 @@ def fake_settings() -> Settings:
 
 
 @pytest.fixture
-def anyio_backend() -> Iterator[str]:
+def anyio_backend() -> str:
     """pytest-asyncio 场景下的后端占位（保持与 anyio 生态兼容）。"""
-    yield "asyncio"
+    return "asyncio"
 
 
 class FakeChatModel:
@@ -62,7 +61,8 @@ class FakeChatModel:
         self.raises = raises
         self.calls: list[Any] = []
 
-    async def ainvoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:
+    # LangChain Runnable 协议规定入参名为 input，此处必须同名（同 core/models.py）
+    async def ainvoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:  # noqa: A002
         """记录调用并返回固定 AIMessage（或抛出预设异常）。"""
         from langchain_core.messages import AIMessage
 
