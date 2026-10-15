@@ -1,0 +1,38 @@
+# 行尾与文本规范化（CLAUDE.md 12.3）。
+#
+# 背景：本仓库原先只有 `core.autocrlf=true` 且无本文件，于是检出时被转成 CRLF，
+# 而 pre-commit 的 `mixed-line-ending --fix=lf` 又把混合行尾的文件改回 LF——两者
+# 互相拉扯，表现为**每次 git 操作都打 `LF will be replaced by CRLF` 警告**，且
+# 工作区里纯 CRLF 与纯 LF 混杂。本文件把行尾定死为 LF，消除这种不确定性。
+#
+# 统一为 LF 而不是 CRLF 的理由：LF 是 git 仓库的存储格式，也是 CI（Linux 容器）
+# 与绝大多数工具链的默认；若选 CRLF，则容器内构建与脚本执行会引入额外转换。
+# `text=auto` 让 git 自行识别文本/二进制，避免把二进制当文本改写。
+
+* text=auto eol=lf
+
+# 明确标记为二进制：不参与行尾与编码转换（NO-17 已禁止大体积二进制入库，
+# 但语料/图标等小文件仍可能出现，显式声明以免被当成文本处理损坏内容）。
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.zip   binary
+*.gz    binary
+*.7z    binary
+*.xlsx  binary
+*.docx  binary
+*.pptx  binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary
+*.otf   binary
+
+# Windows 批处理脚本必须保持 CRLF，否则 cmd.exe 解析会出错。
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+
+# 脚本类文件强制 LF 且标记为可执行意图（避免在容器内因 CRLF 报 `bad interpreter`）。
+*.sh    text eol=lf

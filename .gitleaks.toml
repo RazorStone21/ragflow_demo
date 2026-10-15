@@ -1,0 +1,25 @@
+# 密钥扫描配置（CLAUDE.md 12.3 / NO-17）。
+#
+# 原则：**只继承官方默认规则集，不新增、不削減任何检测规则**——本文件唯一的职责是
+# 排除依赖目录，避免在全量扫描时被第三方包自带的测试向量刷屏。
+# 若将来需要在此放宽某条规则，等同安全策略变更，须按 CLAUDE.md 12.3 会签。
+#
+# 为什么用复数段名 `[[allowlists]]`：
+# 官方 README 明确记载「In v8.25.0 `[allowlist]` was replaced with `[[allowlists]]`」，
+# 且该变更向后兼容（旧写法仍被接受）。本仓库锁定 gitleaks 8.30.1，故采用现行写法。
+# 注意 gitleaks **不校验未知段名**（实测：写入不存在的段名不报错、静默忽略），
+# 因此不能靠"没报错"来判断写法正确——写法以官方 README 为准。
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """
+依赖目录不参与扫描。.venv 内是第三方包自带的**测试向量**，会命中
+generic-api-key 的熵规则：numpy 的 MT19937 随机数用例（numpy/random/tests/
+test_generator_mt19937.py）与 protobuf 的序列化描述符
+（google/protobuf/descriptor_pb2.py），实测共 7 处误报、0 处真实密钥。
+这些文件已被 .gitignore 排除，永远不会进入提交，也就不可能经 git 外泄；
+对本仓库自有文件的扫描不受影响。
+"""
+paths = ['''\.venv/''']
