@@ -1,0 +1,47 @@
+# --- 密钥与环境（NO-17：.env 严禁入库，只提交 .env.example）---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.hypothesis/
+
+# --- uv ---
+.uv/
+uv.toml
+
+# --- 本地数据与运行时产物（语料、索引、备份均不入库）---
+data/
+*.db
+*.sqlite3
+local_data/
+artifacts/
+
+# --- IDE / 编辑器 ---
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- OS ---
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- 日志 ---
+*.log
+logs/

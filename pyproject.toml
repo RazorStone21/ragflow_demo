@@ -1,0 +1,146 @@
+[project]
+name = "agent-platform"
+version = "0.1.0"
+description = "企业级智能体平台 — RAG 主线（RAGFlow 文档工程 + Milvus 检索主链路）"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "Proprietary" }
+dependencies = [
+    # 编排主干（CLAUDE.md 技术栈锁定：LangGraph 1.x）
+    "langgraph>=1.2.15,<1.3",
+    "langgraph-checkpoint-postgres>=3.2.0,<3.3",
+    "langchain-openai>=1.7.2,<2",
+    # HTTP API 与流式
+    "fastapi>=0.143.1",
+    "uvicorn[standard]>=0.34",
+    "sse-starlette>=3.5.0,<4",
+    # 数据校验与配置
+    "pydantic>=2.14.1,<3",
+    "pydantic-settings>=2.16.0,<3",
+    # 外部调用
+    "httpx>=0.28.1,<0.29",
+    "tenacity>=9.2.1,<10",
+    "pymilvus>=2.6,<2.7",
+    "psycopg[binary,pool]>=3.2,<4",
+    # Prompt 模板资产化（CLAUDE.md 5.5）
+    "jinja2>=3.1,<4",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14",
+    "mypy>=1.14",
+    "pytest>=8.3",
+    "pytest-asyncio>=1.0",
+    "pytest-cov>=6",
+    "pre-commit>=4",
+]
+
+[tool.uv.workspace]
+# 预留子包位（CLAUDE.md 2.1 uv workspace monorepo）；当前为单包，不得在无 ADR 时拆分
+members = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_platform"]
+
+# ---------------------------------------------------------------------------
+# ruff：唯一格式与 lint 标准（CLAUDE.md 3.1，行宽 100）
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts"]
+# 文档（含 CLAUDE.md 最高规范与 ADR）中的示例代码块属说明性内容，不参与格式化；
+# 且 CLAUDE.md 为只读文件，不得被工具改写。
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "N",    # pep8-naming（CLAUDE.md 3.4 命名规范）
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "A",    # builtins 遮蔽检查
+    "C4",   # comprehensions
+    "DTZ",  # 强制 aware datetime（CLAUDE.md 3.1 UTC 要求）
+    "T10",  # 调试器遗留检查
+    "T20",  # 禁止 print（NO-07）
+    "PT",   # pytest 风格
+    "SIM",  # 简化建议
+    "RUF",
+]
+ignore = [
+    # 中文文档字符串与注释场景下放宽行长限制
+    "E501",
+    # 中文项目：中文全角标点（（）、，。：等）为正常书写，非"易混淆字符"
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+# ---------------------------------------------------------------------------
+# mypy：core/agents/api 为严格级（CLAUDE.md 3.1）
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+mypy_path = "src"
+namespace_packages = true
+explicit_package_bases = true
+# scripts/ 目录在 Phase 5 写入脚本后纳入（空目录会让 mypy 报错）
+files = ["src/agent_platform", "tests"]
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+strict_equality = true
+check_untyped_defs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+warn_return_any = true
+
+[[tool.mypy.overrides]]
+module = ["agent_platform.core.*", "agent_platform.agents.*", "agent_platform.api.*"]
+strict = true
+
+[[tool.mypy.overrides]]
+# 第三方库缺失类型标注时的受控放宽（仅限这些库，不得扩大）
+module = ["pymilvus.*", "langgraph.checkpoint.postgres.*", "jinja2.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# pytest：单元快而确定；集成由 env 门控（CLAUDE.md 9.3）
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = "-q --strict-markers"
+markers = [
+    "integration: 需要真实基础设施（compose 起 Postgres/Milvus/RAGFlow/LiteLLM）",
+]
+
+[tool.coverage.run]
+source = ["src/agent_platform"]
+omit = ["src/agent_platform/evaluation/*"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+]
