@@ -9,9 +9,10 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any, Protocol, runtime_checkable
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_openai import ChatOpenAI
 
@@ -32,6 +33,20 @@ class ChatModel(Protocol):
         **kwargs: Any,
     ) -> AIMessage:
         """异步调用模型并返回 ``AIMessage``。"""
+        ...
+
+    def astream(
+        self,
+        input: Any,  # noqa: A002  # 同上：与 LangChain Runnable 协议签名保持一致
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[AIMessageChunk]:
+        """异步流式调用模型，逐块产出 ``AIMessageChunk``（CLAUDE.md 4.7）。
+
+        Note:
+            声明为普通 ``def`` 返回异步迭代器（而非 ``async def``），与
+            LangChain ``Runnable.astream`` 及异步生成器实现均兼容。
+        """
         ...
 
 
@@ -107,3 +122,20 @@ class _RunnableChatModelAdapter:
             msg = f"聊天模型返回了非 AIMessage 类型: {type(result).__name__}"
             raise TypeError(msg)
         return result
+
+    async def astream(
+        self,
+        input: Any,  # noqa: A002  # 同上：与 LangChain Runnable 协议签名保持一致
+        config: RunnableConfig | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[AIMessageChunk]:
+        """流式调用底层 Runnable（主模型失败时由 ``with_fallbacks`` 切换备选）。
+
+        Raises:
+            TypeError: 底层产出非 ``AIMessageChunk``——契约破坏，显式失败而非静默丢弃。
+        """
+        async for chunk in self._runnable.astream(input, config=config, **kwargs):
+            if not isinstance(chunk, AIMessageChunk):
+                msg = f"聊天模型流式返回了非 AIMessageChunk 类型: {type(chunk).__name__}"
+                raise TypeError(msg)
+            yield chunk

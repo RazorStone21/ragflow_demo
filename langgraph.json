@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "gov_policy_qa": "./src/agent_platform/agents/gov_policy_qa/graph.py:build_graph"
+  },
+  "env": ".env"
+}

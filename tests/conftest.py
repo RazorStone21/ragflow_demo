@@ -7,10 +7,13 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from pydantic import SecretStr
+
+if TYPE_CHECKING:
+    from langchain_core.messages import UsageMetadata
 
 from agent_platform.settings import Settings
 
@@ -54,12 +57,29 @@ def anyio_backend() -> str:
 
 
 class FakeChatModel:
-    """满足 ``ChatModel`` 协议的最小 fake（返回固定文本，可注入异常）。"""
+    """满足 ``ChatModel`` 协议的最小 fake（固定文本，可注入异常，支持流式）。
 
-    def __init__(self, reply: str = "测试回答", *, raises: BaseException | None = None) -> None:
+    Args:
+        reply: ``ainvoke`` 返回的整段文本，也是 ``astream`` 默认切块的原文。
+        chunks: 自定义流式分块；``None`` 时按句号切分 ``reply``。
+        raises: ``ainvoke``/``astream`` 抛出的异常（模拟网关故障）。
+        usage: 末块携带的 token 用量（模拟网关返回）。
+    """
+
+    def __init__(
+        self,
+        reply: str = "测试回答",
+        *,
+        chunks: list[str] | None = None,
+        raises: BaseException | None = None,
+        usage: UsageMetadata | None = None,
+    ) -> None:
         self.reply = reply
+        self.chunks = chunks
         self.raises = raises
+        self.usage = usage
         self.calls: list[Any] = []
+        self.stream_calls: int = 0
 
     # LangChain Runnable 协议规定入参名为 input，此处必须同名（同 core/models.py）
     async def ainvoke(self, input: Any, config: Any = None, **kwargs: Any) -> Any:  # noqa: A002
@@ -70,3 +90,20 @@ class FakeChatModel:
         if self.raises is not None:
             raise self.raises
         return AIMessage(content=self.reply)
+
+    async def astream(
+        self,
+        input: Any,  # noqa: A002  # LangChain Runnable 协议规定入参名，同 ainvoke
+        config: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        """按分块产出 ``AIMessageChunk``（模拟逐 token 流）。"""
+        from langchain_core.messages import AIMessageChunk
+
+        self.stream_calls += 1
+        if self.raises is not None:
+            raise self.raises
+        parts = self.chunks if self.chunks is not None else [self.reply]
+        for index, part in enumerate(parts):
+            is_last = index == len(parts) - 1
+            yield AIMessageChunk(content=part, usage_metadata=self.usage if is_last else None)

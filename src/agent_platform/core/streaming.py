@@ -9,6 +9,11 @@
     data: {"type":"retrieval.evidence","seq":3,...}
 
     : ping            <- 心跳注释帧
+
+分层职责：
+- **节点**（``agents/``）在运行期用 ``AgentStreamEvent`` 经 LangGraph 的 ``StreamWriter``
+  推送业务事件（``core``，与 SSE 线格式解耦，便于单测）；
+- **API 层**（``api/``）把自定义流块映射为带 ``seq`` 的 ``SseEvent`` 帧发出。
 """
 
 from __future__ import annotations
@@ -56,6 +61,28 @@ class SseEvent(BaseModel):
 def heartbeat_frame() -> str:
     """SSE 保活注释帧（CLAUDE.md 8.4 心跳要求）。"""
     return ": ping\n\n"
+
+
+class AgentStreamEvent(BaseModel):
+    """节点推送到 LangGraph 自定义流的事件（节点 ↔ API 的唯一流契约）。
+
+    节点不感知 SSE 线格式（``seq``/``request_id`` 由 API 层补齐），只声明
+    "发生了什么业务事件"，因此可在单测中直接断言事件序列（CLAUDE.md 9.3）。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    event: SseEventType = Field(description="标准事件类型（CLAUDE.md 8.4 枚举，不得自造）")
+    data: dict[str, Any] = Field(default_factory=dict, description="事件负载")
+
+    def to_chunk(self) -> dict[str, Any]:
+        """转为 LangGraph ``StreamWriter`` 可序列化的流块。"""
+        return {"event": self.event.value, "data": self.data}
+
+
+def noop_stream_writer(_: Any) -> None:
+    """空操作写入器：节点被直接调用（单测）时的 ``writer`` 默认值。"""
+    return
 
 
 class SseEmitter:
