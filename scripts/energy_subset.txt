@@ -1,0 +1,47 @@
+# 入库子集白名单（能源/电力政策专题，首批 20 份）
+#
+# 格式约定（由 scripts/ingest.py 的 --subset 读取）：
+#   - 每行一个**文件名**（不含目录），相对于 --source 指定的语料根目录；
+#   - `#` 开头为注释，空行忽略；文件名按 UTF-8 精确匹配，不做模糊匹配；
+#   - 未出现在本清单中的文件不上传、不解析、不入库。
+#
+# 选型依据（2026-10-15 对 e:\BaiduNetdiskDownload\gov_doc 实测复核，非臆测）：
+#   1. 主题聚焦"电力市场 / 电价机制 / 新能源消纳 / 新型电力系统"——同一主题簇内
+#      文档互相引用（如容量电价 ↔ 现货市场 ↔ 中长期交易），便于演示多跳问答与
+#      冲突/差异对比，也便于构造黄金集；
+#   2. **全部为文本型 PDF（有文本层，无需 OCR）**：逐一检查过 /Font 与 /Image 标记，
+#      解析快、无扫描件，适配 16GB 单机演示环境；
+#   3. 单文件均 < 600KB（最大 1.2MB），规避了 100MB 级的报告类文件
+#      （如 0006 绿色电力证书发展报告 100MB、0042 核电发展报告 5.5MB、
+#      0100 电力市场发展报告 3.0MB）——它们解析慢且非首批必需；
+#   4. **已排除重复文件**：0039 与 0040 内容**完全相同（md5 一致：8e4ffdfd…）**，
+#      仅文件名不同，只保留 0039；重复入库会在检索结果里产生同源冗余证据；
+#   5. 保留 1 份表格文件（0030 贵州电网销售电价表.xlsx），用于验证 RAGFlow 的
+#      多格式解析链路（表格 → 结构化文本），避免只测 PDF 单一路径；
+#   6. 语料本身**不入库**（NO-17），本清单只记录文件名，不复制文件内容。
+#
+# 首批范围之外：其余 ~190 份文件多为项目申报表、比选公告、名单公示等**非政策文本**，
+# 以及天然气/核能/氢能等旁支主题，留待后续按需扩容（改本文件即可，无需改代码）。
+#
+# --- 国家级政策（电力市场与电价机制主线，17 份）---
+0001.china-accelerating-new-power-system-construction-action-plan-2024-cn.pdf
+0002.china-cross-province-transmission-price-notice-2018-cn.pdf
+0009.china-national-unified-power-market-evaluation-system-notice-2025-cn.pdf
+0033.china-national-unified-power-market-implementation-opinions-2026-cn.pdf
+0035.china-new-energy-nearby-consumption-price-mechanism-notice-2025-cn.pdf
+0037.china-new-energy-storage-power-market-scheduling-notice-2022-cn.pdf
+0039.china-new-power-system-15th-five-year-plan-2026-cn.pdf
+0041.china-non-fossil-energy-power-consumption-accounting-guide-2025-cn.pdf
+0095.china-power-generation-side-capacity-price-mechanism-notice-2026-cn.pdf
+0096.china-power-grid-enterprise-proxy-power-purchase-arrangements-notice-2021-cn.pdf
+0097.china-power-grid-enterprise-proxy-power-purchase-notice-2022-cn.pdf
+0110.china-power-market-metering-settlement-rules-2022-cn.pdf
+0111.china-power-medium-long-term-market-basic-rules-2025-cn.pdf
+0116.china-power-spot-market-construction-guideline-2025-cn.pdf
+0119.china-power-system-reform-plan-2002-cn.pdf
+0123.china-power-system-regulation-capability-optimization-action-plan-2025-cn.pdf
+0125.china-renewable-energy-15th-five-year-plan-2026-cn.pdf
+# --- 贵州省级落地文件（机制电价竞价结果 + 电网销售电价表，3 份）---
+0023.贵州省2026年新能源增量项目机制电价竞价结果清单（风电项目）.pdf
+0061.贵州省2026年新能源增量项目机制电价竞价结果清单（光伏项目）.pdf
+0030.贵州省电网销售电价表.xlsx
