@@ -28,6 +28,7 @@ from agent_platform.evaluation.schemas import (
     CaseResult,
     EvalLayer,
     GoldenCase,
+    JudgeSnapshot,
     MetricName,
     MetricVerdict,
 )
@@ -87,13 +88,43 @@ def _result(*, answer: str = "基准价为 0.3515 元/千瓦时 [1]。") -> Case
     )
 
 
-def _judge(tmp_path: Path, model: Any) -> Judge:
-    return Judge(model, logical_name="judge", cache_dir=tmp_path / "cache")
+def _judge(tmp_path: Path, model: Any, *, max_tokens: int | None = None) -> Judge:
+    """构造裁判。``max_tokens`` 不传即用生产默认值——不在这里另写一份默认数字，
+    否则改了 ``Judge`` 的默认，测试仍会照旧通过。"""
+    if max_tokens is None:
+        return Judge(model, logical_name="judge", cache_dir=tmp_path / "cache")
+    return Judge(model, logical_name="judge", cache_dir=tmp_path / "cache", max_tokens=max_tokens)
 
 
 _FAITHFUL_OK = '{"claims": [{"claim": "基准价为 0.3515", "supported": true}], "reason": "有支撑"}'
 _RELEVANCY_OK = '{"score": 0.9, "reason": "正面回答"}'
 _NOT_JSON = "这不是 JSON，只是模型的散文。"
+
+
+# ---------------------------------------------------------------------------
+# 快照：改配置必须留痕（D9）
+# ---------------------------------------------------------------------------
+def test_snapshot_records_the_output_budget(tmp_path: Path) -> None:
+    """裁判输出上限必须进快照。
+
+    D8 修复时把上限从 1024 提到 4096，而快照里没有这一栏——于是一次真实的
+    门禁参数变更在任何对比报告里都不可见。这里钉住它。
+    """
+    judge = _judge(tmp_path, _ScriptedModel(_FAITHFUL_OK), max_tokens=2048)
+    snapshot = judge.snapshot()
+    assert snapshot.max_tokens == 2048
+    assert snapshot.temperature == 0.0  # 其余留痕项不因新增字段而丢失
+    assert snapshot.prompt_version
+
+
+def test_old_artifact_without_max_tokens_reads_as_unrecorded() -> None:
+    """本字段引入前落盘的产物解析为 ``None``（未记录），**不是**某个默认数字。
+
+    给个默认数字等于替旧产物编一个它从没记过的值：对比时那条"漂移"就分不清
+    是真改了上限还是老产物压根没记过。
+    """
+    snapshot = JudgeSnapshot.model_validate({"backend": "in-house", "temperature": 0.0})
+    assert snapshot.max_tokens is None
 
 
 # ---------------------------------------------------------------------------

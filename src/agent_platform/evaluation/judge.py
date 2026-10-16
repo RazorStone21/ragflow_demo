@@ -368,11 +368,19 @@ class Judge:
         return self._logical_name
 
     def snapshot(self) -> JudgeSnapshot:
-        """本次裁判配置的快照（写进产物，保证分数可追溯到"哪版裁判"）。"""
+        """本次裁判配置的快照（写进产物，保证分数可追溯到"哪版裁判"）。
+
+        ``max_tokens`` 一并记录（2026-10-17 补）：它是 D8 的诱因之一，而"输出上限"
+        这种旋钮**改了不会体现在任何一处分数上**——只有当某条样例恰好被截断、
+        从 ``pass`` 变成 ``error`` 时才会显形，而那时离"该改哪一个参数"已经隔了
+        一次排查。记进快照后，改上限会在下一次 ``--baseline`` 对比里报成一条配置
+        漂移，与改提示词、改温度同等可见（tests/evals/README.md 第五节 D9）。
+        """
         return JudgeSnapshot(
             backend="in-house",
             library_version="",
             temperature=0.0,
+            max_tokens=self._max_tokens,
             prompt_version="+".join(JUDGE_PROMPT_NAMES),
             caveat=SAME_SOURCE_CAVEAT,
         )

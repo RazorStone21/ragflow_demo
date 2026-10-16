@@ -304,6 +304,15 @@ class JudgeSnapshot(BaseModel):
     backend: str = Field(default="", description="裁判实现，如 in-house 或 ragas")
     library_version: str = Field(default="", description="裁判库版本；自研时为空")
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    max_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "裁判单次输出上限。它是 D8 的诱因之一（1024 → 4096），故与分数一并留痕："
+            "改它等于改「测量失败」的发生频率，不记就无法在对比里看见。"
+            "None = 未记录（本字段引入前落盘的旧产物），**不得**当作 0 使用"
+        ),
+    )
     prompt_version: str = Field(default="", description="裁判提示词文件名（版本化资产，§5.5）")
     caveat: str = Field(
         default="",

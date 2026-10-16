@@ -233,6 +233,7 @@ tests/evals/
 | **D6** | `Gate.ok` 不计入 `insufficient_samples` | 窄跑恰好框进一条样例时，`refusal_correctness` 会以"1.0 满分／1 条样本"的姿态报**达标**——正是 `[min_samples]` 要拦的假绿 | `Gate.ok` 同时看 `breaches` 与 `insufficient_samples`；三处渲染文案统一 |
 | **D7** | `_parse_metric_map(cast=int)` 静默截断 `3.5 → 3`，且接受 `0` / `-1`；阈值本身也不校验范围 | `min_samples = -1` 使下限恒真（`count < -1` 永远为假），一个敲错的负号就让某条指标**无声退出所有门禁** | `_parse_min_samples` 要求正整数并挡下 `bool`；阈值限定在 `[0,1]` |
 | **D8** | 裁判输出两次都解析不出结构时，`_unparseable_outcome` 记 `FAIL` + `score=0.0` | **一次测量故障伪装成一次质量回归**：首次真实 `--baseline` 对比里，`boundary-market-evaluation-arrangement` 的 `faithfulness` 被记成 `0.0000`，聚合分从 0.9392 被压低到 0.8770（Δ −0.0622），报告读作"跌破"，该样例还进了"新失败样例"——而模型什么都没做错。根因之一：`max_tokens=1024` 偏小，1138 字的答案让裁判 JSON 在半途被截断（"括号未配平"） | 新增 `MetricVerdict.ERROR`（不带分数、不计入聚合，但样例照样判不通过）；`Gate.measurement_failures` 与"跌破"分列；`max_tokens` 提到 4096；`tests/unit/test_evaluation_judge.py` 用 fake `ChatModel` 把裁判的每一条出口跑一遍（该模块原先**整份豁免覆盖率**，失败路径一条都没被执行过，现为 95% 且已取消豁免） |
+| **D9** | `JudgeSnapshot` 不记 `max_tokens`（原列在 §5.3 的缺口） | D8 的修复把上限从 1024 提到 4096，而快照里没有这一栏——一次**门禁参数变更在任何对比报告里都不可见**。它只在"某条样例恰好被截断、`pass` 变 `error`"时显形，而那时离"该改哪个参数"已经隔了一次排查 | 新增 `JudgeSnapshot.max_tokens`，由 `Judge.snapshot()` 写入实际值；`None` 专表"本字段引入前落盘的产物"，**不给默认数字**（默认值等于替旧产物编一个它从未记过的值，漂移报告就分不清"真改了上限"与"旧产物没记过"）。`tests/unit/test_evaluation_judge.py` 钉住写入与"旧产物解析为 `None`"两条 |
 
 ### 5.3 仍然存在的缺口
 
@@ -246,7 +247,6 @@ tests/evals/
 | **分路检索分数未采集** | Milvus `hybrid_search` + `WeightedRanker` 只返回融合分 | `vector_score` / `bm25_score` 结构性为 `None`。取分需改检索形态，属 NO-16 管辖的变更，**先有基线再动** |
 | **间接注入只做提示词卫生** | 未写 Milvus 对抗夹具 | 端到端验证需向 `eval_tenant` upsert 合成毒化切片（会写库），默认不做 |
 | **裁判指标有逐轮噪声** | 生成侧 `temperature` 非 0，两轮答案文本不同（实测 `faithfulness` 抖动 −0.06） | `--baseline` 的裁判指标 Δ **不能直接读成质量变化**；详见 5.4 的四条硬约束 |
-| **裁判快照不含 `max_tokens`** | `JudgeSnapshot` 只记 `backend` / `library_version` / `temperature` / `prompt_version` / `caveat`，而输出上限正是 D8 的诱因之一（1024 → 4096） | 它**不影响解析成功时的分数**，只影响"测量失败"发生的频率，而失败本身在报告里可见，故影响有界。但改它**不会**触发配置漂移告警——补进快照要新增字段，那会让已入库的首份基线凭空报一条漂移（D5 的同类副作用），故留待下一轮基线更新时一并做 |
 
 ### 5.4 裁判指标的逐轮噪声（**实测，读对比表前必看**）
 
