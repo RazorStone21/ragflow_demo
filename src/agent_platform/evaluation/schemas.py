@@ -292,7 +292,15 @@ class CorpusSnapshot(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     collection: str = Field(min_length=1)
-    chunk_count: int = Field(ge=0, description="评测时可检索到的切分总数")
+    chunk_count: int = Field(
+        ge=0,
+        description=(
+            "本轮租户**可检索到的**切分总数——按 `tenant_id` 收口，与检索路径同口径"
+            "（NO-19 的过滤是下推到 Milvus 的，别的租户的行压根检不到）。"
+            "整集合计数会把与之无关的行算进来（实测：集成测试夹具残留把 195 顶成 201），"
+            "让这个字段因语料没变而漂移"
+        ),
+    )
     manifest_sha256: str = Field(default="", description="入库幂等清单的指纹；留空表示未取到")
 
 

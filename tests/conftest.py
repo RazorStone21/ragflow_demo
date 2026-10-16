@@ -173,16 +173,23 @@ class FakeMilvusStore:
     ``AppDeps.milvus_store`` 目前只被两处消费：就绪探针与评估的语料快照，二者
     都只问"库里有多少条"。故这里只实现 ``count``——补一个无人调用的
     ``hybrid_search`` 等于给假实现加一份会悄悄腐烂的接口。
+
+    ``count`` **记录**收到的 ``tenant_id``（而不是丢掉）：评估快照要求按本轮租户
+    收口（D10——不带租户就数进了别的租户的行，数字会因与被评估语料无关的原因漂移），
+    而"调用方到底传没传租户"只有靠调用记录才断言得出来。真实 ``MilvusStore.count``
+    的 ``tenant_id`` 是可选的，传 ``None`` 会静默地数整个集合——这个"可选"就是缺陷
+    的入口，所以假实现必须把入参暴露出来，否则测试对它永远无话可说。
     """
 
     def __init__(self, chunk_count: int = 0) -> None:
         self.chunk_count = chunk_count
         self.count_calls = 0
+        self.count_tenants: list[str | None] = []
 
     async def count(self, *, tenant_id: str | None = None) -> int:
-        """返回预设切片数（忽略租户过滤，单测不需要租户级计数）。"""
-        del tenant_id
+        """返回预设切片数，并记下本次询问的租户。"""
         self.count_calls += 1
+        self.count_tenants.append(tenant_id)
         return self.chunk_count
 
 

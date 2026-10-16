@@ -286,6 +286,7 @@ async def build_run_meta(
     golden: GoldenSet,
     *,
     run_id: str,
+    tenant_id: str,
     judge: JudgeSnapshot | None = None,
 ) -> RunMeta:
     """采集本次运行的完整可比性快照（CLAUDE.md 9.2 留痕）。
@@ -294,6 +295,7 @@ async def build_run_meta(
         deps: 执行器依赖。
         golden: 已装载的黄金集（提供内容指纹与签署计数）。
         run_id: 本次运行 ID。
+        tenant_id: 本轮评估实际使用的租户；``chunk_count`` 按它收口（见下）。
         judge: 裁判配置快照；``None`` 表示本轮未启用裁判。
 
     Returns:
@@ -323,7 +325,13 @@ async def build_run_meta(
         ),
         corpus=CorpusSnapshot(
             collection=settings.milvus_collection,
-            chunk_count=await deps.milvus_store.count(),
+            # 按本轮租户收口（D10，2026-10-17）。原先不带租户，数的是整个集合——
+            # 而检索路径全程带租户过滤（NO-19），别的租户的行**根本检索不到**。
+            # 后果不是数字变大一点，而是这个字段会因与被评估语料无关的原因漂移：
+            # 实测集成测试的夹具残留（`test-tenant-a/b` 各 3 条）把 195 顶成 201，
+            # 一份"语料没变"的基线对比因此会喊出语料漂移。快照的意义就是让
+            # "变了"只对应真变了，所以这里必须与检索同口径。
+            chunk_count=await deps.milvus_store.count(tenant_id=tenant_id),
             manifest_sha256=await _manifest_fingerprint(settings.ingest_manifest_path),
         ),
         judge=judge if judge is not None else JudgeSnapshot(),
@@ -498,7 +506,7 @@ async def run_golden_set(
     if limit is not None and limit < len(golden.cases):
         notes.append(f"本次仅执行前 {limit} 条（黄金集共 {len(golden.cases)} 条），非全量结果")
 
-    meta = await build_run_meta(deps, golden, run_id=run_id)
+    meta = await build_run_meta(deps, golden, run_id=run_id, tenant_id=tenant_id)
     results: list[CaseResult] = []
     for index, case in enumerate(cases, start=1):
         result, _ = await run_case(deps, case, layer=layer, run_id=run_id, tenant_id=tenant_id)

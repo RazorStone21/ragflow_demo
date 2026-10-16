@@ -234,6 +234,7 @@ tests/evals/
 | **D7** | `_parse_metric_map(cast=int)` 静默截断 `3.5 → 3`，且接受 `0` / `-1`；阈值本身也不校验范围 | `min_samples = -1` 使下限恒真（`count < -1` 永远为假），一个敲错的负号就让某条指标**无声退出所有门禁** | `_parse_min_samples` 要求正整数并挡下 `bool`；阈值限定在 `[0,1]` |
 | **D8** | 裁判输出两次都解析不出结构时，`_unparseable_outcome` 记 `FAIL` + `score=0.0` | **一次测量故障伪装成一次质量回归**：首次真实 `--baseline` 对比里，`boundary-market-evaluation-arrangement` 的 `faithfulness` 被记成 `0.0000`，聚合分从 0.9392 被压低到 0.8770（Δ −0.0622），报告读作"跌破"，该样例还进了"新失败样例"——而模型什么都没做错。根因之一：`max_tokens=1024` 偏小，1138 字的答案让裁判 JSON 在半途被截断（"括号未配平"） | 新增 `MetricVerdict.ERROR`（不带分数、不计入聚合，但样例照样判不通过）；`Gate.measurement_failures` 与"跌破"分列；`max_tokens` 提到 4096；`tests/unit/test_evaluation_judge.py` 用 fake `ChatModel` 把裁判的每一条出口跑一遍（该模块原先**整份豁免覆盖率**，失败路径一条都没被执行过，现为 95% 且已取消豁免） |
 | **D9** | `JudgeSnapshot` 不记 `max_tokens`（原列在 §5.3 的缺口） | D8 的修复把上限从 1024 提到 4096，而快照里没有这一栏——一次**门禁参数变更在任何对比报告里都不可见**。它只在"某条样例恰好被截断、`pass` 变 `error`"时显形，而那时离"该改哪个参数"已经隔了一次排查 | 新增 `JudgeSnapshot.max_tokens`，由 `Judge.snapshot()` 写入实际值；`None` 专表"本字段引入前落盘的产物"，**不给默认数字**（默认值等于替旧产物编一个它从未记过的值，漂移报告就分不清"真改了上限"与"旧产物没记过"）。`tests/unit/test_evaluation_judge.py` 钉住写入与"旧产物解析为 `None`"两条 |
+| **D10** | `chunk_count` 用 `milvus_store.count()`，**不带租户**——数的是整个集合，而检索全程带租户过滤（NO-19 下推），别的租户的行**根本检索不到**。字段自己的 docstring 写的是"评测时**可检索到的**切分总数"，代码与它不符 | 这个字段会因与被评估语料**无关**的原因漂移，于是"变了"不再等于"真变了"。实测（2026-10-16）：`tests/integration/test_milvus_integration.py` 的 `seeded` 夹具残留 6 条（`test-tenant-a/b` 各 3 条，同一个 `document_id=doc-bb2b655b4444`，其 `updated_at` 是夹具里硬编码的 `1700000000`，据此可直接指认来源），在**清单指纹一字未变**（`7cb2f62b6912`）的情况下把 195 顶成 201。`demo` 租户——黄金集真正考的那个——**始终是 195**。夹具的清理写在 `finally:` 里，进程被杀就不会执行（本仓集成测试跑得慢，被超时打断是可能的一条路；**这一点我没有日志可证**，只报事实：那一份 `seeded` 的清理未生效）。属 D8/D9 同一类失真 | `build_run_meta` 新增 `tenant_id` 参数并按它收口 `count(tenant_id=…)`；`CorpusSnapshot.chunk_count` 的契约写明"按本轮租户收口"。新增 `tests/unit/test_evaluation_run_meta.py` 钉住两条：租户**传下去了**，且传的是**本轮那个**（写死默认常量同样能过第一条断言，却会在 `--tenant` 换租户时静默报错数）。`FakeMilvusStore` 改为**记录**收到的租户——假实现丢弃入参，测试就永远对这个缺陷无话可说。**修的是口径，不是清理**：租户收口后这些残留不再影响评估，因此**没有**去删 Milvus 里的行（写库需另行授权） |
 
 ### 5.3 仍然存在的缺口
 
@@ -247,6 +248,7 @@ tests/evals/
 | **分路检索分数未采集** | Milvus `hybrid_search` + `WeightedRanker` 只返回融合分 | `vector_score` / `bm25_score` 结构性为 `None`。取分需改检索形态，属 NO-16 管辖的变更，**先有基线再动** |
 | **间接注入只做提示词卫生** | 未写 Milvus 对抗夹具 | 端到端验证需向 `eval_tenant` upsert 合成毒化切片（会写库），默认不做 |
 | **裁判指标有逐轮噪声** | 生成侧 `temperature` 非 0，两轮答案文本不同（实测 `faithfulness` 抖动 −0.06） | `--baseline` 的裁判指标 Δ **不能直接读成质量变化**；详见 5.4 的四条硬约束 |
+| **`evaluation/runner.py` 仍整份豁免覆盖率** | `pyproject.toml` 的 `omit` 里只有它一个，理由是"要真 Postgres/Milvus/网关" | **这条理由已被本轮证伪了至少一半**：`build_run_meta`（可比性快照的采集）**完全离线可测**——`tests/unit/test_evaluation_run_meta.py` 就是用它自己的真实代码路径跑起来的，不连任何服务。§9.3 的要求是"只有**真正只能**在真实基础设施上执行的部分才可豁免，且须逐条写明理由"，一个整文件 `omit` 不是"逐条"。**本次不动它**（把整份纳回覆盖面会把大量真需要基础设施的行计进分母，可能把总覆盖率压破 80% 的底线，那是另一次有范围的改动），登记在此以免它变成"我们已经测过了"的错觉 |
 
 ### 5.4 裁判指标的逐轮噪声（**实测，读对比表前必看**）
 
