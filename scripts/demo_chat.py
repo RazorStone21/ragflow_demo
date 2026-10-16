@@ -131,16 +131,26 @@ async def create_thread(
 
 
 def render_citations(citations: list[dict[str, Any]]) -> str:
-    """把引用列表渲染为可读文本（CLAUDE.md 7.4：答案必须可溯源）。"""
+    """把引用列表渲染为可读文本（CLAUDE.md 7.4：答案必须可溯源）。
+
+    编号**必须沿用 ``Citation.index``**（= 提示词里给证据编的号），不能按列表位置重编：
+    ``citations`` 只含**被引用过**的条目，位置与编号因此通常不相等。实测一次真实问答
+    中模型引用了证据 {1,2,3,4,7,8}，清单恰有 6 条——按位置重编就印成 ``[1]..[6]``，
+    于是正文里的 ``[7]``/``[8]`` 在清单中找不到对应项，清单里的 ``[5]``/``[6]`` 又是错的
+    编号，"引用清单"存在的意义（可溯源）在人类可读层面直接断掉。缺 ``index`` 字段时
+    回退到位置编号（兼容手写的纯 dict 输入）。
+    """
     if not citations:
         return "（本次回答未引用任何证据）"
     lines = []
-    for index, item in enumerate(citations, start=1):
+    for position, item in enumerate(citations, start=1):
+        index = item.get("index")
+        label = index if isinstance(index, int) and index >= 1 else position
         name = item.get("document_name") or "(未知文档)"
         pages = item.get("page_numbers") or []
         page_text = f" 第 {', '.join(str(p) for p in pages)} 页" if pages else ""
         source = item.get("source_uri") or ""
-        lines.append(f"  [{index}] {name}{page_text}{f'  ({source})' if source else ''}")
+        lines.append(f"  [{label}] {name}{page_text}{f'  ({source})' if source else ''}")
     return "\n".join(lines)
 
 

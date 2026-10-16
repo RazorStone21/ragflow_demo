@@ -177,6 +177,27 @@ def test_render_citations_handles_empty_and_missing_fields() -> None:
     assert "(未知文档)" in text
 
 
+def test_render_citations_keeps_citation_index_numbering() -> None:
+    """编号沿用 ``index``，不按列表位置重编——``citations`` 只含**被引用过**的条目。
+
+    实测缺陷：一次真实问答里模型引用了证据 {1,2,3,4,7,8}，``citations`` 恰有 6 条，
+    按位置重编就印成 [1]..[6]：正文的 [7]/[8] 在清单里找不到对应项，清单里的 [5]/[6]
+    又是错编号。引用清单的存在意义就是可溯源（CLAUDE.md 7.4），这一步断了等于没有。
+    """
+    text = demo_chat.render_citations(
+        [
+            {"index": 1, "document_name": "a.pdf", "page_numbers": [2]},
+            {"index": 7, "document_name": "b.pdf", "page_numbers": [10, 11]},
+            {"index": 8, "document_name": "c.pdf", "page_numbers": [2]},
+        ]
+    )
+    assert "[1] a.pdf" in text
+    assert "[7] b.pdf" in text
+    assert "[8] c.pdf" in text
+    assert "[2] " not in text, "位置编号会把它印成 [2]——正文里根本没有这个引用"
+    assert "[3] " not in text, "位置编号会把它印成 [3]——正文里根本没有这个引用"
+
+
 # ---------------------------------------------------------------------------
 # 流消费（真实字节回放）
 # ---------------------------------------------------------------------------
