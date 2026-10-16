@@ -61,13 +61,18 @@ RUN_INTEGRATION_TESTS=true uv run pytest -m integration   # 需 compose 已启�
 uv run python -X utf8 scripts/eval_run.py --validate-only                  # 零基础设施，只校验黄金集
 uv run python -X utf8 scripts/eval_run.py --layer all                      # 全量评估，产出产物
 uv run python -X utf8 scripts/eval_run.py --layer all \
-  --baseline tests/evals/baselines/2026-10-16-phase7-initial.json          # 与基线对比，检出回归
+  --baseline tests/evals/baselines/2026-10-16-phase7-signed.json           # 与基线对比，检出回归
 ```
 
 评估**当前处于观察期**：照常产出报告、判定与留痕，`--baseline` 照常检出回归，但退出码暂不接入
-pre-commit（黄金集 28 条待人工逐条核对原文后签署）。**评估不进 pre-commit**——它慢、要密钥、
-要基础设施，放进去只会训练人加 `--no-verify`。评审协议与缺陷登记见 `tests/evals/README.md`，
-框架选型与被违反的条例见 [ADR-0003](docs/adr/0003-evaluation-framework-and-judge.md)。
+pre-commit。**评估不进 pre-commit**——它慢、要密钥、要基础设施，放进去只会训练人加
+`--no-verify`。评审协议与缺陷登记见 `tests/evals/README.md`，框架选型与被违反的条例见
+[ADR-0003](docs/adr/0003-evaluation-framework-and-judge.md)。
+
+黄金集 28 条**已全部人工签署**（`--require-reviewed` 通过）。当前入库基线有**两份**，且
+**互不可比**：`2026-10-16-phase7-initial.json` 是"28 条草稿"期的真实记录，
+`2026-10-16-phase7-signed.json` 是签署后的现行参照物（两者的黄金集指纹不同，对比会显式
+喊出来）。两份都记着 D1/D2/D3 三条未修缺陷对应的失败，**均不代表达标**。
 
 提交遵循 Conventional Commits；不得 `--no-verify`。AI 协作规则见 CLAUDE.md 12.4。
 
