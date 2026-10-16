@@ -51,6 +51,11 @@ class ErrorCode(StrEnum):
     TOOL_EXECUTION_FAILED = "TOOL_EXECUTION_FAILED"
     GUARDRAIL_BLOCKED = "GUARDRAIL_BLOCKED"
 
+    # 评估（CLAUDE.md 9.2）——不对外暴露为 HTTP 错误：评估是脚本/CI 侧能力，
+    # 这些码只进 CLI 退出码与日志。放进本枚举是为了守住"错误码集中管理"这一条。
+    EVAL_GOLDEN_INVALID = "EVAL_GOLDEN_INVALID"
+    EVAL_ARTIFACT_INCOMPATIBLE = "EVAL_ARTIFACT_INCOMPATIBLE"
+
     # 兜底
     INTERNAL_ERROR = "INTERNAL_ERROR"
 
@@ -244,6 +249,31 @@ class GuardrailBlockedError(AgentPlatformError):
 
     def __init__(self, message: str, *, detail: str | None = None) -> None:
         super().__init__(message, detail=detail or "请求被安全策略拦截。")
+
+
+# ---------------------------------------------------------------------------
+# 评估（CLAUDE.md 9.2 / NO-16）
+# ---------------------------------------------------------------------------
+class GoldenSetError(AgentPlatformError):
+    """黄金集不可用：文件缺失、JSONL 语法错误、字段校验失败或 id 重复。
+
+    一律**显式失败**（NO-06）——黄金集读不出来却继续跑，得到的是"零样例通过"
+    这种最危险的绿灯：报告上写着 100% 达标，实际什么都没测。
+    """
+
+    code = ErrorCode.EVAL_GOLDEN_INVALID
+    http_status = 500
+
+
+class ArtifactIncompatibleError(AgentPlatformError):
+    """评估产物与当前代码不兼容（结构版本不同、缺字段），或与基线不可比。
+
+    与"指标没达标"是两回事：前者说明这份产物没法和基线放在一起看，
+    后者才是质量问题。混成一个退出码会让"改坏了对比逻辑"看起来像"质量下降"。
+    """
+
+    code = ErrorCode.EVAL_ARTIFACT_INCOMPATIBLE
+    http_status = 500
 
 
 # ---------------------------------------------------------------------------

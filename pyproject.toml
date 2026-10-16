@@ -127,6 +127,18 @@ strict = true
 module = ["pymilvus.*", "langgraph.checkpoint.postgres.*", "jinja2.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# ragas **不是**项目依赖（ADR-0003：它无条件依赖已归档的 langchain-community，
+# 违反 NO-14），因此环境里根本没有它的类型信息。它只被 scripts/eval_ragas.py 在
+# **隔离环境**里 import，那里同样解析不到 stub。
+#
+# 为什么这条不算"扩大豁免"：被放宽的对象是**一个本仓永不依赖的库**，放宽之后
+# 也不会掩盖本仓自己的类型错误；而另一条路——给那 4 处 import 各贴一个
+# `# type: ignore`——反而更差：它会一并吞掉"ragas 改了 API 导致 import 名字不再
+# 存在"这类真实故障。范围仅此一项，不得再加。
+module = ["ragas.*"]
+ignore_missing_imports = true
+
 # ---------------------------------------------------------------------------
 # pytest：单元快而确定；集成由 env 门控（CLAUDE.md 9.3）
 # ---------------------------------------------------------------------------
@@ -140,11 +152,24 @@ asyncio_default_fixture_loop_scope = "function"
 addopts = "-q --strict-markers"
 markers = [
     "integration: 需要真实基础设施（compose 起 Postgres/Milvus/RAGFlow/LiteLLM）",
+    "eval: 需真实基础设施 + 网关裁判模型（RUN_EVAL_TESTS=true）；默认 skip，不进 pre-commit",
 ]
 
 [tool.coverage.run]
 source = ["src/agent_platform"]
-omit = ["src/agent_platform/evaluation/*"]
+# 评估层原先整目录豁免（空壳期的权宜）；既有真代码，豁免收窄到**只能**由
+# tests/evals/ 覆盖的执行模块——它要真 Postgres/Milvus/网关，跑不进离线单元门禁。
+# 契约、装载、判分、报告、裁判五块必须在 tests/unit/ 里覆盖到，不再豁免。
+#
+# judge.py 曾经也在这里，理由是"它要连网关"。那个理由看着成立，代价却很实在：
+# 它的**失败路径一条都没被跑过**，于是"裁判输出两次不可解析"被记成 score=0.0，
+# 一次测量故障伪装成一次质量回归，一直活到首次真实基线对比才暴露（见
+# tests/unit/test_evaluation_judge.py 的模块 docstring）。用 fake ChatModel 把
+# 它拉回离线测试后覆盖率 95%，豁免随之取消——**豁免掉一个模块的代价，是它坏掉时
+# 没人知道**。
+omit = [
+    "src/agent_platform/evaluation/runner.py",
+]
 
 [tool.coverage.report]
 fail_under = 80

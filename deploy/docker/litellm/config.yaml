@@ -92,6 +92,29 @@ model_list:
       api_base: https://api.siliconflow.cn/v1
       api_key: os.environ/SILICONFLOW_API_KEY
 
+  # ---------------------------------------------------------------------------
+  # judge：评估裁判模型（CLAUDE.md 5.2 列的应当存在的逻辑名 / 9.2 裁判模型固定并记录版本）
+  #
+  # 【为什么单列一条而不复用 primary-chat】裁判与生成必须能**各自换型**：评测集评分
+  # 要固定版本以便跨版本比较，而生成侧要随产品迭代调型。共用一个逻辑名会让
+  # "只换生成模型、不动裁判"这件事做不到，分数因此失去可比性。
+  #
+  # 【temperature=0 是硬要求】CLAUDE.md 5.3：评测用固定随机种子或 temperature=0。
+  # 裁判分数若带随机性，"这次比基线低 2 分"就分不清是模型退化还是采样抖动。
+  #
+  # 【已知偏置——必须原样保留这段注释】上游与 primary-chat 同为 deepseek-chat，
+  # 即**裁判与被评者是同一个模型**，存在自偏好（self-preference）偏置：
+  # faithfulness / answer_relevancy 一类分数会偏乐观，不得当中性分数使用。
+  # 这是演示期的授权偏离（用户决策），已在 docs/adr/0003 登记，产物里也会
+  # 逐条标记 caveat。生产应换**独立家族**的私有化模型（CLAUDE.md 5.8）。
+  # ---------------------------------------------------------------------------
+  - model_name: judge
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+      temperature: 0.0
+      max_tokens: 1024
+
 # -----------------------------------------------------------------------------
 # 刻意不配置的项，以及原因（留白比配错更需要说明）：
 #

@@ -167,6 +167,25 @@ CITED_REPLY = "依据《电价办法》第3条[1]。"
 """
 
 
+class FakeMilvusStore:
+    """记录切片数的假向量库。
+
+    ``AppDeps.milvus_store`` 目前只被两处消费：就绪探针与评估的语料快照，二者
+    都只问"库里有多少条"。故这里只实现 ``count``——补一个无人调用的
+    ``hybrid_search`` 等于给假实现加一份会悄悄腐烂的接口。
+    """
+
+    def __init__(self, chunk_count: int = 0) -> None:
+        self.chunk_count = chunk_count
+        self.count_calls = 0
+
+    async def count(self, *, tenant_id: str | None = None) -> int:
+        """返回预设切片数（忽略租户过滤，单测不需要租户级计数）。"""
+        del tenant_id
+        self.count_calls += 1
+        return self.chunk_count
+
+
 class FakeRetriever:
     """满足 ``Retriever`` 契约的确定性检索器。
 
@@ -271,6 +290,8 @@ class ApiStack:
     """注入的检索器（fake）；类型为 Any 是因为 ``AppDeps`` 声明的是具体 ``Retriever``。"""
     chat: Any
     """注入的模型（fake）；同上。"""
+    milvus_store: Any
+    """注入的向量库（fake）；同上。单测用 ``FakeMilvusStore``，不含真实 Milvus。"""
     agent_name: str
     readiness_checks: tuple[ReadinessCheck, ...]
 
@@ -283,6 +304,7 @@ def build_api_stack(
     readiness_checks: tuple[ReadinessCheck, ...] | None = None,
     checkpointer: Any = None,
     store: Any = None,
+    milvus_store: Any = None,
 ) -> ApiStack:
     """装配一套依赖：默认内存 checkpointer + 内存 store + fake 检索器/模型。
 
@@ -294,6 +316,7 @@ def build_api_stack(
     resolved_chat = chat if chat is not None else FakeChatModel(CITED_REPLY)
     resolved_store = store if store is not None else InMemoryStore()
     resolved_saver = checkpointer if checkpointer is not None else InMemorySaver()
+    resolved_milvus = milvus_store if milvus_store is not None else FakeMilvusStore()
     graph = build_graph(
         retriever=resolved_retriever,  # type: ignore[arg-type]  # 注入 fake（CLAUDE.md 9.3）
         chat=resolved_chat,
@@ -310,6 +333,7 @@ def build_api_stack(
         store=resolved_store,
         retriever=resolved_retriever,
         chat=resolved_chat,
+        milvus_store=resolved_milvus,
         agent_name=AGENT_NAME,
         readiness_checks=readiness_checks,
     )
@@ -333,6 +357,7 @@ def build_test_app(stack: ApiStack) -> FastAPI:
             store=stack.store,
             agent_name=stack.agent_name,
             retriever=stack.retriever,
+            milvus_store=stack.milvus_store,
             chat=stack.chat,
             chat_logical_name=stack.settings.primary_chat_model,
             guardrail=None,

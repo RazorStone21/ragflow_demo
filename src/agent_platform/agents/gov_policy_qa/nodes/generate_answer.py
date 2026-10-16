@@ -123,7 +123,7 @@ def build_generate_answer_node(
             return answer_update(answer=_INSUFFICIENT_ANSWER, status=STATUS_INSUFFICIENT_EVIDENCE)
 
         tenant_id = tenant_id_from_config(config)
-        messages = _build_messages(question, evidence)
+        messages = build_answer_messages(question, evidence)
         started = time.perf_counter()
         draft, token_usage = await _stream_answer(model, messages, writer)
         duration_ms = (time.perf_counter() - started) * 1000
@@ -179,8 +179,14 @@ def build_generate_answer_node(
     return generate_answer
 
 
-def _build_messages(question: str, evidence: list[EvidenceItem]) -> list[BaseMessage]:
-    """渲染提示词：系统规则 + 用户消息（证据栅栏 + 问题）。"""
+def build_answer_messages(question: str, evidence: list[EvidenceItem]) -> list[BaseMessage]:
+    """渲染提示词：系统规则 + 用户消息（证据栅栏 + 问题）。
+
+    公开而非私有（原名 ``_build_messages``）是**有意的**：评估层要拿它做
+    "栅栏中和是否真的接线"的重放断言（``evaluation/scoring.score_prompt_hygiene``）。
+    断言必须走**生产渲染路径**才有意义——评估层自己复制一份渲染逻辑，
+    断言的就只是那份副本，删掉生产路径里的 ``neutralize_untrusted`` 也照样全绿。
+    """
     blocks = [
         {
             "index": position,
@@ -226,4 +232,4 @@ async def _stream_answer(
     return "".join(parts).strip(), token_usage
 
 
-__all__: list[str] = ["build_generate_answer_node"]
+__all__: list[str] = ["build_answer_messages", "build_generate_answer_node"]

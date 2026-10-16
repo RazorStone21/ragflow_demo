@@ -27,7 +27,7 @@ from agent_platform.core.models import ChatModel, build_chat_model
 from agent_platform.guardrails import Guardrail
 from agent_platform.knowledge.embedder import LiteLLMEmbedder
 from agent_platform.knowledge.gateway_client import GatewayHttpClient
-from agent_platform.knowledge.milvus_store import open_milvus_store
+from agent_platform.knowledge.milvus_store import MilvusStore, open_milvus_store
 from agent_platform.knowledge.reranker import LiteLLMReranker
 from agent_platform.knowledge.retriever import Retriever
 from agent_platform.settings import Settings
@@ -68,6 +68,14 @@ class AppDeps:
     agent_name: str
     """本进程装配的智能体名；``POST /runs`` 据此拒绝指向未装配智能体的请求。"""
     retriever: Retriever
+    milvus_store: MilvusStore
+    """向量库句柄本身。
+
+    ``retriever`` 只回答"这个查询命中什么"，回答不了"库里现在有多少切片"；而评测
+    需要后者来记录语料快照（重入库会让历史基线不可比，必须在产物里留指纹）。
+    单独暴露已打开的实例，而不是在 ``Retriever`` 上加一个转发的 count——那会让
+    检索器多一个与检索无关的职责。
+    """
     chat: ChatModel
     chat_logical_name: str
     guardrail: Guardrail | None
@@ -87,9 +95,9 @@ async def open_production_deps(settings: Settings) -> AsyncIterator[AppDeps]:
     """
     async with AsyncExitStack() as stack:
         gateway = await stack.enter_async_context(GatewayHttpClient(settings))
-        store = await stack.enter_async_context(open_milvus_store(settings))
+        milvus_store = await stack.enter_async_context(open_milvus_store(settings))
         retriever = Retriever(
-            store,
+            milvus_store,
             LiteLLMEmbedder(
                 gateway,
                 logical_model=settings.embedding_model,
@@ -122,7 +130,7 @@ async def open_production_deps(settings: Settings) -> AsyncIterator[AppDeps]:
             await resources.saver.aget_tuple({"configurable": {"thread_id": _READYZ_PROBE_THREAD}})
 
         async def _check_milvus() -> None:
-            await store.count()
+            await milvus_store.count()
 
         yield AppDeps(
             settings=settings,
@@ -130,6 +138,7 @@ async def open_production_deps(settings: Settings) -> AsyncIterator[AppDeps]:
             store=resources.store,
             agent_name=AGENT_NAME,
             retriever=retriever,
+            milvus_store=milvus_store,
             chat=chat,
             chat_logical_name=settings.primary_chat_model,
             guardrail=None,

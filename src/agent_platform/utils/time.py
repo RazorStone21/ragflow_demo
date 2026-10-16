@@ -38,4 +38,13 @@ def iso_utc(raw: str | None) -> str | None:
     return parsed.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-__all__: list[str] = ["iso_utc"]
+def utc_now_iso() -> str:
+    """当前 UTC 时刻，规范为 ``iso_utc`` 的同一种表示（``Z`` 结尾）。
+
+    与 ``iso_utc`` 成对使用：写入的产物时间戳与读回规范化后的时间戳必须字节一致，
+    否则"重新读取产物再写回"会产生无意义的 diff。
+    """
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+__all__: list[str] = ["iso_utc", "utc_now_iso"]

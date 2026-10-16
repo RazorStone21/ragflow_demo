@@ -181,7 +181,17 @@ class Retriever:
 
 
 def _to_evidence(hit: MilvusHit, score: float) -> EvidenceItem:
-    """把检索命中转换为证据条目（保留引用信息，CLAUDE.md 7.4）。"""
+    """把检索命中转换为证据条目（保留引用信息，CLAUDE.md 7.4）。
+
+    Notes:
+        ``vector_score`` / ``bm25_score`` **恒为 ``None``，且不是本函数丢的**：
+        ``MilvusStore.hybrid_search`` 走的是 Milvus ``hybrid_search`` +
+        ``WeightedRanker``，该调用路径**只返回融合后的单一分数**，分路原始分
+        在数据源处就没有被取回。要拿到分路分数，得把一次混合检索拆成两次独立
+        ``search``（稠密一次、稀疏一次）再自行融合——那是**检索形态的变更**，
+        按 CLAUDE.md 9.2 / NO-16 必须先有评估基线才谈得上评估其影响，
+        因此当前只在评估层登记该缺口，不动检索行为。
+    """
     return EvidenceItem(
         chunk_id=hit.chunk_id,
         content=hit.content,

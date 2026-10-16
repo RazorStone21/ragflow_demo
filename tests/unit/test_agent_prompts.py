@@ -9,7 +9,7 @@ from importlib.resources import files
 import pytest
 from langchain_core.messages import HumanMessage
 
-from agent_platform.agents.gov_policy_qa.nodes.generate_answer import _build_messages
+from agent_platform.agents.gov_policy_qa.nodes.generate_answer import build_answer_messages
 from agent_platform.agents.gov_policy_qa.prompts import (
     ANSWER_HUMAN_PROMPT,
     ANSWER_SYSTEM_PROMPT,
@@ -74,14 +74,16 @@ def _raw_template(name: str) -> str:
 
 
 def _render_human(question: str, evidence: list[EvidenceItem]) -> str:
-    """经**生产侧** ``generate_answer._build_messages`` 渲染人消息文本。
+    """经**生产侧** ``generate_answer.build_answer_messages`` 渲染人消息文本。
 
     刻意不做镜像渲染：证据编号、不可信文本中和与模板调用都必须来自被测代码，
     否则改坏生产编号后本文件仍会全绿（自证循环）。
     """
-    messages = _build_messages(question, evidence)
+    messages = build_answer_messages(question, evidence)
     human = messages[-1]
-    assert isinstance(human, HumanMessage), "生产 _build_messages 的末条消息必须是 HumanMessage"
+    assert isinstance(human, HumanMessage), (
+        "生产 build_answer_messages 的末条消息必须是 HumanMessage"
+    )
     return message_text(human)
 
 
@@ -198,8 +200,8 @@ def test_render_is_idempotent_and_does_not_mutate_evidence() -> None:
     """同一入参经生产渲染两次结果完全相同，且渲染不改动传入的证据列表（CLAUDE.md 4.2 纯净性）。"""
     evidence = list(_DEMO_EVIDENCE)
     snapshot = deepcopy(evidence)
-    first = _build_messages(_QUESTION, evidence)
-    second = _build_messages(_QUESTION, evidence)
+    first = build_answer_messages(_QUESTION, evidence)
+    second = build_answer_messages(_QUESTION, evidence)
     assert first == second
     assert evidence == snapshot
 

@@ -87,6 +87,11 @@ class Settings(BaseSettings):
     )
     embedding_model: str = Field(default="embedding", min_length=1)
     rerank_model: str = Field(default="rerank", min_length=1)
+    judge_model: str = Field(
+        default="judge",
+        min_length=1,
+        description="评估裁判模型的网关逻辑名（CLAUDE.md 5.2 / 9.2）；仅评估层使用",
+    )
     model_timeout_s: float = Field(default=120.0, gt=0, le=600)
     model_max_retries: int = Field(default=2, ge=0, le=5)
 
@@ -112,8 +117,26 @@ class Settings(BaseSettings):
     # --- 入库脚本 ---
     ingest_manifest_path: Path = Path("local_data/ingest_manifest.json")
 
+    # --- 评估（CLAUDE.md 9.2 / NO-16）---
+    eval_golden_dir: Path = Path("tests/evals/golden")
+    eval_thresholds_path: Path = Path("tests/evals/config/thresholds.toml")
+    """门禁阈值文件。
+
+    **刻意是文件而不是本模型里的字段**：阈值必须随黄金集版本化、可逐行 review 理由，
+    且不能被环境变量悄悄调低——那等于给"改门禁"开后门。这里的 Path 只决定去**哪里读**，
+    读到的值会原样写进产物与对比报告，所以改路径不会让阈值悄悄变松而不留痕。
+    """
+    eval_runs_dir: Path = Path("local_data/evals/runs")
+    eval_judge_cache_dir: Path = Path("local_data/evals/cache")
+    eval_ragas_dir: Path = Path("local_data/evals/ragas")
+    """RAGAS 旁挂产物的落盘目录（隔离环境跑出来，见 ADR-0003）。"""
+
     # --- 测试 ---
     run_integration_tests: bool = False
+    run_eval_tests: bool = Field(
+        default=False,
+        description="true 时运行需真实基础设施 + 裁判模型的评估测试（CLAUDE.md 9.2）",
+    )
 
 
 def load_settings(env_file: str | Path | None = ".env") -> Settings:
