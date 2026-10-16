@@ -87,6 +87,12 @@ class GatewayHttpClient:
             self._client = httpx.AsyncClient(
                 headers=self._headers,
                 timeout=httpx.Timeout(settings.model_timeout_s),
+                # 本应用的全部 httpx 流量都指向内网/本机服务，没有一处应当走宿主 HTTP 代理。
+                # 而 httpx 默认 trust_env=True 会在 Windows 上读取注册表里的系统代理
+                # （实测本机被 Clash 的 127.0.0.1:7890 劫持，连 localhost 请求都返回 502），
+                # 于是"网关在不在"取决于某台机器上有没有开代理。这与 10.1/NO-15 的
+                # 数据不出域要求也相悖：离线/信创环境更不该由宿主配置决定内部链路走向。
+                trust_env=False,
             )
         else:
             self._owns_client = False

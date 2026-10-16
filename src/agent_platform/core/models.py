@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any, Protocol, runtime_checkable
 
+import httpx
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.runnables import Runnable, RunnableConfig
 from langchain_openai import ChatOpenAI
@@ -20,6 +21,29 @@ from agent_platform.settings import Settings
 
 DEFAULT_TEMPERATURE = 0.0
 """默认温度：检索问答场景要求确定性（CLAUDE.md 5.3，评测固定随机性）。"""
+
+
+def build_http_async_client(settings: Settings) -> httpx.AsyncClient:
+    """构造**不走宿主代理**的 httpx 异步客户端，供模型客户端复用。
+
+    为什么必须显式传进去：``ChatOpenAI`` 不传 ``http_async_client`` 时会用默认客户端，
+    而 httpx 默认 ``trust_env=True`` —— 在 Windows 上会读**注册表**里的系统代理
+    （不看 ``HTTP_PROXY`` 环境变量）。实测本机开着 Clash 时，连往
+    ``127.0.0.1:9380``（**根本没有进程监听**）发请求都能拿到 ``502``，
+    而 ``trust_env=False`` 的同一请求如实返回连接失败——说明默认构造确实把请求交给了代理。
+
+    两个后果都不能接受：
+    1. 能否连上内网模型网关，取决于**这台机器上有没有开代理**；
+    2. 提示词与回答会路过一个第三方代理进程，与 CLAUDE.md 10.1 / NO-15 的数据不出域相悖。
+
+    生命周期：随模型对象存活，由进程生命周期兜底（``build_chat_model`` 每次调用只建一个，
+    主备链共用同一个）。与 ``knowledge/gateway_client.py``、``ragflow_client.py``
+    同一约定——新增任何指向内网/本机的 httpx 客户端都必须照此设置。
+    """
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(settings.model_timeout_s),
+        trust_env=False,
+    )
 
 
 @runtime_checkable
@@ -56,6 +80,7 @@ def _make_chat_openai(
     logical_name: str,
     temperature: float,
     max_tokens: int | None,
+    http_async_client: httpx.AsyncClient,
 ) -> ChatOpenAI:
     """构造指向 LiteLLM 网关的 ``ChatOpenAI``（内部复用）。"""
     # 参数名与 langchain-openai 的字段 alias 对齐（base_url=openai_api_base 的 alias、
@@ -68,6 +93,9 @@ def _make_chat_openai(
         max_retries=settings.model_max_retries,
         temperature=temperature,
         max_completion_tokens=max_tokens,
+        # 必须显式注入：不传就会走宿主系统代理（见 build_http_async_client 的实测说明）。
+        # 节点一律走 async（ainvoke/astream），因此只需异步客户端。
+        http_async_client=http_async_client,
     )
 
 
@@ -91,14 +119,24 @@ def build_chat_model(
         返回主备链（主失败自动切备）。
     """
     primary_name = logical_name or settings.primary_chat_model
+    # 主备链共用同一个 HTTP 客户端：省一个连接池，且两者本就指向同一个网关。
+    http_async_client = build_http_async_client(settings)
     primary = _make_chat_openai(
-        settings, logical_name=primary_name, temperature=temperature, max_tokens=max_tokens
+        settings,
+        logical_name=primary_name,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        http_async_client=http_async_client,
     )
     fallback_name = settings.fallback_chat_model
     if not fallback_name or fallback_name == primary_name:
         return primary
     fallback = _make_chat_openai(
-        settings, logical_name=fallback_name, temperature=temperature, max_tokens=max_tokens
+        settings,
+        logical_name=fallback_name,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        http_async_client=http_async_client,
     )
     chain: Runnable[Any, Any] = primary.with_fallbacks([fallback])
     return _RunnableChatModelAdapter(chain)

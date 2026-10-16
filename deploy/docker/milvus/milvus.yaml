@@ -1,0 +1,36 @@
+# =============================================================================
+# Milvus standalone 配置覆写（16GB 单机场景）
+#
+# 挂载点：/milvus/configs/user.yaml
+#
+# 为什么挂 user.yaml 而不是 milvus.yaml：Milvus 的配置加载顺序（源码
+# pkg/util/paramtable/base_table.go）为
+#     milvus.yaml < _test.yaml < default.yaml < user.yaml
+# user.yaml 最后加载、优先级最高，且**只需写要覆写的键**（增量合并）。
+# 若直接挂 milvus.yaml 会整份替换掉默认配置，等于丢掉其余上千行默认值。
+# 配置目录由 initConfPath() 解析：优先 $MILVUSCONF，否则取 cwd/configs；
+# 镜像 WORKDIR 为 /milvus，故实际目录是 /milvus/configs（已核对该镜像 Dockerfile）。
+#
+# 键名逐条核对自 v2.6.24 的 configs/milvus.yaml，不得凭记忆增删。
+# =============================================================================
+
+# 内存保护（quotaAndLimits.memProtection）——本文件的唯一改动目的。
+#
+# 语义（取自上游注释）：节点内存使用率超过 high 水位即**拒绝全部 DML**；
+# 处于 low~high 之间则按比例降低 DML 速率；低于 low 不动作。
+#
+# 上游默认 0.85 / 0.95。本机 16GB、WSL 上限 12GB，还要同时跑 Postgres/Redis/
+# LiteLLM，若沿用默认水位，Milvus 会一路吃到约 10GB 才开始反压，届时整台机器
+# 已进入 swap 抖动。压到 0.70 / 0.85 让反压提前介入：宁可写入变慢，也不让
+# WSL VM 被 OOM 掉（Milvus 被 OOM 会中断正在进行的解析入库）。
+#
+# 代价要说清：入库与检索的速率上限随之下降。本演示的语料是 20 份政策文档、
+# 量级远未触及水位，因此这笔代价实际不会显现；若将来语料量级上升，应改为
+# 给容器设置显式内存 limit 并恢复上游默认水位，而不是继续压低水位数。
+quotaAndLimits:
+  memProtection:
+    enabled: true
+    dataNodeMemoryLowWaterLevel: 0.70
+    dataNodeMemoryHighWaterLevel: 0.85
+    queryNodeMemoryLowWaterLevel: 0.70
+    queryNodeMemoryHighWaterLevel: 0.85

@@ -10,6 +10,10 @@ import json
 from typing import TYPE_CHECKING
 
 import pytest
+
+from agent_platform.agents.gov_policy_qa.state import AnswerStatus
+from agent_platform.api.idempotency import IDEMPOTENCY_HEADER, IDEMPOTENCY_NAMESPACE
+from agent_platform.knowledge.retriever import REASON_NO_CANDIDATES
 from tests.conftest import (
     TEST_QUESTION,
     FakeChatModel,
@@ -17,10 +21,6 @@ from tests.conftest import (
     insufficient_outcome,
     sufficient_outcome,
 )
-
-from agent_platform.agents.gov_policy_qa.state import AnswerStatus
-from agent_platform.api.idempotency import IDEMPOTENCY_HEADER, IDEMPOTENCY_NAMESPACE
-from agent_platform.knowledge.retriever import REASON_NO_CANDIDATES
 
 if TYPE_CHECKING:
     from tests.conftest import ApiHarness, OpenApi

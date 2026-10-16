@@ -28,8 +28,14 @@ uv.toml
 data/
 *.db
 *.sqlite3
+# 本仓 compose 的卷都落在这里（postgres/、milvus/）。
+# 注意：.gitignore 的 `#` **只在行首**才是注释，行尾注释会被当成模式的一部分、
+# 使整行失效（实测：写成 `local_data/   # 说明` 后 git check-ignore 返回 1）。
 local_data/
 artifacts/
+# 上游 Milvus 官方 compose 的卷惯例是 ./volumes/；本仓未采用（统一放 local_data/），
+# 此处仍拦一道：万一有人照上游写法加卷，不至于把数 GB 索引提交进仓库。
+deploy/docker/*/volumes/
 
 # --- IDE / 编辑器 ---
 .idea/

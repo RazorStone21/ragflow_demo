@@ -104,7 +104,10 @@ async def open_production_deps(settings: Settings) -> AsyncIterator[AppDeps]:
         )
         chat = build_chat_model(settings, logical_name=settings.primary_chat_model)
         resources = await stack.enter_async_context(
-            open_checkpoint_resources(settings.postgres_dsn.get_secret_value())
+            open_checkpoint_resources(
+                settings.postgres_dsn.get_secret_value(),
+                connect_timeout_s=settings.postgres_connect_timeout_s,
+            )
         )
         graph = build_graph(
             retriever=retriever,

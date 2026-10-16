@@ -19,6 +19,10 @@ import time
 from typing import TYPE_CHECKING, Any
 
 import pytest
+
+from agent_platform.agents.gov_policy_qa.state import AnswerStatus
+from agent_platform.core.errors import ErrorCode, ModelGatewayError, RetrievalFailedError
+from agent_platform.core.streaming import SseEventType
 from tests.conftest import (
     TEST_QUESTION,
     FakeChatModel,
@@ -27,14 +31,9 @@ from tests.conftest import (
     sufficient_outcome,
 )
 
-from agent_platform.agents.gov_policy_qa.state import AnswerStatus
-from agent_platform.core.errors import ErrorCode, ModelGatewayError, RetrievalFailedError
-from agent_platform.core.streaming import SseEventType
-
 if TYPE_CHECKING:
-    from tests.conftest import ApiHarness, OpenApi
-
     from agent_platform.settings import Settings
+    from tests.conftest import ApiHarness, OpenApi
 
 PING = ": ping"
 """心跳帧（注释帧，无 event/data）。"""

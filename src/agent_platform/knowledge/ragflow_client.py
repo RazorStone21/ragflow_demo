@@ -99,6 +99,9 @@ class RagFlowClient:
             self._client = httpx.AsyncClient(
                 headers=self._headers,
                 timeout=httpx.Timeout(settings.model_timeout_s, read=300.0),
+                # 与 GatewayHttpClient 同理：RAGFlow 是内网服务，不得继承宿主系统代理。
+                # 实测不关时会被本机代理返回 502（见 gateway_client.py 的同类注释）。
+                trust_env=False,
             )
         else:
             self._owns_client = False

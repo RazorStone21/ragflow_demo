@@ -6,7 +6,7 @@
 
 用法::
 
-    configure_logging(settings)            # 应用启动时调用一次
+    configure_logging(level="INFO")        # 应用启动时调用一次
     with log_context(request_id=rid, tenant_id=tid):
         get_logger(__name__).info("thread created", extra={"event": "thread.created"})
 """
@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -74,7 +75,12 @@ class StructuredJsonFormatter(logging.Formatter):
 
 
 def configure_logging(*, level: str = "INFO", force: bool = False) -> None:
-    """配置根 logger 输出单行 JSON 到 stdout。
+    """配置根 logger 输出单行 JSON 到 **stderr**。
+
+    写 stderr 而非 stdout 是有意的：脚本（``scripts/``）的标准输出要留给结果本身，
+    例如 ``demo_chat.py > answer.txt`` 应当只拿到干净的回答，不被日志行污染。
+    ``logging.StreamHandler()`` 不传参数时的默认流本就是 stderr，此处依赖该默认行为，
+    不显式传 ``sys.stderr`` 以免在被重定向后捕获到替换过的对象。
 
     Args:
         level: 日志级别（DEBUG/INFO/WARNING/ERROR）。
@@ -97,6 +103,25 @@ def configure_logging(*, level: str = "INFO", force: bool = False) -> None:
 def get_logger(name: str) -> logging.Logger:
     """获取模块 logger（结构化字段经 extra 注入）。"""
     return logging.getLogger(name)
+
+
+def enable_utf8_console() -> None:
+    """把 stdout/stderr 切到 UTF-8（Windows 控制台默认 GBK，中文会乱码或抛错）。
+
+    为什么放在 ``core/logging.py``：本模块是进程级输出配置的归属地（它已经安装根
+    handler、设置级别，都是进程全局副作用），编码同属这一层，放这里好过在两个 CLI
+    脚本里各抄一份。
+
+    为什么用 ``reconfigure()`` 而不是替换 ``sys.stdout``：``logging.StreamHandler()``
+    在创建时就抓住了当时的流对象；``reconfigure()`` 是**就地**修改编码，handler 持有的
+    同一对象随之生效。换成 ``sys.stdout = ...`` 会让 handler 继续写旧流。
+
+    Linux/容器下本就是 UTF-8，此函数为幂等空转；仅在 Windows 本地脚本场景有意义。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(encoding="utf-8", errors="replace")
 
 
 @contextmanager

@@ -1,0 +1,204 @@
+# =============================================================================
+# 本地/单机依赖编排（CLAUDE.md 2.2 / 11.1）
+#
+# 起什么：PostgreSQL（LangGraph checkpoint/store）、Redis（任务队列与缓存）、
+#         Milvus standalone（检索主链路，ADR-0002）、LiteLLM Proxy（统一模型网关，NO-02）。
+# 不起什么：RAGFlow。它是文档工程后端，以官方 compose 独立部署并按需启停
+#         （16GB 单机内存有限，见 docs/runbooks/ragflow_setup.md）。
+#
+# 用法：
+#   cp .env.example .env && 填好密钥
+#   docker compose up -d
+#   docker compose ps          # 等所有服务 healthy
+#
+# 卷落在 local_data/，该目录已 gitignore（NO-17：数据与索引不入库）。
+# =============================================================================
+
+name: agent-platform
+
+services:
+  # ---------------------------------------------------------------------------
+  # PostgreSQL：LangGraph 检查点与 store（CLAUDE.md 4.4 / NO-08）
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: ap-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-ragflow_demo}
+      # :? 表示必填——缺了就拒绝启动，而不是静默用弱口令起一个库
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 未设置，请先在 .env 中填写}
+      POSTGRES_DB: ${POSTGRES_DB:-agent_platform}
+      # 中文语料与答案需要正确排序/比较；与宿主机 locale 无关，容器内固定
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./local_data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ragflow_demo} -d ${POSTGRES_DB:-agent_platform}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [agent-platform-net]
+
+  # ---------------------------------------------------------------------------
+  # Redis：LangGraph 任务队列、缓存、限流（CLAUDE.md 1 章）
+  #
+  # 宿主端口刻意用 6380：RAGFlow 的 compose 占用 6379，两者并存时不冲突。
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: ap-redis
+    restart: unless-stopped
+    # 队列数据允许在容器重启时丢失重建；appendonly 换来的是持续的磁盘写。
+    # 若将来把 LangGraph 任务队列当权威状态，须改为 appendonly yes 并加卷。
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [agent-platform-net]
+
+  # ---------------------------------------------------------------------------
+  # Milvus standalone（检索主链路，ADR-0002）
+  #
+  # 三件套结构（etcd 元数据 / MinIO 对象存储 / standalone 本体）与版本取自官方
+  # v2.6.24 的 deployments/docker/standalone/docker-compose.yml，仅做三处改动：
+  #   1. 卷路径改到 ./local_data/milvus/（官方用 ./volumes/）；
+  #   2. 显式加入 agent-platform-net 并复用其别名，与 Postgres/Redis 同网；
+  #   3. 挂 milvus.yaml 覆写内存水位（官方默认值按大内存机器调，16GB 单机需压低）。
+  #
+  # 注意：官方 v2.6.24 这个 git tag 下的 compose 内 pin 的仍是 milvusdb/milvus:v2.6.23
+  # （上游未同步）。本仓按 CHANGELOG 已登记的 Milvus v2.6.24 落地，属**有意偏离**
+  # 上游文件字面内容，已在 CHANGELOG 记明。minio 镜像同样偏离（原因见该服务注释）。
+  # ---------------------------------------------------------------------------
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.25
+    container_name: ap-milvus-etcd
+    restart: unless-stopped
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "4294967296"
+      ETCD_SNAPSHOT_COUNT: "50000"
+    volumes:
+      - ./local_data/milvus/etcd:/etcd
+    command: etcd -advertise-client-urls=http://etcd:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks: [agent-platform-net]
+
+  minio:
+    # 用 Milvus 自建的 MinIO 镜像，**不是**上游 compose 里写的 minio/minio：
+    # Docker Hub 的 minio/minio 仓库已被移除（实测 `docker compose pull` 报
+    # "pull access denied ... repository does not exist"，Hub API 亦确认 object not found），
+    # 上游 v2.6.24 的 compose 因此对全新安装是坏的。Milvus master 已改用下面这个镜像。
+    image: milvusdb/minio:RELEASE.2024-12-18T13-15-44Z
+    container_name: ap-milvus-minio
+    restart: unless-stopped
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+    ports:
+      # 控制台 9001 与 API 9000。单机演示暴露到宿主便于排查；
+      # 生产（K8s）下不得暴露，见 deploy/k8s/README.md。
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./local_data/milvus/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks: [agent-platform-net]
+
+  milvus:
+    image: milvusdb/milvus:v2.6.24
+    container_name: ap-milvus-standalone
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      # 官方 compose 即如此设置；Milvus 依赖特定的系统调用，去掉会启动失败
+      - seccomp:unconfined
+    environment:
+      MINIO_REGION: us-east-1
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - ./local_data/milvus/standalone:/var/lib/milvus
+      # 内存水位覆写（16GB 单机约束，见文件内注释）
+      - ./deploy/docker/milvus/milvus.yaml:/milvus/configs/user.yaml:ro
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    depends_on:
+      etcd:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    networks: [agent-platform-net]
+
+  # ---------------------------------------------------------------------------
+  # LiteLLM Proxy：唯一模型出口（CLAUDE.md 5.1 / NO-02）
+  #
+  # 业务代码只认逻辑名（primary-chat / embedding / rerank），具体型号在
+  # deploy/docker/litellm/config.yaml 里映射。换型号不改业务代码。
+  # ---------------------------------------------------------------------------
+  litellm:
+    # 镜像 tag 编号**不跟 PyPI 发布号**，也不连续：GHCR 上高版本号明显缺失，
+    # 实测 `main-v1.104.x` / `main-v1.105.x` 等 tag 根本不存在（HTTP 404），
+    # 因此 CLAUDE.md 表格里写的「v1.104+」只能落实到镜像实际提供的最高形态。
+    #
+    # 为什么不是更常见的 main-v1.34.4：那个 tag 里装的是 litellm==1.34.4，
+    # 实测其 get_llm_provider 既不认 `deepseek/` 也不认 `hosted_vllm/`（两者都抛
+    # BadRequestError），而本配置三个逻辑名全依赖这两个 provider 前缀——
+    # 结果是网关崩溃重启循环（Restarting (1)），完全不可用。
+    # main-v1.82.3 里是 litellm==1.82.3，三个前缀实测全部解析成功。
+    image: ghcr.io/berriai/litellm:main-v1.82.3
+    container_name: ap-litellm
+    restart: unless-stopped
+    environment:
+      # LITELLM_MASTER_KEY 同时是调用方要携带的 Bearer Token（对应 .env 的 LITELLM_API_KEY）
+      LITELLM_MASTER_KEY: ${LITELLM_API_KEY:?LITELLM_API_KEY 未设置，请先在 .env 中填写}
+      # 加密存储模型凭据用的盐；缺失时 LiteLLM 会拒绝启动
+      LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?LITELLM_SALT_KEY 未设置，请先在 .env 中填写}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?DEEPSEEK_API_KEY 未设置，请先在 .env 中填写}
+      SILICONFLOW_API_KEY: ${SILICONFLOW_API_KEY:?SILICONFLOW_API_KEY 未设置，请先在 .env 中填写}
+      # 私有化部署：关闭遥测上报（CLAUDE.md 9.1 / NO-15：数据不得默认出域）
+      LITELLM_DONT_SHOW_FEEDBACK_BOX: "True"
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./deploy/docker/litellm/config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000", "--num_workers", "2"]
+    healthcheck:
+      # LiteLLM 的就绪探针；启动时要拉模型列表，给足 start_period
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness', timeout=5).status == 200 else 1)\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks: [agent-platform-net]
+
+networks:
+  agent-platform-net:
+    name: agent-platform-net
+    # 显式声明为非 external：本 compose 负责创建它。
+    # RAGFlow 的官方 compose 通过 external network 加入同一网络
+    # （见 docs/runbooks/ragflow_setup.md），从而与 Litellm/Milvus 互通。

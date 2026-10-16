@@ -8,7 +8,8 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import sys
+from collections.abc import Callable, Mapping
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -72,6 +73,25 @@ def fake_settings() -> Settings:
 def anyio_backend() -> str:
     """pytest-asyncio 场景下的后端占位（保持与 anyio 生态兼容）。"""
     return "asyncio"
+
+
+def pytest_asyncio_loop_factories(
+    config: pytest.Config, item: pytest.Item
+) -> Mapping[str, Callable[[], asyncio.AbstractEventLoop]] | None:
+    """Windows 上改用 Selector 事件循环，否则 psycopg 异步连接直接拒绝工作。
+
+    psycopg 的异步实现不支持 Windows 默认的 ``ProactorEventLoop``，会抛
+    ``InterfaceError: Psycopg cannot use the 'ProactorEventLoop' to run in async mode``。
+    Linux/容器（生产目标）默认就是 Selector，因此这里只对 Windows 生效，其余平台返回
+    ``None`` 走 pytest-asyncio 的默认行为。
+
+    用本 hook 而不是覆盖 ``event_loop_policy`` 夹具：后者在 pytest-asyncio 1.4 已废弃。
+    之所以不是"设一次全局 policy"，是因为事件循环由 ``loop_factory`` 直接造出来，
+    全局 policy 会被绕过（uvicorn 0.54 同样是这个原因，见 README 的 ``--loop`` 说明）。
+    """
+    if sys.platform != "win32":
+        return None
+    return {"win32-selector": asyncio.SelectorEventLoop}
 
 
 class FakeChatModel:
@@ -261,20 +281,25 @@ def build_api_stack(
     retriever: Any = None,
     chat: Any = None,
     readiness_checks: tuple[ReadinessCheck, ...] | None = None,
+    checkpointer: Any = None,
+    store: Any = None,
 ) -> ApiStack:
-    """装配一套内存版依赖：内存 checkpointer + 内存 store + fake 检索器/模型。
+    """装配一套依赖：默认内存 checkpointer + 内存 store + fake 检索器/模型。
 
-    ``InMemorySaver`` 仅供单测（NO-08：生产长流程必须 PostgresSaver）。
+    ``InMemorySaver`` 仅供单测（NO-08：生产长流程必须 PostgresSaver）。集成测试
+    经 ``checkpointer`` / ``store`` 传入 ``open_checkpoint_resources`` 的真实资源，
+    其余装配逐字复用，保证"集成验证的就是生产那条装配路径"。
     """
     resolved_retriever = retriever if retriever is not None else FakeRetriever(sufficient_outcome())
     resolved_chat = chat if chat is not None else FakeChatModel(CITED_REPLY)
-    store = InMemoryStore()
+    resolved_store = store if store is not None else InMemoryStore()
+    resolved_saver = checkpointer if checkpointer is not None else InMemorySaver()
     graph = build_graph(
         retriever=resolved_retriever,  # type: ignore[arg-type]  # 注入 fake（CLAUDE.md 9.3）
         chat=resolved_chat,
         chat_logical_name=settings.primary_chat_model,
-        checkpointer=InMemorySaver(),
-        store=store,
+        checkpointer=resolved_saver,
+        store=resolved_store,
         guardrail=None,
     )
     if readiness_checks is None:
@@ -282,7 +307,7 @@ def build_api_stack(
     return ApiStack(
         settings=settings,
         graph=graph,
-        store=store,
+        store=resolved_store,
         retriever=resolved_retriever,
         chat=resolved_chat,
         agent_name=AGENT_NAME,
@@ -361,10 +386,17 @@ def api_factory(fake_settings: Settings) -> OpenApi:
         retriever: Any = None,
         chat: Any = None,
         readiness_checks: tuple[ReadinessCheck, ...] | None = None,
+        checkpointer: Any = None,
+        store: Any = None,
     ) -> AsyncIterator[ApiHarness]:
         resolved = settings if settings is not None else fake_settings
         stack = build_api_stack(
-            resolved, retriever=retriever, chat=chat, readiness_checks=readiness_checks
+            resolved,
+            retriever=retriever,
+            chat=chat,
+            readiness_checks=readiness_checks,
+            checkpointer=checkpointer,
+            store=store,
         )
         app = build_test_app(stack)
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)

@@ -70,6 +70,12 @@ class Settings(BaseSettings):
 
     # --- PostgreSQL（LangGraph checkpoint / store）---
     postgres_dsn: SecretStr = Field(description="postgresql://user:pass@host:port/db")
+    postgres_connect_timeout_s: float = Field(
+        default=10.0,
+        gt=0,
+        le=120,
+        description="建连超时秒数；缺失则 libpq 可能无限期挂住（见 core/checkpoint.py）",
+    )
     redis_url: str = "redis://localhost:6380/0"
 
     # --- LiteLLM 网关（CLAUDE.md 5.1 / NO-02）---

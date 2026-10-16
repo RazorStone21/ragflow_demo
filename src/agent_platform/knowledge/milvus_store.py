@@ -191,6 +191,20 @@ class MilvusStore:
         logger.info("milvus.upserted", extra={"collection": self._collection, "rows": written})
         return written
 
+    async def flush(self) -> None:
+        """把已写入的数据落盘并使其对检索可见。
+
+        Milvus 默认是**有界一致性**：``upsert_chunks`` 返回之后，新数据在随后的一小段
+        时间里查不到。实测（standalone v2.6.24，本机）：写完立即 ``count()`` 得 0，
+        约 1 秒后得 3。对"入库后紧接着提问"的流程，这会表现为明明刚入库却检索不到证据，
+        进而触发 NO-12 的无证据降级分支——用户看到的是一句"没找到依据"。
+
+        因此入库流程**收尾时**必须显式调用一次。刻意不放进 ``upsert_chunks`` 里：
+        flush 会封存段，按批（每 32 条）调用会把批量写入的优势全部抵消。
+        """
+        await self._call("flush", self._client.flush, self._collection)
+        logger.info("milvus.flushed", extra={"collection": self._collection})
+
     async def delete_by_document(self, document_id: str, tenant_id: str) -> int:
         """删除某文档在指定租户下的全部 chunk（撤稿/重建索引用）。
 

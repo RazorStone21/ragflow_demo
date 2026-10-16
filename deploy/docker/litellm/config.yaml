@@ -1,0 +1,99 @@
+# =============================================================================
+# LiteLLM Proxy 模型映射（CLAUDE.md 5.1 / 5.2 / NO-02）
+#
+# 业务代码只认左侧的逻辑名（primary-chat / embedding / rerank，见 .env.example），
+# 具体型号只在本文件出现。换型号或切私有化端点，改这里，不改任何业务代码。
+#
+# 密钥一律 os.environ/... 注入，本文件不得出现真实密钥（NO-03 / 10.1）。
+#
+# 每个映射的落地依据已在注释里写明"查证到什么、还差什么"——凡未经运行时验证的，
+# 都必须显式标注，不得让读者以为已经跑通。
+# =============================================================================
+
+model_list:
+  # ---------------------------------------------------------------------------
+  # primary-chat：主对话模型
+  #
+  # deepseek 是 LiteLLM 的**原生 provider**（源码含 litellm/llms/deepseek/ 模块，
+  # 且 "deepseek" 在 LlmProviders 枚举内），无需 api_base，只需 DEEPSEEK_API_KEY。
+  # ---------------------------------------------------------------------------
+  - model_name: primary-chat
+    litellm_params:
+      model: deepseek/deepseek-chat
+      api_key: os.environ/DEEPSEEK_API_KEY
+      # 生成答案要可复现（CLAUDE.md 5.3：评测用固定温度）
+      temperature: 0.2
+      max_tokens: 2048
+
+  # ---------------------------------------------------------------------------
+  # embedding：向量化（Qwen3-Embedding，SiliconFlow 云端）
+  #
+  # 【为什么用 openai/ 前缀】LiteLLM 没有任何原生 SiliconFlow provider（已核对
+  # 源码树与文档树，无 siliconflow 条目）。SiliconFlow 的 /v1/embeddings 是标准
+  # OpenAI 形状，故走 LiteLLM 的 OpenAI 兼容通道 + 自定义 api_base。
+  #
+  # 【dim 必须与 MILVUS_DIM 一致】.env.example 的 MILVUS_DIM=4096 对应 8B 权重；
+  # 若改用 4B(2560)/0.6B(1024)，必须同步改 MILVUS_DIM，否则入库 upsert 会
+  # fail-fast 报维度不符（这是有意的：宁可启动即失败，也不要写入错的向量）。
+  #
+  # 【未经运行时验证】模型 ID 的确切拼写未经核实——SiliconFlow 的 /v1/models
+  # 需要鉴权（实测未带 key 返回 401 {"code":30014,"message":"Token is invalid."}），
+  # 无法在无密钥环境下确认。首次部署请按 docs/runbooks/ragflow_setup.md 的
+  # "核实 SiliconFlow 模型 ID" 一节实测，不符则改本行。
+  # ---------------------------------------------------------------------------
+  - model_name: embedding
+    litellm_params:
+      model: openai/Qwen/Qwen3-Embedding-8B
+      api_base: https://api.siliconflow.cn/v1
+      api_key: os.environ/SILICONFLOW_API_KEY
+    model_info:
+      # 文档 model_list 结构的规范取值（docs/proxy/config_settings.md 即以
+      # mode: embedding 为例）。声明后网关按 embedding 语义处理该部署。
+      mode: embedding
+
+  # ---------------------------------------------------------------------------
+  # rerank：重排（Qwen3-Reranker，SiliconFlow 云端）
+  #
+  # 【为什么是 hosted_vllm 而不是某个原生 provider】这是一个查证后得出的非显然
+  # 结论，值得写清楚：
+  #   - LiteLLM 官方 /rerank 支持的 provider 列表里**没有** SiliconFlow；但有
+  #     litellm/llms/hosted_vllm/rerank/transformation.py，且 "hosted_vllm" 确实
+  #     在 litellm.rerank() 的 custom_llm_provider 字面量内（已核源码）。
+  #   - HostedVLLMRerankConfig.get_complete_url() 对 api_base 的处理是：
+  #     结尾为 /v1/rerank 则改写为 /rerank，否则追加 /rerank。
+  #     因此 api_base=https://api.siliconflow.cn/v1 → 实际请求
+  #     https://api.siliconflow.cn/v1/rerank，与 SiliconFlow 文档的 rerank 端点一致。
+  #   - 其请求体为 {model, query, documents, top_n, return_documents,...}，
+  #     响应按 results[].{index, relevance_score} 解析——与 SiliconFlow 的
+  #     Jina 兼容形状一致，也与本仓 GatewayHttpClient.RerankResponse 的契约一致。
+  #
+  # 【未设 model_info.mode】官方 rerank 示例（docs/rerank.md）的 model_list 里
+  # 没有 mode 字段，故遵循官方示例不设；加一个没有依据的字段比不加更危险。
+  #
+  # 【未经运行时验证】同 embedding：这是**读源码得出的推断**，不是跑通的结果。
+  # 若运行时报错，按计划中的风险 #5 兜底：Reranker 直连 SiliconFlow（同接口），
+  # 并在 ADR 记明这一临时偏离。首次部署必须实测（runbook 有命令）。
+  # ---------------------------------------------------------------------------
+  - model_name: rerank
+    litellm_params:
+      model: hosted_vllm/Qwen/Qwen3-Reranker-8B
+      api_base: https://api.siliconflow.cn/v1
+      api_key: os.environ/SILICONFLOW_API_KEY
+
+# -----------------------------------------------------------------------------
+# 刻意不配置的项，以及原因（留白比配错更需要说明）：
+#
+# - router_settings.fallbacks（CLAUDE.md 5.4 要求的模型 fallback 链）：
+#   当前 .env 只有 DeepSeek 与 SiliconFlow 两家密钥，未配置第二家对话模型，
+#   无 key 的 fallback 写了也是死配。此项作为**已知缺口**记入 CHANGELOG，
+#   待补第二家 provider 密钥后再加 fallback-chat 条目与本段配置。
+#
+# - litellm_settings（如 num_retries / drop_params）：
+#   重试策略统一由应用侧 core/retry.py 的 tenacity 负责（CLAUDE.md 3.6）。
+#   此处再配一层重试会变成两层叠加，重试次数相乘，且掩盖真实错误。
+#
+# - general_settings.master_key / database_url：
+#   主密钥由 compose 注入的 LITELLM_MASTER_KEY 环境变量提供，LiteLLM 自动读取；
+#   演示期用静态主密钥，不需要 LiteLLM 自身的 Postgres（密钥管理 UI / 虚拟密钥），
+#   不接库可少一处启动依赖。
+# -----------------------------------------------------------------------------

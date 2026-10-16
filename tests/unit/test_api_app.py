@@ -15,13 +15,13 @@ from typing import TYPE_CHECKING, Any, cast
 import httpx
 import pytest
 from starlette.types import Message, Receive, Scope, Send
-from tests.conftest import build_api_stack, build_test_app
 
 from agent_platform import __version__
 from agent_platform.api.container import AppDeps, ReadinessCheck
 from agent_platform.api.middleware.request_context import REQUEST_ID_HEADER
 from agent_platform.core.logging import StructuredJsonFormatter
 from agent_platform.main import API_PREFIX
+from tests.conftest import build_api_stack, build_test_app
 
 if TYPE_CHECKING:
     from tests.conftest import ApiHarness, OpenApi

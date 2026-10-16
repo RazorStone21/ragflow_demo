@@ -24,12 +24,14 @@
 
 ```bash
 # 1) 配置环境（.env 严禁入库，NO-17）
-cp .env.example .env        # 填入 POSTGRES_DSN / LITELLM_API_KEY / RAGFLOW_API_KEY / AGENT_API_BEARER_TOKEN
+cp .env.example .env        # 必填项见 .env.example 尾部的说明，缺一项就起不来
 
 # 2) 启动基础设施（Postgres / Redis / Milvus / LiteLLM）
 docker compose up -d
+docker compose ps           # 等全部 healthy
 
-# 3) 首次使用 RAGFlow：按 docs/runbooks/ragflow_setup.md 完成初始化并生成 API Key
+# 3) 首次使用 RAGFlow：按 docs/runbooks/ragflow_setup.md 完成初始化并生成 API Key，
+#    并核实 SiliconFlow 模型 ID 与嵌入维度
 
 # 4) 同步依赖
 uv sync
@@ -38,8 +40,11 @@ uv sync
 uv run python scripts/ingest.py --source "e:\BaiduNetdiskDownload\gov_doc" --subset scripts/energy_subset.txt --dry-run
 uv run python scripts/ingest.py --source "e:\BaiduNetdiskDownload\gov_doc" --subset scripts/energy_subset.txt
 
-# 6) 启动 API
-uv run uvicorn agent_platform.main:app --host 127.0.0.1 --port 8000
+# 6) 启动 API（工厂形态：main.py 刻意没有模块级 app，见该模块文档字符串）
+uv run uvicorn --factory agent_platform.main:create_app --host 127.0.0.1 --port 8000
+#    仅 Windows 追加 --loop asyncio:SelectorEventLoop：默认的 ProactorEventLoop 不被
+#    psycopg 异步模式支持，会直接抛 InterfaceError。Linux/容器无需此参数。
+#    详见 docs/runbooks/local_env_setup.md「已知坑」。
 
 # 7) 端到端冒烟（另开终端）
 uv run python scripts/demo_chat.py --question "2025年新能源电价机制的主要内容？"
@@ -63,7 +68,10 @@ RUN_INTEGRATION_TESTS=true uv run pytest -m integration   # 需 compose 已启�
 | `src/agent_platform/agents/` | 智能体（当前：`gov_policy_qa`） |
 | `src/agent_platform/api/` | FastAPI 装配、路由、DTO、中间件 |
 | `scripts/` | 入库与演示脚本（均带 `--help`，可重复执行） |
+| `tests/unit/` | 离线单元测试（fake 掉一切外部依赖，必须快且确定） |
+| `tests/integration/` | 需真实基础设施的集成测试（`RUN_INTEGRATION_TESTS` 门控，未就绪自动 skip） |
 | `docs/adr/` | 架构决策记录（只增不改） |
+| `docs/runbooks/` | 环境与组件的手册（本机环境、RAGFlow 部署） |
 | `deploy/` | 本地 compose 片段与 K8s 模板 |
 
 ## 当前阶段边界（阶段二补齐）

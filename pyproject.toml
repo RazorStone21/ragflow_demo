@@ -87,6 +87,12 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"]
 
+[tool.ruff.lint.isort]
+# ``scripts`` 与 ``tests`` 都是本仓第一方代码，但都不在 ``src/`` 下，ruff 的 src 根
+# 推导找不到它们，会误判为第三方而排到 ``agent_platform`` 之前。显式声明，避免
+# "按工具的误会写 import 顺序"——读者不该从 import 分组里读出错误的依赖方向。
+known-first-party = ["scripts", "tests"]
+
 [tool.ruff.format]
 quote-style = "double"
 indent-style = "space"
@@ -99,8 +105,9 @@ python_version = "3.12"
 mypy_path = "src"
 namespace_packages = true
 explicit_package_bases = true
-# scripts/ 目录在 Phase 5 写入脚本后纳入（空目录会让 mypy 报错）
-files = ["src/agent_platform", "tests"]
+# scripts/ 于阶段五纳入（此前为空目录，会让 mypy 报错）。脚本与 src 同标准：
+# 它们是入库与冒烟验证的实际执行入口，类型错了会以"跑一半失败"的形式暴露。
+files = ["src/agent_platform", "tests", "scripts"]
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
@@ -125,6 +132,9 @@ ignore_missing_imports = true
 # ---------------------------------------------------------------------------
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 仓库根入 import 路径，使 tests 能 `from scripts import ingest` 直接测脚本逻辑。
+# agent_platform 走已安装包（editable），无需此处声明。
+pythonpath = ["."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "-q --strict-markers"
