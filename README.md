@@ -41,10 +41,11 @@ uv run python scripts/ingest.py --source "e:\BaiduNetdiskDownload\gov_doc" --sub
 uv run python scripts/ingest.py --source "e:\BaiduNetdiskDownload\gov_doc" --subset scripts/energy_subset.txt
 
 # 6) 启动 API（工厂形态：main.py 刻意没有模块级 app，见该模块文档字符串）
-uv run uvicorn --factory agent_platform.main:create_app --host 127.0.0.1 --port 8000
-#    仅 Windows 追加 --loop asyncio:SelectorEventLoop：默认的 ProactorEventLoop 不被
-#    psycopg 异步模式支持，会直接抛 InterfaceError。Linux/容器无需此参数。
-#    详见 docs/runbooks/local_env_setup.md「已知坑」。
+uv run uvicorn --factory agent_platform.main:create_app \
+    --loop asyncio:SelectorEventLoop --host 127.0.0.1 --port 8000
+#    --loop asyncio:SelectorEventLoop 在 Windows 上必需：asyncio 默认的 ProactorEventLoop
+#    不被 psycopg 异步模式支持，缺了会在启动时抛 InterfaceError；Linux/容器默认即
+#    Selector，无需此参数。详见 docs/runbooks/local_env_setup.md「已知坑」。
 
 # 7) 端到端冒烟（另开终端）
 uv run python scripts/demo_chat.py --question "2025年新能源电价机制的主要内容？"
