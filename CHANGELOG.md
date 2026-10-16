@@ -173,7 +173,9 @@ Postgres 检查点 + SSE 全序列）与 `test_milvus_integration.py`（真 Milv
 1. **SiliconFlow 模型 ID 与 `hosted_vllm` 重排路由仍未验证**。本次联调用的是**一次性弱口令
    冒烟栈**（不触碰仓库 `local_data/` 与用户 `.env`），密钥为占位值，网关对上游必然 502，
    因此这几条断言只走到了"服务可达性"这一层。要变成证据，仍需用户填好真实密钥后跑一次
-   `pytest -m integration` 并按 runbook 手工核实。
+   `pytest -m integration` 并按 runbook 手工核实。（**2026-10-16 更新**：真实密钥下的
+   `pytest -m integration` 已执行，两条推断**均被证实**，且过程中另修掉一处网关层缺陷——
+   见「真实密钥联调」条。）
 2. **RAGFlow 未部署**，`test_ragflow_integration.py` 与 `test_ingest_end_to_end.py` 共 9 条
    全部 skip。RAGFlow 需按其官方 compose 在**仓库外**独立部署（见 `docs/runbooks/ragflow_setup.md`）。
 3. **真实入库与端到端问答仍未执行**（前置同上）。
@@ -182,6 +184,53 @@ Postgres 检查点 + SSE 全序列）与 `test_milvus_integration.py`（真 Milv
 `.env.example` 的 `POSTGRES_DSN` 改为 `127.0.0.1` 并写明原因（照旧写 `localhost` 会启动卡死，
 属**行为变更**）；LiteLLM 镜像 tag 由 `main-v1.34.4` 改为 `main-v1.82.3`；README 启动命令补
 Windows 专属 `--loop` 参数说明。`CLAUDE.md` 本体仍未改动——规则版本升级与基线表同步统一在阶段六。
+
+### 未发布 · 阶段五（真实密钥联调，`fix` / `docs`）
+
+**背景**：`.env` 首次填入真实密钥，阶段五 5.2 的验证关卡开始真正执行（上一条只用了
+一次性弱口令冒烟栈，网关对上游必然失败，断言只走到"服务可达"层）。
+
+**实测通过**：`docker compose config --quiet`（只校验不输出，避免密钥回显到终端与日志）
+→ `docker compose up -d` **六服务全 healthy**（含此前一直崩溃重启的 LiteLLM，印证
+`main-v1.82.3` 的修复）→ `/healthz` 与 `/readyz` 真实探测 **HTTP 200**（`failed: []`）
+→ `ingest.py --dry-run` 列出能源子集 **20 份**、退出码 0、零网络请求（中文文件名正常）
+→ `pytest -m integration` **18 passed / 9 skipped / 0 failed**。
+
+其中 5 条此前一直 skip 的网关用例第一次真跑，**两条"读源码得出的推断"被证实**：
+
+- `hosted_vllm` → SiliconFlow `/v1/rerank` 的路由是对的——相关文档确实排第一，
+  不是等分或乱序（原注释标注的"风险 #5 兜底：Reranker 直连"因此不需要启用）；
+- `Qwen/Qwen3-Embedding-8B` 的模型 ID 拼写正确（出现在上游 `GET /v1/models` 的 99 个
+  模型清单里），实测输出 **4096** 维，与 `MILVUS_DIM` 一致。
+
+**发现并修复的缺陷（1 处，修在网关层）**：**SiliconFlow 对 `encoding_format` 的空值
+直接回 400**。现象是 `/v1/embeddings` 经网关一律 400，上游返回
+`{"code":20015,"message":"The parameter is invalid. Please check again."}`。定位靠
+容器内直连上游做最小化对照（同一 key、同一文本）：
+
+| 请求 | 结果 |
+|---|---|
+| 直连上游 `{model, input}` | 200 |
+| 经网关 `{model, input}` | **400（20015）** |
+| 经网关 `{model, input, encoding_format:"float"}` | 200，dims=4096 |
+| 直连上游 `encoding_format: null` 或 `""` | **400（20015）** |
+| 直连上游 `dimensions: null` / `user: null` | 200（不受影响） |
+
+即 **LiteLLM 1.82.3 在调用方未指定时，把 `encoding_format` 以空值转发给上游**，而
+SiliconFlow 不接受空值。修在 `deploy/docker/litellm/config.yaml` 的 embedding 条目
+（`encoding_format: "float"`）而非业务代码：这是 **provider 的怪癖**，按 NO-02 / 第 5 章
+业务代码只认逻辑名，型号与上游差异一律收敛在网关配置；`gateway_client.embed()` 的请求体
+保持 `{model, input}` 不变。踩坑与对照过程已写进配置注释，避免后人删掉这行。
+
+**排错方法（可复用，已记入配置注释）**：容器内直接用 python 打上游做最小化对照，比读
+LiteLLM 的转发逻辑快得多；另注 LiteLLM 镜像里是 **BusyBox**，`grep --include` 不可用。
+
+**仍未验证（前置：RAGFlow 未部署）**：`test_ragflow_integration.py` 6 条与
+`test_ingest_end_to_end.py` 3 条仍 skip；真实入库与幂等重跑、`demo_chat.py` 带引用回答、
+无关问题走降级三条端到端关卡未执行。
+
+**影响面**：仅 `deploy/docker/litellm/config.yaml` 的 embedding 条目新增一个参数；
+业务代码、HTTP 契约、环境变量均未变。
 
 ### 未发布 · 阶段四（API 与 SSE，`feat(api)`）
 

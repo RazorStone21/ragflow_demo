@@ -32,20 +32,30 @@ model_list:
   # 源码树与文档树，无 siliconflow 条目）。SiliconFlow 的 /v1/embeddings 是标准
   # OpenAI 形状，故走 LiteLLM 的 OpenAI 兼容通道 + 自定义 api_base。
   #
-  # 【dim 必须与 MILVUS_DIM 一致】.env.example 的 MILVUS_DIM=4096 对应 8B 权重；
-  # 若改用 4B(2560)/0.6B(1024)，必须同步改 MILVUS_DIM，否则入库 upsert 会
-  # fail-fast 报维度不符（这是有意的：宁可启动即失败，也不要写入错的向量）。
+  # 【模型 ID 与维度已运行时核实（2026-10-16）】Qwen/Qwen3-Embedding-8B 出现在
+  # SiliconFlow `GET /v1/models` 返回的 99 个模型清单里；实测输出 **4096** 维，
+  # 与 .env.example 的 MILVUS_DIM=4096 一致。若改用 4B(2560)/0.6B(1024)，必须
+  # 同步改 MILVUS_DIM，否则入库 upsert 会 fail-fast 报维度不符（这是有意的：
+  # 宁可启动即失败，也不要写入错的向量）。
   #
-  # 【未经运行时验证】模型 ID 的确切拼写未经核实——SiliconFlow 的 /v1/models
-  # 需要鉴权（实测未带 key 返回 401 {"code":30014,"message":"Token is invalid."}），
-  # 无法在无密钥环境下确认。首次部署请按 docs/runbooks/ragflow_setup.md 的
-  # "核实 SiliconFlow 模型 ID" 一节实测，不符则改本行。
+  # 【encoding_format 必须显式指定 —— 踩过的坑，别删】不指定时 LiteLLM 1.82.3
+  # 会把该参数以**空值**转发给上游，而 SiliconFlow 对空值直接回
+  # `400 {"code":20015,"message":"The parameter is invalid. Please check again."}`。
+  # 实测对照（同一 key、同一文本）：
+  #   直连上游 {model,input}                         → 200
+  #   经网关    {model,input}                        → 400（20015）
+  #   经网关    {model,input,encoding_format:"float"} → 200，dims=4096
+  #   直连上游 encoding_format:null 或 ""             → 400（20015）
+  #   直连上游 dimensions:null / user:null            → 200（这两个不受影响）
+  # 修在网关侧而非业务代码：这是 **provider 的怪癖**，按 NO-02 / 第 5 章，业务
+  # 代码只认逻辑名，型号差异与上游怪癖一律收敛在本文件。
   # ---------------------------------------------------------------------------
   - model_name: embedding
     litellm_params:
       model: openai/Qwen/Qwen3-Embedding-8B
       api_base: https://api.siliconflow.cn/v1
       api_key: os.environ/SILICONFLOW_API_KEY
+      encoding_format: "float"   # 见上：不是可选优化，缺了就直接 400
     model_info:
       # 文档 model_list 结构的规范取值（docs/proxy/config_settings.md 即以
       # mode: embedding 为例）。声明后网关按 embedding 语义处理该部署。
@@ -70,9 +80,11 @@ model_list:
   # 【未设 model_info.mode】官方 rerank 示例（docs/rerank.md）的 model_list 里
   # 没有 mode 字段，故遵循官方示例不设；加一个没有依据的字段比不加更危险。
   #
-  # 【未经运行时验证】同 embedding：这是**读源码得出的推断**，不是跑通的结果。
-  # 若运行时报错，按计划中的风险 #5 兜底：Reranker 直连 SiliconFlow（同接口），
-  # 并在 ADR 记明这一临时偏离。首次部署必须实测（runbook 有命令）。
+  # 【已运行时验证（2026-10-16）】上述路由推断经 test_litellm_proxy.py 的
+  # test_rerank_returns_relevance_ordered 在真实网关 + 真实 SiliconFlow 上跑通：
+  # 返回 results[].{index, relevance_score}，且与问题相关的那条排第一——断言的是
+  # "排第一"而不只是"有返回"，因为路由接错时往往返回一堆等分或乱序结果，只查结构
+  # 会漏掉。因此**不需要**启用计划中风险 #5 的兜底（Reranker 直连上游）。
   # ---------------------------------------------------------------------------
   - model_name: rerank
     litellm_params:
