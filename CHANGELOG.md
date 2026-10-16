@@ -268,6 +268,102 @@ LiteLLM 均无关；不同前向批的浮点归约顺序不同，故低位有差
 `tests/integration/test_litellm_proxy.py` 一条用例的断言与名称变更。业务代码、HTTP
 契约、环境变量均未变。
 
+### 未发布 · 阶段五（RAGFlow 部署与真实入库，`feat(knowledge)` / `fix` / `docs`）
+
+**背景**：RAGFlow v0.27.2 按 `docs/runbooks/ragflow_setup.md` 在**仓库外**部署完成（不 vendor
+上游 `docker/` 目录，规避其附加条款与升级维护负担）。阶段五最后一组关卡开始真跑：真实入库、
+幂等重跑、端到端带引用问答。此前 `test_ragflow_integration.py`（6 条）与
+`test_ingest_end_to_end.py`（3 条）共 9 条一直是 skip。
+
+**实测通过**：
+
+- **真实入库**：5 份能源政策 PDF → `total: 5, succeeded: 5, skipped: 0, failed: 0, chunks: 49`，退出码 0；
+- **幂等重跑**：`skipped: 5, chunks: 0`，Milvus 独立复核 **49 行**（无重复）；
+- **端到端问答**：`demo_chat.py --question "2025年新能源电价机制的主要内容？"` → SSE 序列
+  `retrieve_evidence`（命中 8 条证据）→ `generate_answer` → 中文回答带 `[1]..[8]` 内联引用与
+  引用清单（含文件名、页码）→ `run.completed`；回答明确声明资料未涵盖的部分（NO-12）；
+- **降级分支**：无关问题 → 0 条证据 → `answer_without_evidence`（**不调模型**）→ 确定性拒答 + 引导。
+
+**发现并修复的缺陷**：
+
+1. **入库曾处于"假绿"：解析失败被记成成功，重跑永久跳过**（本次最严重的一处）。RAGFlow 侧 5 份
+   文档全部 `run=FAIL`（根因见末条「部署事实」），而 `ingest.py` 把"解析成功但切分 0 条"当作成功
+   写入幂等清单——`succeeded: 5, chunks: 0`、退出码 0、无任何告警。后果不是"少几条数据"，而是
+   **这批文件从此再也不会被入库**，且不留痕迹。处置分两层：
+   - 新增错误码 `KNOWLEDGE_PARSE_FAILED` 与 `KnowledgeParseFailedError`：`FAIL`/`CANCEL` 或
+     零切分一律**显式失败**；`retryable=False`——RAGFlow 报 `FAIL` 是确定性结果，重试只会重复。
+   - 新增 `is_stale_manifest_entry()` 守卫：清单里 `chunk_count == 0`（或缺失、类型不可解释）的
+     记录视为**陈旧条目**，重跑时**不跳过而是重新入库**并打 `ingest.stale_manifest_entry` 警告。
+     判定朝向"宁可重跑"：重跑代价只是覆盖写入（Milvus 主键即 `chunk_id`），漏判代价是数据永久
+     缺失。`--dry-run` 与真实入库共用同一判定，否则"先干跑确认"就成了误导。
+2. **重入清理不是尽力而为，会在上传之前就把文件判死**。内容变更（或清单陈旧）时会先按旧
+   `document_id` 清理旧产物，而 RAGFlow 对"删一个不属于该数据集的 id"是**报错**而非幂等成功
+   （实测源码 `document_api.py` 的 `delete_documents` 先校验 id 归属）。于是只要那个文档已经不在
+   ——上一轮的补偿删除、或操作者在控制台手工清理——照常调用就会让本文件在上传前失败，而"它已经
+   不在了"恰恰是这一步想要的结果。改为 `_delete_document_best_effort()`：清理自身出错只记
+   `ingest.cleanup_failed` 警告，**不掩盖原始异常**（NO-06）。本次真实重跑中两处修复**都实际触发
+   过**（先 `stale_manifest_entry` 再 `cleanup_failed`），文件按预期继续而非中断。
+3. **`RagFlowClient.list_datasets(name=...)` 把"精确查找"当成了"过滤器"**。服务端的 `name`
+   参数查不到时直接返回 4xx `User '<tenant_id>' lacks permission for dataset '<name>'`
+   （源码 `dataset_api_service.py`：`if name:` 分支在 `get_kb_by_name` 落空时返回该消息）——
+   文案说的是权限，实际是"还没建"。首轮入库**必然**撞上（数据集尚未创建），且极具误导性。
+   改为客户端翻页 + 精确匹配，不把 `name` 发给服务端。
+4. **`extra=` 键撞 `LogRecord` 保留属性，只在日志级别放行时才炸**。`logging.Logger.makeRecord`
+   对同名键抛 `KeyError: Attempt to overwrite 'created' in LogRecord`，而该调用在
+   `isEnabledFor` **之后**——于是 pytest 默认 WARNING 级别下全绿，真跑 INFO 时 `ingest.py` 当场崩。
+   修正键名，并新增**全仓静态守卫** `test_extra_keys_never_shadow_logrecord_attributes`（AST 扫描
+   `src/`、`scripts/`、`tests/` 下所有 `extra={...}` 字面量），把这一类封死在提交之前。
+5. **`demo_chat.py` 从不渲染权威终态：降级分支表现为"答了个空"，且会把已撤回的草稿当答案**。
+   脚本只把 `message.delta` 写 stdout，`run.completed` 的负载里仅取了 `citations` 与
+   `answer_status`。于是：`answer_without_evidence` 按设计**不发任何增量** → 用户只看到空白；
+   更糟的是 `citation_missing` / `guardrail_blocked` —— 它们**已经流式推送过草稿**，随后用整段
+   兜底文案替换，而脚本会把**因无有效引用被撤回的结论**当作最终答案打印（NO-12 挡的正是它）。
+   已在脚本内声明该契约（答案正文以 `run.completed.answer` 为权威），无增量或终态与草稿不一致时
+   补打权威答案，草稿被替换时在 stderr 出声；草稿已逐字呈现时**不重复**（`> answer.txt` 仍是
+   干净答案）。
+
+**新增测试**：`tests/unit/test_ingest.py` 新增 2 例（零切分陈旧条目不跳过而重跑、上一轮遗留文档
+已不存在时不阻断重入），并把 `FakeRagFlow` 的删除语义**改成与真实服务端一致**（删不存在的 id
+要报错）——此前替身一律成功，"文档已不在"这条最常见的真实路径永远走不到，兜底逻辑无从验证
+（"替身比现实宽松"式的假绿）；`tests/unit/test_demo_chat.py` 新增 3 例（无增量时渲染终态、草稿被
+替换时以终态为准并出声、终态缺正文时指出契约异常）+ 1 条防重复断言；`tests/unit/test_ragflow_client.py`
+覆盖翻页与精确匹配。两处关键修复的**判别力均经实证**：临时摘掉修复后对应用例确实转红
+（`assert [] == ['a.pdf']`；`assert 2 == 0` / 退出码 `EXIT_PARTIAL`），随后恢复。
+
+**部署事实（已写入 runbook）**：RAGFlow 的解析**依赖租户默认嵌入模型**，未设置时一律 `run=FAIL`
+（这是上面第 1 条"假绿"的上游根因）；控制台里必须选 **`OpenAI-API-Compatible`** 而非 `OpenAI`
+——后者带一份写死的 OpenAI 真名清单，会逐个模型去访问真实的 api.openai.com 并失败（实测白跑
+一轮：报错堆里能看到 LiteLLM 的错误格式，故可据此判定网关本身是通的）；且**注册模型 ≠ 设为默认
+模型**，两个动作都要做。默认模型经 `PATCH /api/v1/models/default` 按 `model_id`（取自
+`GET /api/v1/models`，不硬编码）设置，指向本平台网关的 `embedding` 逻辑名。
+
+**门禁与验证**：`ruff format --check` 99 文件已格式化 → `ruff check` 全通过 → `mypy` 99 文件 0 问题
+→ `pytest tests/unit` **467 passed** → `pytest -m integration` 在**真实基础设施**上
+**27 passed / 0 skipped / 0 failed**（139s）。此后一次运行**零 skip**：此前一直 skip 的
+`test_ragflow_integration.py`（6 条）与 `test_ingest_end_to_end.py`（3 条）第一次真跑，后者在真
+容器上重跑了一遍三条幂等断言——「重跑不增条数」「内容变更后旧 chunk 一条不剩」「入库结果可被
+真实嵌入 + BM25 混合检索命中且跨租户不可见（NO-19）」——正是本次两处入库修复的自动化对应物。
+
+**已知缺口（如实记录，未掩饰）**：
+
+1. **只入了能源子集的 5 份，20 份白名单尚未全量入库**（`scripts/energy_subset.txt`）。先以 5 份
+   打通全链并验证幂等，再放量——放量前无需改代码，`--subset` 指向同一白名单即可。
+2. **RAGFlow 容器仍在运行**，占用 4 GiB 以上内存（16GB 本机的现实约束）。入库完成后可用
+   `docker compose stop` 回收（runbook 已写明）；**停它不影响检索与问答**，因为检索主链路在
+   Milvus（ADR-0002 的双后端分工）。
+3. **`.env` 的 `RAGFLOW_BASE_URL` 用 `localhost`**：与 Postgres 那条"IPv6 优先导致挂起"的实测
+   不同，httpx 对 ::1 的拒绝会立即回落到 IPv4，本次真实入库与集成测试均在 `localhost:9380`
+   下跑通，故**不改**（无证据不臆改）。
+4. 多租户 Milvus 主键缺口、Langfuse/护栏/评估占位等此前已登记的项，状态未变（见上文各条）。
+
+**影响面**：新增 1 个错误码（`KNOWLEDGE_PARSE_FAILED`）；`scripts/ingest.py` 与 `scripts/demo_chat.py`
+的行为变更（前者：零切分从"记成功"改为"失败 + 自愈重跑"；后者：增补权威答案渲染与 stderr 提示）；
+`RagFlowClient.list_datasets` 的名称过滤改为客户端实现（对调用方契约不变：仍返回匹配列表）。
+**未新增环境变量**（`.env.example` 复核无缺项）。`CLAUDE.md` 本体仍未改动——规则版本升级
+（v1.1.1 → v1.2.0）与基线表同步统一在阶段六提交。
+
+---
+
 ### 未发布 · 阶段四（API 与 SSE，`feat(api)`）
 
 **变更**：

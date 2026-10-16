@@ -152,7 +152,127 @@ curl -s -H "Authorization: Bearer $KEY" http://localhost:9380/api/v1/datasets | 
 # 期望：{"code":0,...,"data":[...]}
 ```
 
-## 步骤 5 · 核实 SiliconFlow 模型 ID 与维度
+## 步骤 5 · 配置默认嵌入模型（**跳过这步，解析必定失败**）
+
+> **实测踩过（2026-10-16）**：5 份文档上传成功、`start_parsing` 也返回成功，最终却全部
+> `run=FAIL`，`progress_msg` 里是
+> `[ERROR]Fail to bind embedding model: No default embedding model is set.`。
+> 根因在 RAGFlow 侧：`api/db/joint_services/tenant_model_service.py:196` 在租户没有默认
+> 嵌入模型时直接抛 `No default {model_type} model is set.`，由 `rag/svr/task_executor.py`
+> 包成上面那句。**上传与提交解析都不校验这一点**——它只在最晚的环节以"解析失败"的形态
+> 暴露，而错误文案不提"模型没配"，极容易误判成文件坏或引擎没起来。
+
+先看当前状态（本仓的 API Key 能读这两个端点，无需浏览器）：
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" http://localhost:9380/api/v1/models/default
+# 全新部署实测：{"code":0,"data":{"models":[]}}   ← 空即"没配"
+```
+
+### 为什么必须在浏览器里配
+
+- **v1 REST 没有注册供应商的端点**：只有 `GET /api/v1/models`、`GET /api/v1/models/default`、
+  `PATCH /api/v1/models/default`。`PATCH` 只能把**已存在**的模型指定为默认，不能创建。
+- 注册供应商走的是另一套 `web/` 会话鉴权路由，且注册/登录对**口令做 RSA 加密**
+  （见步骤 4）——脚本化的成本远高于收益。
+- 管理 CLI 需要 `ragflow-cli==0.27.2` **外加一个超级用户口令**，而上游 compose 未传
+  `--init-superuser`（步骤 4 已述：默认没有可用账号）。
+- **不要选 `Builtin` 供应商**：其嵌入实现被 COMPOSE_PROFILE 门控 ——
+  `rag/llm/embedding_model.py:224-241` 里 `BuiltinEmbed` 仅在
+  `"tei-" in os.getenv("COMPOSE_PROFILES", "")` 时才初始化，而本部署的 profile 是
+  `infinity,cpu,metadata-mysql`（不含 `tei-`），所以 Builtin 在我们这里**根本不可用**，
+  除非另外起一个 TEI 容器。
+- **不要选 `SILICONFLOW` 供应商**（RAGFlow 确实内置了它）：那会把厂商密钥留在 RAGFlow
+  里并绕开网关，违反 CLAUDE.md 5.1 与 NO-02（模型调用一律经 LiteLLM）。
+
+### 要填的值
+
+控制台 `http://localhost` → 右上角头像 → **模型提供商** → 添加 **OpenAI-API-Compatible**：
+
+| 字段 | 值 |
+|---|---|
+| API-Key | 本仓 `.env` 里的 **`LITELLM_MASTER_KEY`**（不是 SiliconFlow 的 key） |
+| Base URL | `http://host.docker.internal:4000/v1` |
+| 模型类型 / 模型名 | **`embedding`** ← 填 LiteLLM 的**逻辑名**，不是 `Qwen/Qwen3-Embedding-8B` |
+
+> `host.docker.internal` 可用是**实测**的：在 `ragflow-cpu` 容器内对
+> `host.docker.internal:4000` 与 `172.17.0.1:4000` 都能建立连接。
+> 填逻辑名 `embedding` 也是刻意的 —— 型号映射只活在
+> `deploy/docker/litellm/config.yaml`，换模型不动 RAGFlow（CLAUDE.md 第 5 章：业务只认逻辑名）。
+> 该表单若另有"维度 / dimension"一项，填 **4096**（与 `MILVUS_DIM` 一致）。
+
+顺手把 **chat** 的模型名 `primary-chat` 也加上（同一个供应商实例即可）：RAGFlow 的其它
+功能会用到它，且这同样经网关，不违反 NO-02。
+
+**不需要手工添加模型名**：该工厂在 `conf/llm_factories.json` 里的模型清单是**空的**，
+于是 `api/apps/services/provider_api_service.py` 会退回**模型发现** —— 主动
+`GET {base_url}/models`，再用 `rag/llm/model_meta.py` 的
+`OpenAIAPICompatible._infer_model_types` 按名字关键词定类型：含 `embed`/`bge` → embedding，
+含 `rerank` → rerank，其余 → chat。
+
+【已实测（2026-10-16）】本仓网关的 `/v1/models` 恰好返回三个逻辑名，正好对上这三条启发式，
+**自动发现即全部通过**：
+
+```
+primary-chat → chat     embedding → embedding     rerank → rerank
+```
+
+（控制台里那个 **添加自定义模型** 按钮是"要强制某个名字"时才用的，本例用不上。）
+
+### 供应商别选错：`OpenAI` ≠ `OpenAI-API-Compatible`（实测白跑过一轮）
+
+选 **`OpenAI`** 会看到满屏 `Fail to access model(OpenAI/gpt-3.5-turbo)`、`…/gpt-5.5`、
+`Fail to access embedding model(text-embedding-3-large)`、`tts-1`、`whisper-1` 之类。
+
+**这不是接线错**：`OpenAI` 工厂在 `llm_factories.json` 里带一份**写死的 OpenAI 真名清单**，
+RAGFlow 拿它逐个探测你的网关，网关当然全部拒绝。判据有两个，都能一眼认出：
+
+- 报错里的模型名是 **OpenAI 的真名**（gpt-*、text-embedding-3-*、whisper-1…）；
+- 错误体里嵌着 **LiteLLM 的错误格式**（`Call /v1/models to view available models for your key.`）
+  —— 这反过来证明网关是通的，只是名字不认识。
+
+只要换成 **`OpenAI-API-Compatible`**（空清单 → 走发现），同一组 base_url/key 就全过。
+
+`base_url` 对非 VLLM 供应商是**原样透传**的（`_normalize_provider_base_url` 只给 VLLM 补
+`/v1`），所以填 `http://host.docker.internal:4000/v1` 不会再被追加一层。
+
+### 必须再走「设置默认模型」
+
+**注册 ≠ 默认。** 三个模型都通过验证、`GET /api/v1/models` 能列出来，解析照样会失败 ——
+`tenant_model_service.py` 读的是 `Tenant` 表的 `embedding_id` / `tenant_embedding_id`，
+那是「设置默认模型」这一步写的。控制台自己也有这句提示：*“请先在模型提供商中添加 Embedding
+模型和 LLM，然后在『设置默认模型』中设置它们。”*
+
+到 **设置默认模型** 里把 **Embedding model** 选成 `embedding`、**Chat model** 选成
+`primary-chat`。
+
+### 复核
+
+```bash
+curl -s -H "Authorization: Bearer $KEY" http://localhost:9380/api/v1/models/default
+# 期望 data.models 里出现 model_type=embedding、model_name=embedding 的一条
+```
+
+若供应商已注册、只是默认没选上，可用 PATCH 补（这条是 v1 REST，**可脚本化**，
+【已于 2026-10-16 实测生效】）——传 `model_id` 最省事，文档写明它优先于
+`model_provider/model_instance/model_name` 三元组，且带存在性、归属与类型校验：
+
+```bash
+MID=$(curl -s -H "Authorization: Bearer $KEY" http://localhost:9380/api/v1/models \
+      | python -c "import json,sys; print([m['model_id'] for m in json.load(sys.stdin)['data'] if m['name']=='embedding'][0])")
+curl -s -X PATCH http://localhost:9380/api/v1/models/default \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d "{\"model_id\":\"$MID\",\"model_type\":\"embedding\"}"
+# 期望 {"code":0}；随后 GET /models/default 应出现 model_type=embedding 的一条
+```
+
+> `model_id` 从 `GET /api/v1/models` 现取、不要硬编码：抄串了会静默把默认指到别的模型上，
+> 而 PATCH 仍返回成功。
+
+**顺序很重要**：先做完这一步再跑 `scripts/ingest.py`。否则会得到一批 `run=FAIL` 的文档，
+而 RAGFlow **拒绝同名重复上传**（下一节），必须先删掉失败文档才能重跑。
+
+## 步骤 6 · 核实 SiliconFlow 模型 ID 与维度
 
 > **已于 2026-10-16 用真实密钥核实完毕**：`Qwen/Qwen3-Embedding-8B` 确实出现在上游
 > `GET /v1/models` 的 99 个模型清单里，实测输出 **4096** 维、与 `MILVUS_DIM` 一致；
@@ -187,7 +307,7 @@ curl -s https://api.siliconflow.cn/v1/embeddings \
 RUN_INTEGRATION_TESTS=true uv run pytest -m integration -k litellm -v
 ```
 
-## 步骤 6 · 与本平台联通（可选，当前不需要）
+## 步骤 7 · 与本平台联通（可选，当前不需要）
 
 本平台只从**宿主机**按 `RAGFLOW_BASE_URL` 访问 RAGFlow，因此两者不在同一 Docker
 网络里也能工作。若将来需要容器间直连（例如把 RAGFlow 的 MCP 服务挂进编排），
@@ -242,9 +362,27 @@ docker compose stop                       # 入库完成后释放 4 GiB+（数�
 | `docker compose up` 卡在拉镜像 | Docker Desktop 未配代理（Settings → Resources → Proxies） |
 | ragflow 容器反复重启，日志有 `nltk` / `huggingface` 下载失败 | `HF_ENDPOINT` 未改成镜像站，或容器无外网 |
 | 上传返回 `code=109` | `RAGFLOW_API_KEY` 错或失效，重新生成 |
+| 文档 `run=FAIL`，`progress_msg` 含 `Fail to bind embedding model: No default embedding model is set.` | **租户没配默认嵌入模型**，见步骤 5。错误文案不提模型，极易误判成文件坏 |
 | 解析长时间 `RUNNING` | 扫描件在 OCR；`RAGFLOW_PARSE_TIMEOUT_S` 默认 3600s。本项目能源子集已确认是文本型 PDF，无需 OCR |
+| 重新上传报 `Duplicated document name in the same dataset.` | 见下节「同名文档」 |
 | 入库报"文件名超过 255 字节" | RAGFlow 按**字节**限长，中文名约 85 字就到顶，重命名后再入库 |
 | 9380 连不上但控制台能开 | `SVR_HTTP_PORT` 被改成了别的值，或容器未 healthy |
+
+### 同名文档：RAGFlow 拒绝重复上传（会卡死重跑）
+
+【已核实（v0.27.2 源码）】`api/apps/restful_apis/document_api.py` 的上传处理器先查
+`DocumentService.query(name=name, kb_id=dataset_id)`，非空即返回
+`Duplicated document name in the same dataset.` —— **同名不是覆盖，是拒绝**。
+
+推论很关键：**任何残留在数据集里的文档（尤其是解析失败的）都会挡住同名文件的重新入库**，
+而失败文档不会被记进幂等清单、也就没人替它收尸。`scripts/ingest.py` 因此有两处兜底：
+
+1. 入库失败时**补偿删除**刚上传的文档（`ingest.file_failed` 后跟 `ingest.cleanup_failed` 即为它没删掉）；
+2. 重入时清理上一轮遗留文档是**尽力而为**的 —— 该文档大概率已被第 1 条删掉，而 RAGFlow 对
+   "删除不属于该数据集的 id"是**报错**而非幂等成功，所以这一步失败不判整体失败
+   （否则重跑会在上传之前就卡死）。
+
+两处都失败时（例如 RAGFlow 不可用），到控制台手工删掉同名文档再重跑。
 
 ## 升级
 
