@@ -337,8 +337,8 @@ docker network connect agent-platform-net ragflow-server   # 容器名以 docker
 2. **"入库时停掉 postgres/redis 腾内存"没用**：实测两个加起来只有 59 MiB。
    要腾内存得看上面那张表里真正的大头。
 
-因此策略是：**入库分批做**（先 5 份跑通端到端再上量）、**入库完成后停 RAGFlow**、
-解析期间不要在宿主上跑别的重活：
+因此策略是：**入库分批做**（实测路径：5 份跑通端到端 → 放量到 19 份，两批都验证了幂等重跑）、
+**入库完成后停 RAGFlow**、解析期间不要在宿主上跑别的重活：
 
 ```bash
 cd /e/Codes/ragflow-0.27.2/docker
@@ -363,7 +363,8 @@ docker compose stop                       # 入库完成后释放 4 GiB+（数�
 | ragflow 容器反复重启，日志有 `nltk` / `huggingface` 下载失败 | `HF_ENDPOINT` 未改成镜像站，或容器无外网 |
 | 上传返回 `code=109` | `RAGFLOW_API_KEY` 错或失效，重新生成 |
 | 文档 `run=FAIL`，`progress_msg` 含 `Fail to bind embedding model: No default embedding model is set.` | **租户没配默认嵌入模型**，见步骤 5。错误文案不提模型，极易误判成文件坏 |
-| 解析长时间 `RUNNING` | 扫描件在 OCR；`RAGFLOW_PARSE_TIMEOUT_S` 默认 3600s。本项目能源子集已确认是文本型 PDF，无需 OCR |
+| 解析长时间 `RUNNING` | **头号原因不是扫描件，而是「页数多 / 表格密集」**：`layout_recognize=DeepDOC` 对**每一页**都跑版面识别与表格结构识别（TSR，日志表现为反复出现 `Best table orientation: 0°`），与页面有无文本层无关。实测 0061（318 页竞价结果表，仅 1.2MB）被拆成 27 个 12 页任务、单片 `Build document` 410~809s、全程约 3 小时，超出 `RAGFLOW_PARSE_TIMEOUT_S`（默认 3600）。**按文件大小估耗时是错的判据**，页数 × 表格密度才是。处置：调大该值，或把这类大页数表格件移出子集（见 `scripts/energy_subset.txt` 文末）。查进度看 `docker logs docker-ragflow-cpu-1 --since 5m` 里的 `Task done` 行；`docker stats` 里 CPU 打满而内存不高即属此类 |
+| 超时或人工停止后，RAGFlow 里的文档不见了 | **设计行为，非异常**：超时、`FAIL`、`CANCEL` 都会触发 `scripts/ingest.py` 的补偿删除（`ingest_one` 的 `except AgentPlatformError` 分支）。不删则残留文档挡住同名重传，重跑永远补不上。代价是**已经跑掉的分片全部作废**（重跑要重新解析）——所以对"本就很慢"的文件，应早点决定是调大超时还是移出子集，而不是跑一半再停 |
 | 重新上传报 `Duplicated document name in the same dataset.` | 见下节「同名文档」 |
 | 入库报"文件名超过 255 字节" | RAGFlow 按**字节**限长，中文名约 85 字就到顶，重命名后再入库 |
 | 9380 连不上但控制台能开 | `SVR_HTTP_PORT` 被改成了别的值，或容器未 healthy |
