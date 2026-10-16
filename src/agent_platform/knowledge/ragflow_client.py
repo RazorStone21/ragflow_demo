@@ -149,12 +149,34 @@ class RagFlowClient:
     async def list_datasets(
         self, *, name: str | None = None, page_size: int = DEFAULT_PAGE_SIZE
     ) -> list[DatasetInfo]:
-        """列出数据集（可按名称过滤）。"""
-        params: dict[str, Any] = {"page": 1, "page_size": page_size}
-        if name:
-            params["name"] = name
-        body = await self._request("GET", "/api/v1/datasets", params=params)
-        return _parse_list(body, DatasetInfo, "数据集")
+        """列出数据集（可按名称精确过滤）。
+
+        名称过滤**在客户端完成**，不把 ``name`` 发给服务端。依据（实测，v0.27.2）：
+        服务端的 ``name`` 参数不是过滤器而是**精确查找**，查不到时直接返回 4xx
+        ``User '<tenant_id>' lacks permission for dataset '<name>'``
+        （源码 ``api/apps/services/dataset_api_service.py`` 的 ``list_datasets``：``if name:``
+        分支在 ``get_kb_by_name`` 落空时返回该消息）。把它当过滤器用，会在"数据集尚未创建"
+        这一最常见的情形下失败——首轮入库必然如此，且错误文案说的是权限，极具误导性。
+
+        Args:
+            name: 精确匹配的数据集名；``None`` 表示不过滤（只取首页）。
+            page_size: 每页条数。
+
+        Returns:
+            匹配的数据集列表。指定 ``name`` 时会翻页直到命中或取完所有页。
+        """
+        page = 1
+        while True:
+            body = await self._request(
+                "GET", "/api/v1/datasets", params={"page": page, "page_size": page_size}
+            )
+            items = _parse_list(body, DatasetInfo, "数据集")
+            if name is None:
+                return items
+            matched = [dataset for dataset in items if dataset.name == name]
+            if matched or len(items) < page_size:
+                return matched
+            page += 1
 
     # ------------------------------------------------------------------
     # 文档

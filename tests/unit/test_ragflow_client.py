@@ -105,6 +105,65 @@ async def test_ensure_dataset_creates_when_absent() -> None:
     assert await _client(handler).ensure_dataset("gov_policy") == "ds_new"
 
 
+async def test_list_datasets_filters_by_name_on_the_client() -> None:
+    """名称过滤在客户端完成：**不把 ``name`` 发给服务端**。
+
+    实测（v0.27.2）：服务端的 ``name`` 是**精确查找**而非过滤器，查不到时返回 4xx
+    ``User '…' lacks permission for dataset '…'``（文案说的是权限，实为"不存在"）。
+    若照字面当过滤器发出去，"数据集尚未创建"这一最常见情形会直接失败——首轮入库必然如此。
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _ok([{"id": "ds1", "name": "gov_policy"}, {"id": "ds2", "name": "other"}])
+
+    datasets = await _client(handler).list_datasets(name="gov_policy")
+
+    assert [dataset.id for dataset in datasets] == ["ds1"]
+
+
+async def test_list_datasets_name_filter_never_reaches_the_server() -> None:
+    """把上一条的"不发给服务端"钉在请求串上——否则这次修复随时会被改回去。"""
+    queries: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        queries.append(request.url.query.decode())
+        return _ok([{"id": "ds1", "name": "gov_policy"}])
+
+    await _client(handler).list_datasets(name="gov_policy")
+
+    assert queries == ["page=1&page_size=100"]
+
+
+async def test_list_datasets_pages_until_name_is_found() -> None:
+    """目标数据集不在首页时继续翻页，而不是当成不存在。"""
+    pages: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        pages.append(page)
+        if page == 1:
+            return _ok([{"id": f"ds{i}", "name": f"filler-{i}"} for i in range(100)])
+        return _ok([{"id": "ds_target", "name": "gov_policy"}])
+
+    datasets = await _client(handler).list_datasets(name="gov_policy")
+
+    assert [dataset.id for dataset in datasets] == ["ds_target"]
+    assert pages == [1, 2]
+
+
+async def test_list_datasets_absent_name_is_empty_not_error() -> None:
+    """翻到最后一页仍无同名数据集时返回空列表——"没有"不得表现为异常。
+
+    这正是实测踩到的坑：服务端对"查不到"的响应是 4xx，客户端必须把它收敛成空列表，
+    否则 ``ensure_dataset`` 永远走不到"创建"那一步。
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _ok([{"id": "ds1", "name": "other"}])
+
+    assert await _client(handler).list_datasets(name="gov_policy") == []
+
+
 async def test_ensure_dataset_rejects_response_without_id() -> None:
     """创建响应缺少 id 时视为契约破坏。"""
 
