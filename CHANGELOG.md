@@ -78,6 +78,20 @@
 
 **未决事项**：本次不新增；D1 / D2 / D3 仍待处理，D3 的裁定问题**未因签署而得到回答**（见上条 ①）。
 
+### 未发布 · 阶段七（集成测试去跨运行全局耦合，`test(integration)`）
+
+**日期**：2026-10-17　**规范版本**：CLAUDE.md v1.3.0　**关联**：`tests/evals/README.md` 5.2 的 D10 条（补记）
+
+**变更**：`tests/integration/test_milvus_integration.py` 的 `TENANT_A` / `TENANT_B` 改为**每次运行独占**（`_RUN_SALT` 后缀），并相应更新 `test_count_respects_tenant_scope` 的 docstring。**不改任何被测代码**。
+
+**动机**：全门禁链的集成层报出 `test_count_respects_tenant_scope` 失败——`assert 6 == 3`。追下来就是 D10 那批残留（`doc-bb2b655b4444`，`test-tenant-a/b` 各 3 行）还在库里。**错在断言的前提，不在被测代码**：那 6 行确实都是 `test-tenant-a` 的行，`count` 按租户统计的行为完全正确；错的是"这个租户名下只有本夹具刚写的行"这个**跨运行假设**，而它本来就不成立——夹具的清理写在 `finally:` 里，进程被杀就不执行。租户名固定 ⇒ 任何一次中断都会让此后**每一次**运行失败，直到有人手工清库；而这条失败没有任何地方会提醒你"该清库了"。
+
+**影响面**：只动测试，不动运行时。租户独占之后夹具写下的即该租户的全部内容，**绝对条数才重新有意义**；`test_tenant_filter_isolates_results` 的隔离断言顺带变扎实（该租户名下确定只有夹具自己那 3 行，而不是"恰好没排进 top-k"）。**残留的 6 行仍在 Milvus 里，未删**——修的是前提不是数据，写库需另行授权。反过来，删数据也不能替代这次修复：它只解这一次，下一次中断照样复现。
+
+**验证**：`RUN_INTEGRATION_TESTS=true uv run pytest -m integration` → **18 passed, 9 skipped**（修改前 1 failed / 17 passed / 9 skipped）；`ruff format --check`、`ruff check`、`mypy` 均通过。
+
+**未决事项**：本次不新增。
+
 ### 未发布 · 工程门禁（`chore(ci)`）
 
 **变更**：

@@ -30,8 +30,23 @@ if TYPE_CHECKING:
 
 pytestmark = pytest.mark.integration
 
-TENANT_A = "test-tenant-a"
-TENANT_B = "test-tenant-b"
+_RUN_SALT = uuid.uuid4().hex[:8]
+"""本进程独占的租户后缀，让每次运行的租户名都不一样。
+
+租户名原先写成固定的 ``test-tenant-a`` / ``test-tenant-b``，于是**断言绝对条数**
+（如 ``count(TENANT_A) == 3``）就隐含了一个跨运行假设：这个租户名下除了本夹具刚写的
+三行再无别行。这个假设是假的——夹具的清理写在 ``finally:`` 里，进程被杀就不执行，
+残留会一直留着。实测发生过：某次中断留下的 ``doc-bb2b655b4444``（两个租户各 3 行）
+把下一次运行的 ``count(TENANT_A)`` 从 3 顶成 6，测试报 ``assert 6 == 3``。
+
+关键在于**这不是代码错**：那 6 行确实都是 ``test-tenant-a`` 的行，``count`` 按租户
+统计的行为完全正确，错的是"这个租户名下只有我写的行"这个前提。所以修的是前提——
+每次运行自带私有租户，夹具写入的即该租户的全部内容，绝对条数才重新有意义；顺带
+让租户名互不相同的断言（前缀不同即不可能相等）也真的扎得下去。
+"""
+
+TENANT_A = f"test-tenant-a-{_RUN_SALT}"
+TENANT_B = f"test-tenant-b-{_RUN_SALT}"
 DATASET = "integration_test_dataset"
 
 CORPUS = {
@@ -181,7 +196,11 @@ async def test_tenant_filter_isolates_results(
 
 
 async def test_count_respects_tenant_scope(seeded: MilvusStore) -> None:
-    """``count`` 按租户统计，不把其他租户的行算进来。"""
+    """``count`` 按租户统计，不把其他租户的行算进来。
+
+    断言绝对条数的前提是"这个租户名下只有本夹具写的行"——该前提由每次运行独占的
+    租户名（见 ``_RUN_SALT``）保证，而不是由"历史上没人漏清理"保证。
+    """
     assert await seeded.count(tenant_id=TENANT_A) == len(CORPUS)
     assert await seeded.count(tenant_id=TENANT_B) == len(CORPUS)
 
