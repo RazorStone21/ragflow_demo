@@ -223,6 +223,107 @@ async def test_run_stream_consumes_full_sequence(capsys: pytest.CaptureFixture[s
     assert "电价办法.pdf" in captured.out
     assert "grounded" in captured.out, "答案状态要显示，未接地时必须看得出来"
     assert "命中证据 1 条" in captured.err
+    assert captured.out.count("居民电价按年度核定[1]。") == 1, (
+        "草稿已逐字呈现，权威终态不得再打一遍——否则 demo_chat.py > answer.txt 里答案会重复"
+    )
+
+
+async def test_run_stream_renders_answer_from_completed_when_no_delta(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """降级分支不发任何 token 增量，正文只能来自 ``run.completed``。
+
+    这是实测漏过的缺陷：只打印 message.delta 时，``answer_without_evidence`` 在终端上
+    表现为"答了个空"，看上去像产品缺陷，实为冒烟脚本漏渲染了权威终态。
+    """
+    refusal = (
+        "抱歉，我在现有资料中没有找到足以支撑回答的内容，因此不给出结论（不做无依据的推测）。"
+        "\n\n请补充政策名称、发布年份、地区或文号等线索，我再检索一次。"
+    )
+    chunks = [
+        sse("run.started", {"agent": "gov_policy_qa"}),
+        sse("retrieval.evidence", {"evidence": []}),
+        sse("node.entered", {"node": "answer_without_evidence"}),
+        sse(
+            "run.completed",
+            {
+                "answer": refusal,
+                "answer_status": "insufficient_evidence",
+                "citations": [],
+                "retrieval_meta": {},
+            },
+        ),
+    ]
+    async with make_client(stream_handler(chunks)) as client:
+        code = await demo_chat.run_stream(
+            client,
+            base_url="http://testserver",
+            headers={},
+            thread_id="t1",
+            agent="gov_policy_qa",
+            question="如何用 Python 实现快速排序？",
+        )
+
+    captured = capsys.readouterr()
+    assert code == demo_chat.EXIT_OK
+    assert refusal in captured.out, "无增量时权威答案必须由 run.completed 渲染出来"
+    assert "insufficient_evidence" in captured.out
+    assert "不一致" not in captured.err, "压根没有草稿，不得误报'草稿被替换'"
+
+
+async def test_run_stream_shows_authoritative_answer_when_draft_was_replaced(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """引用缺失/护栏拦截会在流式推送**之后**替换草稿：以终态为准，且必须出声。
+
+    只打印增量会把"已被撤回、没有有效引用的结论"当作最终答案展示（NO-12 挡的正是它）。
+    """
+    chunks = [
+        sse("message.delta", {"delta": "根据资料，电价将于次年上调。"}),
+        sse(
+            "run.completed",
+            {
+                "answer": "抱歉，本次生成的回答未能给出有效引用，无法确认其有据可依，因此不予采纳。",
+                "answer_status": "citation_missing",
+                "citations": [],
+            },
+        ),
+    ]
+    async with make_client(stream_handler(chunks)) as client:
+        code = await demo_chat.run_stream(
+            client,
+            base_url="http://testserver",
+            headers={},
+            thread_id="t1",
+            agent="gov_policy_qa",
+            question="电价会涨吗？",
+        )
+
+    captured = capsys.readouterr()
+    assert code == demo_chat.EXIT_OK
+    assert "不予采纳" in captured.out, "草稿被撤回后，权威终态必须出现在 stdout"
+    assert "citation_missing" in captured.out
+    assert "不一致" in captured.err, "草稿被整段替换必须出声，否则读者会以为草稿就是答案"
+
+
+async def test_run_stream_reports_missing_answer_body(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``run.completed`` 不带正文时指出契约异常，不假装"模型回答为空"。"""
+    chunks = [sse("run.completed", {"answer": "", "answer_status": "pending", "citations": []})]
+    async with make_client(stream_handler(chunks)) as client:
+        code = await demo_chat.run_stream(
+            client,
+            base_url="http://testserver",
+            headers={},
+            thread_id="t1",
+            agent="gov_policy_qa",
+            question="q",
+        )
+
+    captured = capsys.readouterr()
+    assert code == demo_chat.EXIT_OK
+    assert "未携带答案正文" in captured.err
 
 
 async def test_run_stream_stops_at_run_error(capsys: pytest.CaptureFixture[str]) -> None:

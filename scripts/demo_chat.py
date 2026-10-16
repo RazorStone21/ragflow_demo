@@ -12,6 +12,11 @@ Milvus，答案来自网关后的对话模型。因此本脚本能跑通，就�
 输出分流（有意为之）：**回答写 stdout**，诊断写 stderr。这样 ``demo_chat.py > answer.txt``
 拿到的就是干净的答案，而进度与日志不污染它。
 
+答案正文以 ``run.completed`` 的 ``answer`` 为**权威终态**（契约见 ``api/schemas/events.py``）：
+``message.delta`` 只是草稿——降级分支根本不发增量，而引用缺失/护栏拦截会在流式推送**之后**
+用整段兜底文案替换掉草稿。只打印增量，前者表现为"答了个空"，后者更糟：把已被撤回的
+无引用结论当作最终答案展示（NO-12 要挡的正是它）。
+
 用法::
 
     uv run python scripts/demo_chat.py --question "2025年新能源电价机制的主要内容？"
@@ -153,6 +158,7 @@ async def run_stream(
     payload = {"agent": agent, "message": question}
     completed: dict[str, Any] | None = None
     block: list[str] = []
+    draft: list[str] = []  # 已推送的增量拼接（草稿），用于判断终态是否需要补打
 
     async with client.stream("POST", url, headers=headers, json=payload) as response:
         if response.status_code >= 400:
@@ -176,6 +182,8 @@ async def run_stream(
                 block = []
             if frame is None:
                 continue
+            if frame.event == "message.delta":
+                draft.append(_delta_of(frame))
             code = _handle_frame(frame)
             if code is not None:
                 return code
@@ -186,6 +194,7 @@ async def run_stream(
         sys.stderr.write("流已结束但未收到 run.completed（连接可能被中断）\n")
         return EXIT_PROTOCOL
 
+    _emit_authoritative_answer(completed, streamed="".join(draft).strip())
     _out("\n")
     citations = completed.get("citations") or []
     _out(f"引用来源（{len(citations)} 条）：\n{render_citations(citations)}\n")
@@ -204,8 +213,7 @@ def _handle_frame(frame: Frame) -> int | None:
         count = len(payload.get("evidence") or [])
         sys.stderr.write(f"[retrieval] 命中证据 {count} 条\n")
     elif frame.event == "message.delta":
-        # 负载键名核实自 generate_answer 节点：data={"delta": delta}
-        _out(str(payload.get("delta") or ""))
+        _out(_delta_of(frame))
     elif frame.event == "run.error":
         sys.stderr.write(
             f"[error] {payload.get('code')}: {payload.get('message')}"
@@ -213,6 +221,46 @@ def _handle_frame(frame: Frame) -> int | None:
         )
         return EXIT_RUN_ERROR
     return None
+
+
+def _delta_of(frame: Frame) -> str:
+    """取 ``message.delta`` 帧的增量文本。
+
+    负载键名核实自 ``generate_answer._stream_answer``：``data={"delta": delta}``。delta 的
+    读取只有这一处，渲染（:func:`_handle_frame`）与草稿累积（:func:`run_stream`）共用，
+    避免两处各写一份键名、日后改一处漏一处。
+    """
+    payload = frame.data.get("payload") or {}
+    return str(payload.get("delta") or "")
+
+
+def _emit_authoritative_answer(completed: dict[str, Any], *, streamed: str) -> None:
+    """打印 ``run.completed.answer``——本轮运行的**权威答案**，必要时说明它替代了草稿。
+
+    为什么不能只打印 ``message.delta``：降级分支（``answer_without_evidence``）按设计不发
+    任何增量，只打增量则用户看到一片空白；更糟的是 ``citation_missing`` /
+    ``guardrail_blocked``——它们**已经流式推送过草稿**，随后用整段兜底文案替换掉它。
+    只打增量就是把"因无有效引用而被撤回的结论"当成最终答案展示（NO-12 挡的正是它）。
+
+    草稿已逐字呈现时不再重复，``demo_chat.py > answer.txt`` 因此拿到的仍是干净答案。
+
+    Args:
+        completed: ``run.completed`` 的负载。
+        streamed: 已写到 stdout 的增量拼接结果。与节点的归一化口径一致地 strip 后比较
+            （``generate_answer._stream_answer`` 返回 ``"".join(parts).strip()``）。
+    """
+    answer = str(completed.get("answer") or "")
+    if not answer:
+        # 终态无正文属服务端契约异常：如实说明，不让人误以为"模型答了个空"
+        sys.stderr.write("[final] run.completed 未携带答案正文（服务端终态异常）\n")
+        return
+    if answer.strip() == streamed:
+        return
+    if streamed:
+        sys.stderr.write(
+            "[final] 流式草稿与权威终态不一致（草稿已被兜底文案替换），以下为权威答案\n"
+        )
+    _out(f"{answer}\n")
 
 
 def build_parser() -> argparse.ArgumentParser:
