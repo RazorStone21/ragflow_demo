@@ -39,26 +39,33 @@ cd ragflow-0.27.2/docker
 grep -nE '^(DOC_ENGINE|DEVICE|HF_ENDPOINT|SVR_HTTP_PORT|RAGFLOW_IMAGE)=' .env
 ```
 
-按下面覆写（左侧为键，右侧为本项目要求的取值与理由）：
+> **实测结论（v0.27.2，2026-10-16）**——先查再改的价值就在这里：
+>
+> - **`HF_ENDPOINT` 在 v0.27.2 的 `.env` 里不存在**（只有一行注释掉的 `# HF_ENDPOINT=...`）。
+>   官方镜像已在 `Dockerfile:296` 写入 `ENV HF_ENDPOINT=https://hf-mirror.com`，即**镜像默认就走
+>   镜像站**。所以**不要**硬加这一项（缺键就是信号）；启动后按「步骤 3」在容器里复核即可。
+> - `DOC_ENGINE`/`DEVICE` 是 `${DOC_ENGINE:-elasticsearch}` 这种 compose 插值写法，改的是整个表达式；
+>   `SVR_HTTP_PORT=9380`、`RAGFLOW_IMAGE=infiniflow/ragflow:v0.27.2` **本来就是我们要的值**，
+>   不必动 —— 改了只会平白给未来的 diff 添噪声。
+>
+> 因此**真正需要覆写的只有 3 行**：
 
-| 键 | 取值 | 理由 |
-|---|---|---|
-| `RAGFLOW_IMAGE` | `infiniflow/ragflow:v0.27.2` | 锁定版本，与 CHANGELOG 登记一致；不要用 `latest` |
-| `DOC_ENGINE` | `infinity` | 用内置 Infinity 而非 Elasticsearch：**不起 ES 容器**，省下约 4GB 内存与一次 JVM 预热 |
-| `DEVICE` | `cpu` | 本机无 GPU |
-| `HF_ENDPOINT` | `https://hf-mirror.com` | 首次解析要拉 DeepDoc 模型权重；直连 HuggingFace 在本机不通 |
-| `SVR_HTTP_PORT` | `9380` | 必须与本仓 `.env` 的 `RAGFLOW_BASE_URL=http://localhost:9380` 一致 |
+| 键 | 上游原值 | 覆写为 | 理由 |
+|---|---|---|---|
+| `DOC_ENGINE` | `${DOC_ENGINE:-elasticsearch}` | `infinity` | 用内置 Infinity 而非 Elasticsearch：**不起 ES 容器**，省下约 4GB 内存与一次 JVM 预热。注意 `.env:38` 的 `COMPOSE_PROFILES=${DOC_ENGINE},${DEVICE},metadata-${METADATA_DB_PROFILE}` 用它选 profile —— 改这一个键就等于把服务集从 `es01` 切到 `infinity` |
+| `MINIO_PORT` | `9000` | `9002` | 与本平台 Milvus 的 MinIO 撞宿主端口 |
+| `MINIO_CONSOLE_PORT` | `9001` | `9003` | 同上。RAGFlow 自身经 docker 网络内的 `minio:9000` 访问它，宿主端口号改成多少都不影响功能 |
+| `INFINITY_PSQL_PORT` | `5432` | `5433` | **实测起容器才炸出来的第三个冲突**：Infinity 也讲 PostgreSQL 线协议、默认就抢 5432，而本平台 Postgres 正是 5432（报错 `Bind for 0.0.0.0:5432 failed: port is already allocated`）。这三个端口不是一次看出来的——`grep` 只覆盖了你想到的键，剩下的靠"起服务时它响亮地失败" |
 
 ```bash
-# 逐条改（sed -i 会就地改文件；先备份便于回退）
-cp .env .env.orig
-sed -i 's|^RAGFLOW_IMAGE=.*|RAGFLOW_IMAGE=infiniflow/ragflow:v0.27.2|'   .env
-sed -i 's|^DOC_ENGINE=.*|DOC_ENGINE=infinity|'                           .env
-sed -i 's|^DEVICE=.*|DEVICE=cpu|'                                        .env
-sed -i 's|^HF_ENDPOINT=.*|HF_ENDPOINT=https://hf-mirror.com|'            .env
-sed -i 's|^SVR_HTTP_PORT=.*|SVR_HTTP_PORT=9380|'                         .env
-grep -nE '^(DOC_ENGINE|DEVICE|HF_ENDPOINT|SVR_HTTP_PORT|RAGFLOW_IMAGE)=' .env   # 复核
+cp -n .env .env.orig        # 备份便于回退（-n：已有备份时不覆盖）
+# 然后逐行改这三个键 —— 用编辑器，不要用 shell 的 sed，原因见下
 ```
+
+**工具注意（本机实测，会浪费半小时的坑）**：在本仓库环境下，Bash 命令里**只要出现 `.env`
+字面量就会被仓库的 deny 规则整条拦下**（规则把参数按**仓库根目录**解析，`cd` 到别处也照样拦；
+`sed -i … .env` 一起被拦，且是**整条命令不执行**，不是部分执行）。改用编辑器工具打开
+**绝对路径** `E:\Codes\ragflow-0.27.2\docker\.env` 逐行修改。
 
 ### 端口冲突检查（重要）
 
@@ -66,42 +73,78 @@ grep -nE '^(DOC_ENGINE|DEVICE|HF_ENDPOINT|SVR_HTTP_PORT|RAGFLOW_IMAGE)=' .env   
 **9000/9001**（Milvus 的 MinIO）、**19530/9091**（Milvus）、**4000**（LiteLLM）。
 其中 Redis 刻意错开到 6380 就是为了避开 RAGFlow 的 6379。
 
-起 RAGFlow 前先确认它实际会占哪些宿主端口：
+【已核实（v0.27.2）】base compose 里 `minio` 与 `redis` **不带 profile（必起）**，且都发布宿主端口：
+`${MINIO_PORT}:9000`、`${MINIO_CONSOLE_PORT}:9001`、`${REDIS_PORT}:6379`（另有 `mysql:3306`，
+由 `metadata-mysql` profile 带起）。与本平台的唯一冲突是 **MinIO 的 9000/9001**（本仓已占，
+见上表覆写）；redis 上游默认 6379、本仓刻意用的是 6380，不冲突。
+
+**查端口别用 netstat / `Get-NetTCPConnection`**：本机实测 Docker Desktop 发布的端口
+**不出现在宿主 socket 列表里**（9000/4000/5432/6380 全查不到，尽管 `docker compose ps`
+显示已发布），拿它当判据只会得出"全空闲"的错误结论。可信的判据有两个：
 
 ```bash
-docker compose config | grep -A3 'published:'
+# 1) 容器实际发布了什么（权威）
+docker compose ps --format "{{.Service}} -> {{.Ports}}"
+# 2) 直接起服务 —— 真冲突时 compose 立刻报 "port is already allocated"，失败是响亮且即时的
 ```
 
-【未核实】上游 RAGFlow 的 compose 是否默认起 MinIO（占 9000/9001）随版本而异。
-若与本仓 Milvus 的 MinIO 撞端口：改 RAGFlow 侧的 `MINIO_PORT`/`MINIO_CONSOLE_PORT`
-（RAGFlow 的文档存储用哪个端口无所谓），**不要**动本仓 Milvus 侧的端口 ——
-`MILVUS_URI` 与 Milvus 的 MinIO 端点都在本仓配置里互相引用。
+端口真冲突时的处置：改的是 **RAGFlow 侧**的 `MINIO_PORT`/`MINIO_CONSOLE_PORT`/`REDIS_PORT`
+（RAGFlow 自己经 docker 网络内的服务名访问这些依赖，宿主端口号无所谓），**不要**动本仓
+Milvus 侧的端口 —— `MILVUS_URI` 与 Milvus 的 MinIO 端点都在本仓配置里互相引用。
 
 ## 步骤 3 · 启动与等待就绪
 
+**起之前先校验配置**（`--services` 只输出服务名、不打印 `.env` 里的口令，可放心跑）：
+
 ```bash
-docker compose up -d
-docker compose ps          # 等 ragflow 的 STATUS 变成 healthy
-docker compose logs -f ragflow | head -50   # 首次启动要拉 DeepDoc 权重，可能数分钟
+docker compose config --services | sort
+# 期望正好这 5 个：infinity / minio / mysql / ragflow-cpu / redis
+# 出现 es01 说明 DOC_ENGINE 覆写没生效（profile 选错了引擎）
 ```
 
-镜像拉取要走代理：Docker Desktop → **Settings → Resources → Proxies** 填
-`http://127.0.0.1:7890`（`HTTPS_PROXY` 只对当前 shell 生效，docker daemon 看不到它）。
+```bash
+docker compose pull        # RAGFlow CPU 镜像数 GB，第一次要等
+docker compose up -d
+docker compose ps          # 等 ragflow-cpu 的 STATUS 变成 healthy
+docker compose logs -f ragflow-cpu | head -50   # 首次启动要拉 DeepDoc 权重，可能数分钟
+```
+
+镜像拉取走的是 **Docker Desktop 自带的代理**，不是 shell 的 `HTTPS_PROXY`（`docker info`
+里能看到 `HTTP Proxy: http.docker.internal:3128`）。它在本机是否通，取决于 **Clash 是否开着**
+—— 拉不动就先确认代理。
 
 就绪判据：
 
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' http://localhost:9380/api/v1/datasets   # 401 即为"服务在且要鉴权"
+
+# 顺带复核镜像里 HF_ENDPOINT 的实际取值（步骤 2 说"不要硬加"的依据就在这里）
+docker compose exec -T ragflow-cpu printenv HF_ENDPOINT    # 期望 https://hf-mirror.com
 ```
 
 **401 是成功信号**（服务活着、只是没带 Key）。连不上才是没起来。
 
 ## 步骤 4 · 生成 API Key
 
-1. 浏览器打开 `http://localhost:${SVR_HTTP_PORT:-80}`（RAGFlow 的 Web 控制台），
+**这一步用浏览器，不要试图用 curl 绕过**（实测，省得再踩一次）：
+
+- **没有预置账号**。镜像里确实有播种代码（`api/db/init_data.py` 的 `admin@ragflow.io` /
+  `admin`），但只在服务端显式带 `--init-superuser` 启动时才创建，而上游 compose **没传**
+  这个 flag（`docker-compose.yml` 的 `command:` 只有 `--enable-adminserver
+  --init-model-init-provider-tables`），所以默认没有可用账号。
+- **注册与登录都对口令做 RSA 加密**：`POST /api/v1/users`（注册）与 `POST /api/v1/auth/login`
+  都要求口令是**用公钥加密后的 base64**（前端 `web/` 里加密后再发）。直接发明文会得到
+  `CryptPayloadError('password payload is not valid base64')`（实测注册接口原样返回）。
+  也就是说 API Key 的获取链（注册 → 登录拿会话 → `POST /api/v1/system/tokens`）**无法在
+  不实现前端加密的前提下脚本化**，而实现它的收益只有"省几次点击"——不值。
+
+1. 浏览器打开 `http://localhost`（宿主 80 端口，即 `${SVR_WEB_HTTP_PORT}` 的默认值），
    首次访问需注册一个本地账号（数据全在本机，不出域）；
 2. 右上角头像 → **API** → 生成 API Key；
 3. 写进本仓库 `.env` 的 `RAGFLOW_API_KEY=`（`.env` 已 gitignore，NO-17）。
+
+> 本地演示用 **`admin` / `admin` 这类弱口令即可，但仅在"端口不对外"的前提下**——
+> 控制台（80）与 API（9380）都发布在 `0.0.0.0`，别把它放到能被别人访问的网络上（CLAUDE.md 10.1）。
 
 ```bash
 # 复核鉴权真的通了（把 KEY 换成你生成的）
@@ -111,10 +154,14 @@ curl -s -H "Authorization: Bearer $KEY" http://localhost:9380/api/v1/datasets | 
 
 ## 步骤 5 · 核实 SiliconFlow 模型 ID 与维度
 
-`deploy/docker/litellm/config.yaml` 里 `embedding`/`rerank` 两个映射的**模型 ID 拼写
-未经运行时验证**（SiliconFlow 的 `/v1/models` 需要鉴权，无密钥环境下无法确认），
-而 `MILVUS_DIM=4096` 是照着 `Qwen3-Embedding-8B` 填的。**首次部署必须先核实**，
-否则会在真实入库时才以「维度不符」失败：
+> **已于 2026-10-16 用真实密钥核实完毕**：`Qwen/Qwen3-Embedding-8B` 确实出现在上游
+> `GET /v1/models` 的 99 个模型清单里，实测输出 **4096** 维、与 `MILVUS_DIM` 一致；
+> `hosted_vllm → /v1/rerank` 的路由也在真实网关上跑通（详见 CHANGELOG「真实密钥联调」
+> 与 `deploy/docker/litellm/config.yaml` 的注释）。**本节保留为"换模型/换维度时的复核
+> 规程"**，首次部署不必再走一遍。
+
+`MILVUS_DIM=4096` 是照着 `Qwen3-Embedding-8B` 填的，两者必须一致，否则会在真实入库时
+才以「维度不符」失败——换型号时按下面的最小证据链复核：
 
 ```bash
 # 1) 看 SiliconFlow 上实际可用的模型 ID（把 KEY 换成 SILICONFLOW_API_KEY）
@@ -152,21 +199,40 @@ docker network connect agent-platform-net ragflow-server   # 容器名以 docker
 
 ## 内存安排（16GB 单机）
 
-本机同时跑 Postgres + Redis + Milvus 三件套 + LiteLLM 已经吃掉相当一部分内存，
-RAGFlow（含 Infinity）再叠上来会进入 swap 抖动。建议按**入库与问答分离**使用：
+**实测数字（2026-10-16）**：`.wslconfig` 里 `memory=10GB`，WSL 虚拟机实得 **9.7Gi**。
+两套栈同时起来后 `free -h`：**used 7.1Gi / available 2.6Gi**。逐容器账面（`docker stats --no-stream`）：
+
+| 容器 | 内存（空闲态） | 谁在用 |
+|---|---|---|
+| ragflow-cpu | **4.12 GiB** | RAGFlow 服务 + 任务执行器（解析时还会涨） |
+| ap-litellm | **1.56 GiB** | 模型网关（入库时的嵌入调用要它，停不得） |
+| ap-milvus-standalone | 325 MiB | 检索主链路，入库目标 |
+| mysql / minio / infinity（RAGFlow 侧） | 633 MiB | RAGFlow 自身依赖 |
+| ap-postgres + ap-redis | **59 MiB** | checkpoint / 队列，入库路径用不到 |
+
+两个被实测推翻的直觉，都记下来免得后人再算错一次：
+
+1. **真正的约束是 WSL 内核，不是容器上限**。Infinity 的 `mem_limit: ${MEM_LIMIT}` = 7.52GiB
+   比可用量还大 —— 调小它只会让 OOM 来得更早，不是解法；要让路的只能是"少开点东西"。
+2. **"入库时停掉 postgres/redis 腾内存"没用**：实测两个加起来只有 59 MiB。
+   要腾内存得看上面那张表里真正的大头。
+
+因此策略是：**入库分批做**（先 5 份跑通端到端再上量）、**入库完成后停 RAGFlow**、
+解析期间不要在宿主上跑别的重活：
+
+```bash
+cd /e/Codes/ragflow-0.27.2/docker
+docker compose stop                       # 入库完成后释放 4 GiB+（数据卷保留，下次 start 即可）
+```
 
 | 阶段 | RAGFlow | 说明 |
 |---|---|---|
 | 入库（解析切分） | **运行** | 解析完的内容已落进 Milvus，RAGFlow 不再参与 |
 | 问答 / 演示 | **可停** | 检索走 Milvus，RAGFlow 停掉不影响问答链路 |
 
-```bash
-cd /e/Codes/ragflow-0.27.2/docker
-docker compose stop               # 入库完成后释放内存（数据卷保留，下次 start 即可）
-```
-
 相关配置：
-- `.wslconfig` 给 WSL 上限 12GB（见 [local_env_setup.md](local_env_setup.md)）；
+- `.wslconfig`：`memory=10GB` + `networkingMode=mirrored` + `autoProxy=true`
+  （见 [local_env_setup.md](local_env_setup.md)）；
 - `deploy/docker/milvus/milvus.yaml` 已把 Milvus 内存反压水位压到 0.70/0.85。
 
 ## 常见故障

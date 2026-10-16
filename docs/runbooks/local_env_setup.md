@@ -68,18 +68,37 @@ http://127.0.0.1:7890
 注意：shell 里的 `HTTPS_PROXY` 对 **docker daemon 无效**，必须在这里单独配一次。
 （`git` / `npx` 等命令行工具则是相反 —— 见「代理速查」。）
 
-## 步骤 7 · 限制 WSL 内存（16GB 机器必做）
+## 步骤 7 · 配置 `%UserProfile%\.wslconfig`（16GB 机器必做）
 
-写 `%UserProfile%\.wslconfig`（即 `C:\Users\kevin\.wslconfig`）：
+本机**实际生效**的内容（2026-10-16 复核，逐项都写明它买到什么）：
 
 ```ini
 [wsl2]
-memory=12GB
+# 镜像网络：WSL 复用 Windows 的网络栈，于是能直接访问宿主 127.0.0.1:7890 的代理，
+# "localhost 上的代理连不上"这类问题从根上消失。
+networkingMode=mirrored
+
+# 自动继承 Windows 的 HTTP 代理设置（Clash：127.0.0.1:7890）。
+autoProxy=true
+
+# 经 Windows 隧道解析 DNS，避开代理/VPN 环境下的 DNS 失败。
+dnsTunneling=true
+
+# 内存上限。宿主可用 15.2 GB，留约 5 GB 给 Windows。
+memory=10GB
+
+[experimental]
+# 把不再使用的内存还给 Windows，而不是攥着不放。
+autoMemoryReclaim=gradual
 ```
 
-改完执行 `wsl --shutdown` 生效。理由：不限制时 WSL 会随宿主内存增长，
-与 Milvus/Postgres/LiteLLM 争内存，最终整机进入 swap 抖动；
-Milvus 被 OOM 会中断正在进行的解析入库。
+实测效果：`memory=10GB` 下 WSL 虚拟机总内存 **9.7Gi**（本平台六容器起来后
+used 3.0Gi / available 6.7Gi，见 `free -h`）。**这 9.7Gi 是本机所有容器共享的硬顶**，
+RAGFlow 入库时的内存安排见 [ragflow_setup.md](ragflow_setup.md) 末节。
+
+改完执行 `wsl --shutdown` 生效（会重启整个 Docker 虚拟机，容器随之重启）。
+理由：不限制时 WSL 会随宿主内存增长，与 Milvus/Postgres/LiteLLM 争内存，
+最终整机进入 swap 抖动；Milvus 被 OOM 会中断正在进行的解析入库。
 
 > 不要顺手加 `kernelCommandLine = vm.max_map_count=...`：那是 Elasticsearch 的要求，
 > 本项目 `DOC_ENGINE=infinity` 不起 ES。
