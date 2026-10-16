@@ -8,16 +8,9 @@
 
 ## [未发布]
 
-**进行中**：最小合规骨架 + RAG 主线（6 阶段计划）。阶段一（`core/`）、阶段二（`knowledge/`）、阶段三（`agents/gov_policy_qa`）、阶段四（`api/` + SSE）已落地；阶段五（基础设施与入库）、阶段六（规则同步）尚未完成。
+**进行中**：最小合规骨架 + RAG 主线（6 阶段计划）。阶段一（`core/`）、阶段二（`knowledge/`）、阶段三（`agents/gov_policy_qa`）、阶段四（`api/` + SSE）、阶段五（基础设施与入库）已落地并在**真实基础设施**上验证（真 Postgres / 真 Milvus / 真 RAGFlow + 真实密钥网关）；规范侧 **v1.2.0 已发布**（见下一条版本记录），阶段六随之收尾。
 
-本条目将在全部阶段收尾时替换为正式的 **v1.2.0** 记录，届时必须包含：
-
-- **变更**：新增 `agents/`（智能体注册表 + `gov_policy_qa` 图与节点）、`tenants/`（租户上下文）、`guardrails/sanitize.py`（不可信内容中和）、`knowledge/`（RAGFlow 客户端 + Milvus 存储 + 嵌入/重排 + 检索器）、`core/` 的平台原语；`langgraph.json` 入口声明；提示词资产化（`prompts/*.v1.jinja`）；`ChatModel.astream` 流式契约与 SSE 事件分层（节点推 `AgentStreamEvent`，API 层映射为带 `seq` 的帧）。
-- **ADR**：[ADR-0001](docs/adr/0001-langgraph-as-orchestration-backbone.md)（LangGraph 编排主干）、[ADR-0002](docs/adr/0002-ragflow-milvus-division-of-labor.md)（RAGFlow / Milvus 双后端分工）。
-- **基线版本实测值**（以 `pyproject.toml` / `uv.lock` / 镜像 tag 为权威落地值，覆盖 CLAUDE.md 第 1 章表格的意图值）：langgraph 1.2.15、langgraph-checkpoint-postgres 3.2.0、langchain-openai 1.7.2、fastapi 0.143.1、pydantic 2.14.1、pymilvus 2.6.x、RAGFlow v0.27.2、Milvus v2.6.24。
-- **已知偏离（须如实记录）**：LiteLLM 镜像 tag 与 CLAUDE.md 表格标注的基线（v1.104+）**编号体系不一致**，实际以镜像 tag 为准（本仓落地值 **`main-v1.82.3`**，最初选用的 `main-v1.34.4` 经实测完全不可用，见「真实环境联调」条）；偏离原因与后续处理在此说明。
-- **新增环境变量**：见 `.env.example`（`MILVUS_DIM`、检索阈值、`PRIMARY_CHAT_MODEL`、`EMBEDDING_MODEL`、`RERANK_MODEL` 等）。
-- **占位与顺延**：Langfuse/OTel 追踪、NeMo Guardrails + Presidio 护栏、黄金集 + RAGAS 评估门禁、K8s 部署、HITL 中断恢复、私有化 Qwen3 切换 —— 均为接口占位，实际实现顺延至阶段二。
+本条以下为**平台侧**变更记录（按时间倒序），正式发布时归档为对应版本；**规范本身的版本演进以 `## [v1.2.0]` 与 `## [v1.1.1]` 两条为权威**。此处原列的「v1.2.0 待写清单」（变更 / ADR / 基线版本实测值 / 已知偏离 / 新增环境变量 / 占位与顺延）已由下一条落实，不再重复。
 
 ### 未发布 · 工程门禁（`chore(ci)`）
 
@@ -467,6 +460,28 @@ LiteLLM 均无关；不同前向批的浮点归约顺序不同，故低位有差
 3. **追踪钩子仍未接线**。`core/tracing.build_tracing_hook` 已就绪，但 `build_graph` 未开放该注入点；与 Langfuse/OTel 一并顺延至基础设施阶段。
 
 **影响面**：新增对外 HTTP/SSE 契约（既定接口首次发布，尚无外部集成方）；新增 2 个环境变量（已同步 `.env.example`）；启动命令由 `agent_platform.main:app` 改为 `--factory agent_platform.main:create_app`。`CLAUDE.md` 本体尚未改动——按第 14 章，规则版本升级（v1.1.1 → v1.2.0）与基线表同步统一在阶段六提交（NO-20 的记账留痕见本条）。
+
+---
+
+## [v1.2.0] — 2026-10-16 — 规范升级：双后端落地形态、基线实测值与边界澄清
+
+| 项 | 内容 |
+|---|---|
+| **版本** | v1.2.0（MINOR；`CLAUDE.md` 文件头版本号为准） |
+| **日期** | 2026-10-16 |
+| **变更摘要** | ① 第 1 章基线版本表同步**实测落地值**；② 修正模型网关条目（LiteLLM 镜像 tag 编号体系与 PyPI 不一致，原「v1.104+」无法由镜像字面满足）；③ 第 7 章新增第 8 条「双后端分工的落地形态」；④ 演示期云端嵌入/重排**入册并封边界**；⑤ 第 2.2 节增补「落地现状」清单，标出未创建的目录与文件。 |
+| **动机** | 阶段五在真实基础设施上收尾后，落地值与规范文本出现**可核对的偏差**（版本号、镜像 tag 体系、云端嵌入的合规边界、规范声明了并不存在的目录）。按 14.2，基线版本升级与新增/调整约定**必须**更新本规则，故一次性同步——而不是让偏差散落在 CHANGELOG 与 runbook 里（NO-20 的靶心正是后者）。 |
+| **影响面** | `CLAUDE.md` 第 1 章表格、第 2.2 节、第 7 章；**无代码改动、无新增依赖、无环境变量变更**，存量代码无需改造（符合 MINOR 语义）。**ADR 无新增**：ADR-0001 / ADR-0002 已存在且覆盖对应决策，本次只是把 ADR-0002 的结论落成规范条款。 |
+
+**变更明细**：
+
+1. **基线版本同步**（以 `uv.lock` 与镜像 tag 为权威落地值）：LangGraph **1.2.15**、langgraph-checkpoint-postgres **3.2.0**、langchain-openai **1.7.2**、FastAPI **0.143.1**、Pydantic **2.14.1**、Milvus **v2.6.24**（standalone）、RAGFlow **v0.27.2**（`DOC_ENGINE=infinity`、CPU）。
+2. **修正一处"规范无法落地"的条目**：模型网关原写「v1.104+」，而 LiteLLM 的镜像 tag **编号体系不跟 PyPI 发布号**（实测 `main-v1.105.1` 不存在，HTTP 404），规范的**字面要求无法由镜像满足**。已改为「v1.104+（**PyPI 口径**）＋ 本仓以镜像 tag 为权威落地值 **`main-v1.82.3`**」，并把该编号体系差异写进表格，避免后人再按 PyPI 号去找镜像。（最初选用的 `main-v1.34.4` 经实测完全不可用，见「阶段五 · 真实环境联调」条。）
+3. **第 7 章第 8 条（新增）**：把 ADR-0002 的决策落成规范条款——RAGFlow 只承担文档工程、**检索主链路自建在 Milvus**，两者由 `knowledge/` 衔接且**职责不得互相越界**；同步幂等键 = 源文件路径 + 内容 sha256、Milvus 主键沿用 RAGFlow 的 `chunk_id`（重复同步为 **upsert 覆盖而非新增**）；**解析失败（`FAIL` / `CANCEL` / 零切分）必须显式失败并做补偿删除**，并写明"记成成功但零切分会让这批文件被永久跳过且不留痕迹"这一**实测事故**；租户过滤表达式由本平台代码构造、**调用方无法绕过**（NO-19）；**引用编号必须与答案正文中的编号一致**（对应本次在渲染层修复的真实缺陷）。
+4. **演示期云端嵌入/重排入册并封边界**：第 1 章「嵌入/重排」行改为「**生产须私有化**」，并在基线版本列注明本仓演示期经网关指向云端 API、**语料出域、仅限公开演示语料**；第 7 章第 8 条写明**不得用于客户数据与生产环境**，生产切换私有化 Qwen3 只改网关映射、业务代码零改动。**未新增 NO-xx**：该边界由第 7 章第 8 条与 [10.1](#101-密钥与数据保护)共同约束，不扩充禁止项清单（避免与 NO-15「数据出域」的语义重叠）。
+5. **第 2.2 节增补「落地现状」清单**：逐项勾对标准结构与仓库现实，明确 `config/`、`memory/`、`tools/`、`agents/<name>/subgraphs/`、`docs/agent-kickoffs/`、`docs/claude-code-prompts.md`、`docs/api/`、`Dockerfile`，以及 12.4 要求沉淀的 `.claude/commands/`（`scaffold` / `new-agent` / `new-tool` / `guard-review`）与 `.claude/agents/` **均未创建**，标注为**待建**。此前规范在声明并不存在的东西，属 NO-20 的靶心。
+
+**关联**：[ADR-0001](docs/adr/0001-langgraph-as-orchestration-backbone.md)、[ADR-0002](docs/adr/0002-ragflow-milvus-division-of-labor.md)；本 CHANGELOG 上述各「阶段五」条目为本次核对的依据。
 
 ---
 

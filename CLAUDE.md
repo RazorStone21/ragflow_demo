@@ -6,8 +6,8 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | **v1.1.1** |
-| 生效日期 | 2026-10-09 |
+| 文档版本 | **v1.2.0** |
+| 生效日期 | 2026-10-16 |
 | 状态 | Active（强制执行） |
 | 适用范围 | 企业级智能体平台后端、智能体应用、MCP 工具服务、RAG/知识服务、部署与评估流水线 |
 | 编排主干（已锁定） | **LangGraph 1.x**（详见 [第 1 章](#1-技术栈锁定)、[ADR-0001](docs/adr/0001-langgraph-as-orchestration-backbone.md)） |
@@ -39,20 +39,20 @@
 |---|---|---|---|---|
 | 语言运行时 | **Python** | ≥ 3.11，< 3.13 | — | PSF |
 | 包/环境管理 | **uv**（workspace monorepo） | 最新稳定 | poetry / pdm（全仓统一，不得多套并存） | MIT/Apache |
-| 编排框架 | **LangGraph** | 1.x（1.0 GA 2025-10-22，基线 1.2.x） | AutoGen / CrewAI / Dify 画布**不得替代核心编排** | 库 MIT；Platform 商业（Self-Hosted Enterprise 可离线） |
-| 持久化检查点 | **langgraph-checkpoint-postgres**（`PostgresSaver` / `PostgresStore`） | 3.1.x | Redis 仅作队列/缓存，不作权威检查点 | MIT |
+| 编排框架 | **LangGraph** | 1.x（1.0 GA 2025-10-22，基线 1.2.x；本仓落地 **1.2.15**） | AutoGen / CrewAI / Dify 画布**不得替代核心编排** | 库 MIT；Platform 商业（Self-Hosted Enterprise 可离线） |
+| 持久化检查点 | **langgraph-checkpoint-postgres**（`PostgresSaver` / `PostgresStore`） | 3.1.x（本仓落地 **3.2.0**） | Redis 仅作队列/缓存，不作权威检查点 | MIT |
 | 多智能体 | **langgraph-supervisor / langgraph-swarm** | 与 LangGraph 1.x 匹配 | 自研 Subgraph 编排 | MIT |
-| 模型/组件 SDK | **LangChain 1.0**（`langchain-classic` 与独立集成包）；检索子系统可用 **LlamaIndex** | 1.x | — | MIT（`langchain-community` 已归档，**禁止新增引用**） |
-| 模型网关 | **LiteLLM Proxy**（统一入口） | v1.104+ | Higress；New-API（**AGPL，未过法务禁止入生产**） | LiteLLM MIT |
+| 模型/组件 SDK | **LangChain 1.0**（`langchain-classic` 与独立集成包）；检索子系统可用 **LlamaIndex** | 1.x（本仓落地 **langchain-openai 1.7.2**） | — | MIT（`langchain-community` 已归档，**禁止新增引用**） |
+| 模型网关 | **LiteLLM Proxy**（统一入口） | v1.104+（**PyPI 口径**；**镜像 tag 编号不跟 PyPI 发布号**，本仓以镜像 tag 为权威落地值：**`main-v1.82.3`**） | Higress；New-API（**AGPL，未过法务禁止入生产**） | LiteLLM MIT |
 | 工具/上下文协议 | **MCP（Model Context Protocol）** | 2025 后稳定规范，`pip install "langchain[mcp]"` | A2A 仅用于跨厂商智能体互操作（预研） | 开放标准 |
-| HTTP API | **FastAPI** + Uvicorn(worker 由 Gunicorn 管理) | 0.115+ | — | MIT |
-| 数据校验 | **Pydantic v2**（`pydantic-settings` 管配置） | 2.x | — | MIT |
+| HTTP API | **FastAPI** + Uvicorn(worker 由 Gunicorn 管理) | 0.115+（本仓落地 **0.143.1**） | — | MIT |
+| 数据校验 | **Pydantic v2**（`pydantic-settings` 管配置） | 2.x（本仓落地 **2.14.1**） | — | MIT |
 | 流式协议 | **SSE**（`sse-starlette` / LangGraph 原生 `astream`） | — | WebSocket（仅双向交互场景，需 ADR） | MIT |
 | 关系/检查点库 | **PostgreSQL** | 15+ | — | PostgreSQL License |
 | 缓存/队列 | **Redis**（LangGraph 任务队列、缓存、限流） | 7+ | — | RSAL/开源版（注意 7.4 后 license，内网自用合规） |
-| 向量库 | **Milvus**（生产） / **pgvector**（轻量单机） | Milvus 2.6 | Qdrant / Weaviate（需 ADR） | Apache-2.0 / PostgreSQL |
-| RAG 平台 | **RAGFlow**（知识后端，经 REST/MCP 调用） | v0.27+ | 自研 LlamaIndex 管线；**不得用其画布替代 LangGraph 编排** | Apache-2.0（注意其附加条款） |
-| 嵌入/重排 | **Qwen3-Embedding / Qwen3-Reranker**（私有化） | 最新稳定 | bge-m3 / bge-reranker | Apache（各模型权重 License 单独确认） |
+| 向量库 | **Milvus**（生产） / **pgvector**（轻量单机） | Milvus 2.6（本仓落地 **v2.6.24** standalone） | Qdrant / Weaviate（需 ADR） | Apache-2.0 / PostgreSQL |
+| RAG 平台 | **RAGFlow**（知识后端，经 REST/MCP 调用） | v0.27+（本仓实测 **v0.27.2**，`DOC_ENGINE=infinity`、CPU） | 自研 LlamaIndex 管线；**不得用其画布替代 LangGraph 编排** | Apache-2.0（注意其附加条款） |
+| 嵌入/重排 | **Qwen3-Embedding / Qwen3-Reranker**（**生产须私有化**） | 最新稳定（**本仓演示期经网关指向云端 API，语料出域，仅限公开演示语料**——边界见 [第 7 章](#7-知识与-rag-规范)第 8 条） | bge-m3 / bge-reranker | Apache（各模型权重 License 单独确认） |
 | 知识图谱/本体 | **owlready2** + Protégé（OWL/SWRL 编辑）；GraphRAG/LightRAG 按需 | — | — | MIT/Apache |
 | 长期记忆 | **LangGraph `PostgresStore`**（默认同栈）；按需 **Mem0 / Graphiti** | — | Letta | MIT/Apache（Mem0 部分能力受限，需核实） |
 | 可观测性 | **Langfuse（自托管）** + **OpenTelemetry** | Langfuse 稳定自托管版 | LangSmith（SaaS，涉数据出域禁止）/ Arize Phoenix | Langfuse 核心 MIT |
@@ -147,6 +147,14 @@
 │   └── api/                      # 接口补充说明（OpenAPI 自动生成，不手写重复）
 └── scripts/                      # 运维/数据/评测脚本（必须可重复执行、带 --help）
 ```
+
+> **落地现状（2026-10-16 核对：规范声明必须与仓库现实一致，不得据上表假设某目录已存在）**
+>
+> **已落地**：`src/agent_platform/` 下的 `core/`、`knowledge/`、`agents/`、`api/`、`tenants/`、`guardrails/`（`sanitize.py` 不可信内容中和）、`utils/`；`tests/` 下 `unit/`、`integration/`、`evals/`；`scripts/`、`deploy/docker/`、`deploy/k8s/`、`docs/adr/`、`docs/runbooks/`、`langgraph.json`、`docker-compose.yml`、`.claude/settings.json`。
+>
+> **仅有空壳（目录在、能力未实现）**：`evaluation/`（评估集与评测器为占位）、`guardrails/` 中除 `sanitize.py` 外的护栏（NeMo Guardrails / Presidio 未接入）。引用时按"接口占位"对待，不得当作已有能力。
+>
+> **尚未创建（待建，非已具备）**：`config/`、`memory/`、`tools/`、`agents/<name>/subgraphs/`、`docs/agent-kickoffs/`、`docs/claude-code-prompts.md`、`docs/api/`、`Dockerfile`，以及 [12.4](#124-ai-协作claude-code--vibe-coding) 要求沉淀的 `.claude/commands/`（`scaffold` / `new-agent` / `new-tool` / `guard-review`）与 `.claude/agents/`。任务涉及这些路径时，先建目录再引用。
 
 ### 2.3 放置规则（什么代码放哪里）
 
@@ -326,6 +334,7 @@
 5. 检索节点必须处理"无结果/低置信"分支（澄清、扩检、转人工），不得让模型在无证据时编造；答案与证据绑定，支持溯源。
 6. 领域本体/规则（OWL/SWRL）用 Protégé 编辑、owlready2 加载，作为结构化约束/推理层与 RAG 互补；图谱（GraphRAG/LightRAG）用于多跳关系问题，是否引入须 ADR。
 7. 知识库变更（切分策略、模型、Top-K、阈值、rerank）属于**检索质量变更**，必须跑评估集回归（[9.2](#92-评估门禁)）后方可上线。
+8. **双后端分工的落地形态（[ADR-0002](docs/adr/0002-ragflow-milvus-division-of-labor.md)，2026-10-16 实测跑通）**：RAGFlow 只承担**文档工程**（解析 / OCR / 版面与表格识别 / 切分 / 文档生命周期），**检索主链路自建在 Milvus**（稠密 + BM25 混合检索 → 阈值 → 重排 → 证据与引用），两者由 `knowledge/` 衔接，职责**不得互相越界**。同步的幂等键为**源文件路径 + 内容 sha256**，Milvus 主键直接沿用 RAGFlow 的 `chunk_id`（`auto_id=False`），故重复同步是 **upsert 覆盖而非新增**；**解析失败（`FAIL` / `CANCEL` / 零切分）必须显式失败并做补偿删除**，不得记成"成功但零切分"——实测发生过，其后果是这批文件被永久跳过且不留痕迹。租户过滤表达式由本平台代码构造（`knowledge/milvus_schema`），**调用方无法绕过**（NO-19）；**引用编号必须与答案正文中的编号一致**，且无证据不得给出事实性结论（NO-12）。**演示期偏离（已封边界）**：嵌入与重排经 LiteLLM 网关指向**云端 API**，语料因此出域——**仅限公开演示语料，不得用于客户数据与生产环境**；生产必须切私有化 Qwen3，切换只改网关映射、业务代码零改动（[10.1](#101-密钥与数据保护)）。
 
 ---
 
