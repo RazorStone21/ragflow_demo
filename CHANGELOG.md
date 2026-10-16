@@ -225,12 +225,48 @@ SiliconFlow 不接受空值。修在 `deploy/docker/litellm/config.yaml` 的 emb
 **排错方法（可复用，已记入配置注释）**：容器内直接用 python 打上游做最小化对照，比读
 LiteLLM 的转发逻辑快得多；另注 LiteLLM 镜像里是 **BusyBox**，`grep --include` 不可用。
 
+**发现的上游特性（1 处，非缺陷，但推翻了一条测试前提）**：**SiliconFlow 的嵌入会
+在推理侧把一次请求里的多个输入拆进不同的前向批，不同前向批的结果在低位上不一致**。
+上述 18 passed 里，`test_embedding_is_deterministic` 是**偶发**通过的：单独重跑 5 次
+挂 2 次，报错 `Mismatched elements: 4090/4096, Max absolute difference: 1.26e-03`；
+关掉本机代理后复现，故与代理、与本仓 `trust_env=False` 的修复无关。
+
+定位方法是容器内直连上游做分组签名探测（一次请求发 `[T]*4`，把两两"是否逐位相同"
+编成 6 位 E/D 串）：
+
+| 探测 | 结果（8 轮） |
+|---|---|
+| 直连上游 | 4 轮 `EEEEEE`（整体一批）、4 轮 `DDDEEE`（拆成 `[T] + [T,T,T]`，子批内逐位相同、子批间有差） |
+| 经网关 | 7 轮 `EEEEEE`、1 轮 `EEDEDD`（拆成 `[T,T,T] + [T]`） |
+
+拆与不拆逐次随机，**直连同样复现** → 拆分发生在 SiliconFlow 推理侧，与本仓客户端和
+LiteLLM 均无关；不同前向批的浮点归约顺序不同，故低位有差。
+
+量化（8 轮 × 5 次请求）：向量是 **L2 单位向量**（实测 `|v|=1.000000`），跨请求
+**余弦最坏 0.999903**（1−cos≈9.7e-5），而**逐元素最大差最坏 3.5e-3**——两者相差两个
+数量级，逐元素差会被向量尺度放大、单独看会误导（Milvus 用的是 `COSINE` 度量，自行
+归一化，单位范数只是上游的偶然属性，不作为契约）。
+
+据此改写用例（`test_embedding_is_deterministic` → `test_embedding_direction_is_stable`）：
+断言从逐元素 `approx(abs=1e-6)` 改为**余弦 ≥ 1−1e-3**。这不是"放宽测试以求绿"
+（NO-06），三点依据写进用例 docstring：① 原阈值与"同批必然逐位相同"的前提本身是我
+未经验证的臆测，实测已证伪；② 新阈值由实测最坏值留约一个数量级余量给出（上游分批
+策略不受本仓控制，卡在实测值上等于把偶发性引回门禁）；③ 断言仍具区分度，实测不同
+文本 cos 0.25~0.52、换成 4B 模型 cos **−0.027**，任何"串了别的文本/别的模型"的回归
+都会被拦下。改写后连跑 6 次全过（改前 5 次挂 2 次）。
+
+**业务影响**：检索排序不受影响（1e-4 量级的余弦抖动远小于排序间距）；入库幂等性也
+不受影响——幂等键是源文件路径 + 内容 sha256，与向量是否逐位可复现无关。**但若将来
+做逐次比对式的评估或缓存命中判定，不能依赖云端嵌入的逐位可复现性**，这是一条应写进
+选择依据的约束。
+
 **仍未验证（前置：RAGFlow 未部署）**：`test_ragflow_integration.py` 6 条与
 `test_ingest_end_to_end.py` 3 条仍 skip；真实入库与幂等重跑、`demo_chat.py` 带引用回答、
 无关问题走降级三条端到端关卡未执行。
 
-**影响面**：仅 `deploy/docker/litellm/config.yaml` 的 embedding 条目新增一个参数；
-业务代码、HTTP 契约、环境变量均未变。
+**影响面**：`deploy/docker/litellm/config.yaml` 的 embedding 条目新增一个参数；
+`tests/integration/test_litellm_proxy.py` 一条用例的断言与名称变更。业务代码、HTTP
+契约、环境变量均未变。
 
 ### 未发布 · 阶段四（API 与 SSE，`feat(api)`）
 

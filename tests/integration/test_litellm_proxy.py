@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
@@ -81,14 +82,38 @@ async def test_embedding_dimension_matches_milvus_config(
     assert any(value != 0.0 for value in vectors[0]), "嵌入不得为全零向量"
 
 
-async def test_embedding_is_deterministic(
+def _cosine(first: list[float], second: list[float]) -> float:
+    """两向量夹角余弦（纯 Python，避免为一个断言引入 numpy 依赖）。"""
+    dot = sum(a * b for a, b in zip(first, second, strict=True))
+    norm = math.sqrt(sum(a * a for a in first)) * math.sqrt(sum(b * b for b in second))
+    return dot / norm
+
+
+async def test_embedding_direction_is_stable(
     gateway: GatewayHttpClient, integration_settings: Settings
 ) -> None:
-    """同一文本两次嵌入应几乎一致——不稳定会让检索结果无法复现。"""
+    """同一文本两次嵌入的**方向**应高度一致——否则检索排序无法复现。
+
+    为什么断言余弦而不是逐元素相等（2026-10-16 实测证据）：SiliconFlow 推理侧做动态
+    批处理，一个请求里的 N 个输入会被拆进**不同的前向批**，不同前向批的浮点归约顺序
+    不同，结果在低位上就不一致。用 ``[T]*4`` 探测读出的分组签名：直连 8 轮中 4 轮为
+    ``DDDEEE``（拆成 ``[T] + [T,T,T]``，子批内逐位相同、子批间有差），经网关 8 轮中
+    1 轮为 ``EEDEDD``。拆与不拆逐次随机，**与是否经过网关无关**（直连同样复现，故不是
+    本仓客户端或 LiteLLM 的问题）。后果：逐元素比较哪怕放宽到 ``abs=1e-3`` 也注定偶发
+    失败——实测逐元素最大差最坏 **3.5e-3**，此前 ``abs=1e-6`` 的用例 5 次跑挂 2 次。
+
+    真正决定"排序能否复现"的是方向：实测跨请求余弦最坏 **0.999903**（1-cos≈9.7e-5，
+    40 次请求比对）。阈值取 ``1 - 1e-3``，与实测最坏值留约一个数量级余量——上游分批
+    策略不受本仓控制，把阈值卡在实测值上等于把偶发性重新引回门禁。
+    """
     first, second = await gateway.embed(
         [PROBE_TEXT] * 2, logical_model=integration_settings.embedding_model
     )
-    assert pytest.approx(first, abs=1e-6) == second
+    similarity = _cosine(first, second)
+    assert similarity >= 1 - 1e-3, (
+        f"同一批内同一文本的嵌入方向不一致（cos={similarity!r}）；"
+        " 这通常意味着上游换模型或换了分批策略，检索排序将不可复现"
+    )
 
 
 async def test_rerank_returns_relevance_ordered(
