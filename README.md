@@ -56,7 +56,18 @@ uv run python scripts/demo_chat.py --question "2025年新能源电价机制的�
 ```bash
 uv run ruff format --check && uv run ruff check && uv run mypy && uv run pytest
 RUN_INTEGRATION_TESTS=true uv run pytest -m integration   # 需 compose 已启动
+
+# 评估（阶段七；需 postgres / milvus / litellm 已启动，且网关已加载 judge 路由）
+uv run python -X utf8 scripts/eval_run.py --validate-only                  # 零基础设施，只校验黄金集
+uv run python -X utf8 scripts/eval_run.py --layer all                      # 全量评估，产出产物
+uv run python -X utf8 scripts/eval_run.py --layer all \
+  --baseline tests/evals/baselines/2026-10-16-phase7-initial.json          # 与基线对比，检出回归
 ```
+
+评估**当前处于观察期**：照常产出报告、判定与留痕，`--baseline` 照常检出回归，但退出码暂不接入
+pre-commit（黄金集 28 条待人工逐条核对原文后签署）。**评估不进 pre-commit**——它慢、要密钥、
+要基础设施，放进去只会训练人加 `--no-verify`。评审协议与缺陷登记见 `tests/evals/README.md`，
+框架选型与被违反的条例见 [ADR-0003](docs/adr/0003-evaluation-framework-and-judge.md)。
 
 提交遵循 Conventional Commits；不得 `--no-verify`。AI 协作规则见 CLAUDE.md 12.4。
 
@@ -75,7 +86,21 @@ RUN_INTEGRATION_TESTS=true uv run pytest -m integration   # 需 compose 已启�
 | `docs/runbooks/` | 环境与组件的手册（本机环境、RAGFlow 部署） |
 | `deploy/` | 本地 compose 片段与 K8s 模板 |
 
-## 当前阶段边界（阶段二补齐）
+## 当前阶段边界（阶段七补齐）
 
-Langfuse/OTel 追踪、NeMo Guardrails + Presidio 护栏、黄金集 + RAGAS 评估门禁、
-K8s 部署、HITL 中断恢复、私有化 Qwen3 切换 —— 均为接口占位，见 `CHANGELOG.md` v1.2.0。
+**已落地**：评估层（`src/agent_platform/evaluation/` + `scripts/eval_run.py`）——28 条黄金集、
+六个确定性判分器、网关裁判层、产物留痕与基线对比，见 `tests/evals/README.md`。
+
+**仍为接口占位**：Langfuse/OTel 追踪（`core/tracing.py` 已就绪但未接线）、NeMo Guardrails + Presidio
+护栏（`guardrails/__init__.py` 为 PassThrough，`container.py` 传 `guardrail=None`）、K8s 部署
+（`deploy/k8s/` 仅占位 README）、HITL 中断恢复（全仓无 `interrupt()`，故黄金集该类别为 0 条，
+**不编造**）。
+
+**仍为演示期偏离（已封边界、入册）**：嵌入/重排经网关指向云端 API（ADR-0002）、裁判复用
+同一上游导致同源自偏好偏置（ADR-0003）。**生产须切私有化 Qwen3 与独立家族的本地裁判模型**，
+切换只改网关映射、业务代码零改动。**语料不得出域**——演示期仅限公开演示语料。
+
+**已知质量缺陷（已登记、待修复）**：生成侧无"模型自称无法回答"分支（NO-12 实质违反）、
+裁判提示词 v1 缺"即使答得出也必须拒答"一档。逐条证据见 `tests/evals/README.md` 第五节。
+
+完整边界见 `CHANGELOG.md` 的 `v1.3.0` 与「未发布 · 阶段七」两条。
