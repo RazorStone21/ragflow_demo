@@ -42,13 +42,17 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from agent_platform.core.errors import AgentPlatformError, ConfigurationError
+from agent_platform.core.errors import (
+    AgentPlatformError,
+    ConfigurationError,
+    KnowledgeParseFailedError,
+)
 from agent_platform.core.logging import configure_logging, enable_utf8_console, get_logger
 from agent_platform.knowledge.embedder import LiteLLMEmbedder
 from agent_platform.knowledge.gateway_client import GatewayHttpClient
 from agent_platform.knowledge.milvus_store import MilvusStore, open_milvus_store
 from agent_platform.knowledge.ragflow_client import RagFlowClient
-from agent_platform.knowledge.ragflow_schemas import ChunkInfo
+from agent_platform.knowledge.ragflow_schemas import ChunkInfo, DocumentInfo
 from agent_platform.knowledge.schemas import ChunkRecord
 from agent_platform.settings import Settings, load_settings
 from agent_platform.utils.text import content_fingerprint
@@ -142,6 +146,26 @@ class Manifest:
     def record(self, source_rel: str, payload: dict[str, Any]) -> None:
         """登记一个已成功入库的文件。"""
         self.files[source_rel] = payload
+
+
+def is_stale_manifest_entry(entry: dict[str, Any] | None) -> bool:
+    """该清单记录是否属于「零切分」的陈旧条目，因而不该被当作"已入库"跳过。
+
+    当前代码里"解析成功、却一个可用切分都没产出"会直接抛
+    :class:`KnowledgeParseFailedError`（见 ``collect_and_index``），所以
+    **成功记录必然 ``chunk_count >= 1``**。清单里出现 ``chunk_count == 0``
+    只可能来自修复前的缺陷版本——实测它把 5 份 ``run=FAIL`` 的文档记成
+    "成功 5 份、切分 0 条"。若照旧按指纹跳过，这 5 份文件就再也进不了库，
+    而且全程不报错、不留痕（CLAUDE.md 0.5「失败要出声」正指这种情形）。
+
+    判定朝向"宁可重跑"：``chunk_count`` 缺失或类型不可解释时同样视为陈旧。
+    重跑的代价只是再入一次库（Milvus 主键即 ``chunk_id``，重复写入是覆盖），
+    而漏判的代价是数据永久缺失且无人察觉。
+    """
+    if not isinstance(entry, dict):
+        return False
+    count = entry.get("chunk_count")
+    return not isinstance(count, int) or count <= 0
 
 
 def load_subset(subset_path: Path) -> list[str]:
@@ -253,6 +277,21 @@ def to_chunk_record(
     )
 
 
+def parse_failure_detail(parsed: DocumentInfo | None) -> str:
+    """从 RAGFlow 的解析日志里抽出可操作的一行，作为失败详情。
+
+    ``progress_msg`` 是多行日志，真正有信息量的是末尾那几行错误（例如
+    ``[ERROR]Fail to bind embedding model: No default embedding model is set.``）。
+    只取末尾 3 个非空行并截断，既给出根因又不把整段日志灌进异常与结构化日志。
+    """
+    if parsed is None:
+        return "RAGFlow 未返回该文档的解析状态，请到控制台核对文档列表。"
+    lines = [line.strip() for line in parsed.progress_msg.splitlines() if line.strip()]
+    if not lines:
+        return f"RAGFlow 未给出解析日志（状态 {parsed.run.value}），请到控制台查看解析详情。"
+    return " / ".join(lines[-3:])[:500]
+
+
 async def ingest_one(
     *,
     rel_path: str,
@@ -272,9 +311,24 @@ async def ingest_one(
     if previous_document_id:
         # 内容变更后的重入：先清旧产物，否则旧 chunk 会以孤儿行形式永久留在索引里。
         removed = await store.delete_by_document(previous_document_id, tenant_id)
-        await ragflow.delete_documents(dataset_id, [previous_document_id])
+        # 尽力而为：这里删的是**上一轮尝试**的遗留物。RAGFlow 对"删一个不属于该
+        # 数据集的 id"是**报错**而非幂等成功（实测源码 document_api.py 的
+        # delete_documents：id 不在 dataset_doc_ids 里即返回错误）。于是只要那个文档
+        # 已经不在了——上一轮的补偿删除、或操作者在控制台手工清理——照常调用就会让
+        # 本文件在上传之前就失败。而"它已经不在了"恰恰是这一步想要的结果。
+        await _delete_document_best_effort(
+            ragflow,
+            dataset_id,
+            previous_document_id,
+            rel_path,
+            context="重入时清理上一轮遗留文档",
+        )
+        # 文案只陈述观察到的动作，不断言成因：触发清理的有两种情形（内容变更 / 清单记录
+        # 陈旧），而本函数只拿得到 previous_document_id，分不出来。原先写"内容变更"，
+        # 在陈旧那一支就是**假话**——会让操作者去找一个不存在的 diff（实测踩过）。
+        # 成因由紧邻的 ingest.stale_manifest_entry 事件给出：有它即陈旧，无它即内容变更。
         logger.info(
-            "内容变更，已清理旧文档产物",
+            "重新入库前清理上一轮遗留的旧文档产物",
             extra={
                 "event": "ingest.replaced",
                 "source": rel_path,
@@ -284,9 +338,93 @@ async def ingest_one(
         )
 
     doc = await ragflow.upload_document(dataset_id, abs_path)
-    await ragflow.start_parsing(dataset_id, [doc.id])
-    await ragflow.wait_parse_done(dataset_id, [doc.id])
+    try:
+        await ragflow.start_parsing(dataset_id, [doc.id])
+        statuses = await ragflow.wait_parse_done(dataset_id, [doc.id])
+        # 「离开进行中」不等于「解析成功」：wait_parse_done 会带着 FAIL/CANCEL 一起返回。
+        # 必须在这里判，否则失败文档会以"0 切分"的名义被记成成功（实测踩过，见
+        # KnowledgeParseFailedError 的 docstring）。
+        parsed = statuses.get(doc.id)
+        if parsed is None or not parsed.run.is_success:
+            state = parsed.run.value if parsed is not None else "UNKNOWN"
+            # 根因（RAGFlow 的报错原文）进 message——按 core/errors.py 的契约，message 是
+            # "进受控日志的内部诊断信息"，正是操作者排障要看的；detail 留给调用方指引。
+            raise KnowledgeParseFailedError(
+                f"解析未成功（{state}）: {rel_path} — {parse_failure_detail(parsed)}",
+                detail=(
+                    "常见原因：RAGFlow 未配置默认嵌入模型（控制台 → 模型设置）。"
+                    "该文件未计入成功，处理后重跑本命令即可；已成功的文件会按指纹跳过。"
+                ),
+            )
+        written = await collect_and_index(
+            doc=doc,
+            rel_path=rel_path,
+            tenant_id=tenant_id,
+            dataset_id=dataset_id,
+            ragflow=ragflow,
+            embedder=embedder,
+            store=store,
+        )
+    except AgentPlatformError:
+        # 补偿：RAGFlow **拒绝同名重复上传**（实测 "Duplicated document name in the
+        # same dataset."）。失败文档不入清单、也就没人替它收尸，留着它会让重跑次次
+        # 撞在同名冲突上——脚本承诺的"重跑只补失败的"就永远补不上。
+        await _delete_document_best_effort(
+            ragflow, dataset_id, doc.id, rel_path, context="解析失败后的补偿删除"
+        )
+        raise
 
+    return IngestOutcome(
+        source_rel=rel_path, is_success=True, document_id=doc.id, chunk_count=written
+    )
+
+
+async def _delete_document_best_effort(
+    ragflow: RagFlowClient,
+    dataset_id: str,
+    document_id: str,
+    rel_path: str,
+    *,
+    context: str,
+) -> None:
+    """尽力删除文档；清理自身出错只记日志，**不得掩盖原始异常**（NO-06）。
+
+    Args:
+        context: 触发清理的场景（写入日志，用于区分是补偿删除还是重入清理）。
+    """
+    try:
+        await ragflow.delete_documents(dataset_id, [document_id])
+    except AgentPlatformError as cleanup_exc:
+        # 两种场景共用一条文案，且对两者都成立：文档仍在 → 会被同名冲突挡住；
+        # 文档已不在 → 本次删除本就无事可做，无需动作。故只陈述事实并给出核对方式，
+        # 不写"必须人工删除"那种在第二种场景下会误导人的结论。
+        logger.warning(
+            "清理文档未成功；若该文档仍在数据集中，重跑会撞同名冲突，请到 RAGFlow 控制台核对",
+            extra={
+                "event": "ingest.cleanup_failed",
+                "source": rel_path,
+                "document_id": document_id,
+                "context": context,
+                "error_code": cleanup_exc.code.value,
+            },
+        )
+
+
+async def collect_and_index(
+    *,
+    doc: DocumentInfo,
+    rel_path: str,
+    tenant_id: str,
+    dataset_id: str,
+    ragflow: RagFlowClient,
+    embedder: LiteLLMEmbedder,
+    store: MilvusStore,
+) -> int:
+    """拉取切分 → 映射 → 嵌入 → 写入 Milvus，返回写入条数。
+
+    Raises:
+        KnowledgeParseFailedError: 解析成功但一条可用切分都没有（"零入库"不得算成功）。
+    """
     updated_at = int(datetime.now(UTC).timestamp())
     records: list[ChunkRecord] = []
     async for _page_index, page in ragflow.iter_chunks(dataset_id, doc.id):
@@ -310,8 +448,11 @@ async def ingest_one(
             )
 
     if not records:
-        return IngestOutcome(
-            source_rel=rel_path, is_success=True, document_id=doc.id, chunk_count=0
+        # 解析成功却一条可用切分都没有 ⇒ 这份文件对知识库零贡献。记成成功会把
+        # "什么都没入库"写进幂等清单，之后每次重跑都跳过它——问题被永久掩盖。
+        raise KnowledgeParseFailedError(
+            f"解析完成但未产出任何可用切分: {rel_path}",
+            detail="文档可能是空的、或是全部切分被人工禁用；本次不计入成功，重跑会再试。",
         )
 
     written = 0
@@ -319,10 +460,7 @@ async def ingest_one(
         batch = records[start : start + EMBED_BATCH_SIZE]
         vectors = await embedder.embed_documents([record.content for record in batch])
         written += await store.upsert_chunks(batch, vectors)
-
-    return IngestOutcome(
-        source_rel=rel_path, is_success=True, document_id=doc.id, chunk_count=written
-    )
+    return written
 
 
 async def _print_plan(pairs: list[tuple[str, Path]], existing: Manifest) -> None:
@@ -336,7 +474,11 @@ async def _print_plan(pairs: list[tuple[str, Path]], existing: Manifest) -> None
     for rel_path, abs_path in pairs:
         recorded = existing.fingerprint_of(rel_path)
         current = content_fingerprint(await asyncio.to_thread(abs_path.read_bytes))
-        (to_skip if recorded == current else to_ingest).append(rel_path)
+        # 干跑必须与真实入库给出同一个答案，否则"先 --dry-run 确认"就成了误导。
+        is_unchanged = recorded == current and not is_stale_manifest_entry(
+            existing.files.get(rel_path)
+        )
+        (to_skip if is_unchanged else to_ingest).append(rel_path)
     logger.info(
         "干跑完成：未发起任何网络请求",
         extra={
@@ -388,7 +530,10 @@ async def run(args: argparse.Namespace, settings: Settings) -> int:
             extra={
                 "event": "ingest.collection_ready",
                 "collection": store.collection,
-                "created": created,
+                # 键名不得用 created：它是 LogRecord 的保留属性（记录创建时间戳），
+                # 作为 extra 键会在 makeRecord 里抛 KeyError。同类保留名见
+                # tests/unit/test_logging.py 的守卫用例。
+                "collection_created": created,
                 "dim": store.dim,
                 "dataset_id": dataset_id,
             },
@@ -397,7 +542,18 @@ async def run(args: argparse.Namespace, settings: Settings) -> int:
             fingerprint = content_fingerprint(await asyncio.to_thread(abs_path.read_bytes))
             entry = manifest.files.get(rel_path)
             recorded = manifest.fingerprint_of(rel_path)
-            if recorded == fingerprint:
+            if recorded == fingerprint and is_stale_manifest_entry(entry):
+                # 这里的指纹一致是"假一致"：记录虽在，但它是零切分的陈旧条目，
+                # 库里其实什么都没有。出声后照常入库——否则这批文件会被永久跳过。
+                logger.warning(
+                    "清单记录为零切分，视为未入库并重跑",
+                    extra={
+                        "event": "ingest.stale_manifest_entry",
+                        "source": rel_path,
+                        "recorded_chunk_count": entry.get("chunk_count") if entry else None,
+                    },
+                )
+            elif recorded == fingerprint:
                 outcomes.append(
                     IngestOutcome(source_rel=rel_path, is_success=True, is_skipped=True)
                 )
@@ -418,8 +574,10 @@ async def run(args: argparse.Namespace, settings: Settings) -> int:
                     previous_document_id=previous,
                 )
             except AgentPlatformError as exc:
-                # 单文件失败不中断整批（CLAUDE.md 7.3）。异常文本可能含内部信息，
-                # 只记类型与错误码；细节留 DEBUG 级日志，不进常规日志（NO-07）。
+                # 单文件失败不中断整批（CLAUDE.md 7.3）。``message`` 按契约就是
+                # "进受控日志的内部诊断信息"（core/errors.py），不属 NO-07 要挡的
+                # 密钥/PII；因此截断后记进常规日志——"失败文件到底为什么失败"是
+                # 操作者当场就要回答的问题，压在 DEBUG 级等于没记（实测踩过）。
                 outcome = IngestOutcome(
                     source_rel=rel_path, is_success=False, reason=exc.code.value
                 )
@@ -430,9 +588,10 @@ async def run(args: argparse.Namespace, settings: Settings) -> int:
                         "source": rel_path,
                         "error_code": exc.code.value,
                         "error_type": type(exc).__name__,
+                        "error_message": exc.message[:300],
                     },
                 )
-                logger.debug("失败详情", extra={"source": rel_path, "detail": str(exc)})
+                logger.debug("失败栈线索", extra={"source": rel_path, "repr": repr(exc)})
             outcomes.append(outcome)
             if outcome.is_success:
                 manifest.record(
@@ -536,9 +695,15 @@ def main(argv: list[str] | None = None) -> int:
                 "event": "ingest.fatal",
                 "error_code": exc.code.value,
                 "error_type": type(exc).__name__,
+                # 致命错误必须自带原因：退出码 3 是对脚本调用方的契约，操作者手里
+                # 不会有别的线索（实测踩过：只见到 VALIDATION_FAILED，真实原因
+                # "lacks permission for dataset" 被压在 DEBUG 级，白查一轮）。
+                # 异常文本由客户端从**请求路径与上游响应体**拼出，不含请求头/凭据；
+                # 截断 500 字符是防上游把一大段 HTML 塞进 message 撑爆日志。
+                "detail": str(exc)[:500],
             },
         )
-        logger.debug("失败详情", extra={"detail": str(exc)})
+        logger.debug("失败详情（含堆栈线索）", extra={"detail": repr(exc)})
         return EXIT_FATAL
 
 

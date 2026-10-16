@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
+from pathlib import Path
 from typing import Any, cast
 
 from agent_platform.core.logging import StructuredJsonFormatter, log_context
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _render(record: logging.LogRecord) -> dict[str, Any]:
@@ -86,3 +90,41 @@ def test_sensitive_extra_keys_are_redacted() -> None:
     assert payload["api_key"] == "[REDACTED]"
     assert "sk-real-secret-value" not in json.dumps(payload)
     assert payload["duration_ms"] == 12.5
+
+
+def _extra_dict_keys(path: Path) -> list[tuple[int, str]]:
+    """静态扫描一个文件里所有 ``extra={...}`` 字面量的字符串键。"""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    keys: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg != "extra" or not isinstance(keyword.value, ast.Dict):
+                continue
+            for key in keyword.value.keys:
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    keys.append((node.lineno, key.value))
+    return keys
+
+
+def test_extra_keys_never_shadow_logrecord_attributes() -> None:
+    """``extra=`` 的键不得与 ``LogRecord`` 的保留属性同名（全仓静态守卫）。
+
+    ``logging.Logger.makeRecord`` 碰到同名键会抛
+    ``KeyError: "Attempt to overwrite '<key>' in LogRecord"``，而它**只在日志级别
+    放行到该语句时才被调用**（在 ``isEnabledFor`` 之后）。于是 pytest 默认 WARNING
+    级别下全绿、真跑 INFO 时脚本当场崩——实测 ``scripts/ingest.py`` 的
+    ``extra={"created": ...}`` 正是这样在真实入库的第二步炸掉的。静态扫描把这一类
+    封死在提交之前，而不是等哪次真跑撞上。
+    """
+    reserved = set(vars(logging.LogRecord("", 0, "", 0, "", (), None)))
+    offenders = [
+        f"{path.relative_to(REPO_ROOT)}:{lineno} -> {key!r}"
+        for root in (REPO_ROOT / "src", REPO_ROOT / "scripts", REPO_ROOT / "tests")
+        for path in sorted(root.rglob("*.py"))
+        for lineno, key in _extra_dict_keys(path)
+        if key in reserved
+    ]
+
+    assert not offenders, "extra= 键与 LogRecord 保留属性同名: " + "; ".join(offenders)

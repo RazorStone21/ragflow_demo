@@ -43,6 +43,7 @@ class ErrorCode(StrEnum):
     # 知识检索（CLAUDE.md 第 7 章）
     KNOWLEDGE_UNAVAILABLE = "KNOWLEDGE_UNAVAILABLE"
     KNOWLEDGE_PARSE_TIMEOUT = "KNOWLEDGE_PARSE_TIMEOUT"
+    KNOWLEDGE_PARSE_FAILED = "KNOWLEDGE_PARSE_FAILED"
     RETRIEVAL_FAILED = "RETRIEVAL_FAILED"
     EVIDENCE_INSUFFICIENT = "EVIDENCE_INSUFFICIENT"
 
@@ -204,6 +205,19 @@ class KnowledgeParseTimeoutError(KnowledgeError):
 
     code = ErrorCode.KNOWLEDGE_PARSE_TIMEOUT
     retryable = True
+
+
+class KnowledgeParseFailedError(KnowledgeError):
+    """文档解析以失败告终（``FAIL``/``CANCEL``），或解析成功但未产出任何可用切分。
+
+    与重试无关：RAGFlow 报 ``FAIL`` 是确定性结果（缺模型、文件损坏等），
+    自动重试只会重复同一次失败。**必须显式暴露**，不得当作"空文档"静默记为成功——
+    实测踩过：5 份文档全部 ``FAIL``，脚本却报"成功 5 份、切分 0 条"，并把它们记进
+    幂等清单，于是重跑全部跳过、问题被永久掩盖。
+    """
+
+    code = ErrorCode.KNOWLEDGE_PARSE_FAILED
+    retryable = False
 
 
 class RetrievalFailedError(KnowledgeError):
