@@ -47,6 +47,13 @@ repos:
       # 恰是 CLAUDE.md 12.3 / NO-06 明令禁止的。故显式排除，保留只读保护。
       # 注意：排除的只是这三条文本规范化钩子；ruff/mypy/gitleaks 本就只作用于代码文件。
       # 将来按 NO-20 修订 CLAUDE.md 时，需先经人确认再临时 attrib -r，改完恢复。
+      #
+      # **提交本身会悄悄清掉只读位（2026-10-16 实测）**：pre-commit 为保护未暂存改动
+      # 会 stash 再还原，还原时**重写**了 CLAUDE.md，`attrib` 从 `A R` 变回 `A`（文件
+      # 内容与 `git status` 都不报警，只读保护就这样无声失效）。故**凡提交过
+      # CLAUDE.md，事后必须 `attrib +R CLAUDE.md` 并核对 `ls -l` 显示 `-r--r--r--`**。
+      # 另记：该文件历史行尾为 CRLF（上表 `* text=auto eol=lf` 它并未生效），这是一处
+      # 既存的、经本条排除条款默认接受的偏离——本条**不改变**它，也不据此重新规范化。
       - id: trailing-whitespace
         exclude: ^CLAUDE\.md$
       - id: end-of-file-fixer
