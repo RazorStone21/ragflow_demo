@@ -12,6 +12,7 @@ from langchain_core.messages import HumanMessage
 from agent_platform.agents.gov_policy_qa.nodes.generate_answer import build_answer_messages
 from agent_platform.agents.gov_policy_qa.prompts import (
     ANSWER_HUMAN_PROMPT,
+    ANSWER_NO_EVIDENCE_MARKER,
     ANSWER_SYSTEM_PROMPT,
     render_prompt,
 )
@@ -107,6 +108,23 @@ def test_system_prompt_renders_static_text_without_jinja_residue() -> None:
     assert rendered.strip()
     assert "{{" not in rendered
     assert "{%" not in rendered
+
+
+def test_system_prompt_v2_declares_all_three_evidence_branches() -> None:
+    """v2 规则 4 必须写清"完全无据 / 部分支撑 / 足以支撑"三种情形（NO-12 的生成侧落地）。
+
+    只锚定分支措辞与标记常量，不锁整句：措辞可以打磨，但少掉任何一档都会让
+    模型退回"一律作答"或"一律拒答"，而两者都曾在实测中出过错。
+    """
+    rendered = render_prompt(ANSWER_SYSTEM_PROMPT)
+
+    assert ANSWER_NO_EVIDENCE_MARKER in rendered
+    assert "完全无法支撑" in rendered
+    assert "只能支撑一部分" in rendered
+    assert "足以支撑" in rendered
+    # 部分作答不仅不得拒答，提示词还要明确禁止写标记——否则模型会把它当语气词
+    partial_rule = rendered.split("只能支撑一部分", 1)[1].split("\n", 1)[0]
+    assert ANSWER_NO_EVIDENCE_MARKER in partial_rule
 
 
 def test_human_prompt_numbers_evidence_from_one_matching_citation_parser() -> None:

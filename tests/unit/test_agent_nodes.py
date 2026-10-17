@@ -27,11 +27,19 @@ from agent_platform.agents.gov_policy_qa.nodes.answer_without_evidence import (
 from agent_platform.agents.gov_policy_qa.nodes.generate_answer import (
     _BLOCKED_ANSWER,
     _CITATION_MISSING_ANSWER,
+    _MODEL_NO_EVIDENCE_ANSWER,
     build_generate_answer_node,
+)
+from agent_platform.agents.gov_policy_qa.nodes.result import (
+    REASON_MODEL_DECLARED_INSUFFICIENT,
 )
 from agent_platform.agents.gov_policy_qa.nodes.retrieve_evidence import build_retrieve_evidence_node
 from agent_platform.agents.gov_policy_qa.nodes.types import GovPolicyQaNode
-from agent_platform.agents.gov_policy_qa.prompts import ANSWER_SYSTEM_PROMPT, render_prompt
+from agent_platform.agents.gov_policy_qa.prompts import (
+    ANSWER_NO_EVIDENCE_MARKER,
+    ANSWER_SYSTEM_PROMPT,
+    render_prompt,
+)
 from agent_platform.agents.gov_policy_qa.state import (
     STATUS_ANSWERED,
     STATUS_CITATION_MISSING,
@@ -502,6 +510,94 @@ async def test_generate_without_evidence_never_calls_model() -> None:
     assert result["citations"] == []
     assert model.stream_calls == 0
     assert writer.chunks == []
+
+
+async def test_generate_marker_refuses_and_downgrades_retrieval_meta() -> None:
+    """模型首字符声明无据 → insufficient_evidence、固定拒答文案、无引用、元数据降级（NO-12）。
+
+    检索层原本判定 is_sufficient=True；生成结果推翻它。只改状态不改元数据会让
+    ``score_refusal`` 判"自相矛盾"，等于修了一半。
+    """
+    sufficient_meta = _outcome(_two_evidence()).meta
+    assert sufficient_meta.is_sufficient is True
+    state = _state(evidence=_two_evidence())
+    state["retrieval_meta"] = sufficient_meta
+    model = FakeChatModel([ANSWER_NO_EVIDENCE_MARKER], usage=_USAGE)
+    node = _answer_node(model)
+    writer = CollectingWriter()
+
+    result = await node(state, writer=writer, config=_config())
+
+    assert result["answer_status"] == STATUS_INSUFFICIENT_EVIDENCE
+    assert result["answer"] == _MODEL_NO_EVIDENCE_ANSWER
+    assert result["citations"] == []
+    downgraded = result["retrieval_meta"]
+    assert downgraded.is_sufficient is False
+    assert downgraded.reason == REASON_MODEL_DECLARED_INSUFFICIENT
+    assert downgraded.candidate_count == sufficient_meta.candidate_count
+    assert writer.chunks == [], "拒答路径不得把标记或草稿推给用户"
+    assert model.stream_calls == 1, "不得为判定无据再调一次模型"
+
+
+async def test_generate_marker_skips_output_guardrail() -> None:
+    """拒答路径不调用输出护栏：最终文案是本地常量，草稿整体丢弃。
+
+    若把标记分支放在护栏之后，一个"恒拦截"的护栏会把 insufficient_evidence
+    改写成 guardrail_blocked——语义错位，且用户会以为是内容违规。
+    """
+    guardrail = FakeGuardrail(GuardrailDecision.block("演示用拦截规则命中"))
+    node = _answer_node(FakeChatModel([ANSWER_NO_EVIDENCE_MARKER]), guardrail=guardrail)
+
+    result = await node(_state(evidence=_two_evidence()), config=_config())
+
+    assert result["answer_status"] == STATUS_INSUFFICIENT_EVIDENCE
+    assert guardrail.output_checks == []
+
+
+async def test_partial_answer_with_uncovered_wording_stays_answered() -> None:
+    """部分作答的开头不是标记：正文里说"未涵盖"不触发拒答（保护来自位置，不来自文案）。"""
+    draft = "《电价政策》规定分时电价适用于工业用户 [1]。风电部分的资料未涵盖。"
+    node = _answer_node(FakeChatModel([draft]))
+
+    result = await node(_state(evidence=_two_evidence()), config=_config())
+
+    assert result["answer_status"] == STATUS_ANSWERED
+    assert result["answer"] == draft
+    assert [citation.chunk_id for citation in result["citations"]] == ["c1"]
+
+
+async def test_misplaced_marker_is_logged_but_answer_kept(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """标记出现在正文中间（协议违规）：记 WARNING 与偏移，但仍按正常答案处理。"""
+    draft = f"根据资料 [1]，结论如上。{ANSWER_NO_EVIDENCE_MARKER}附注"
+    node = _answer_node(FakeChatModel([draft]))
+
+    with caplog.at_level("WARNING"):
+        result = await node(_state(evidence=_two_evidence()), config=_config())
+
+    assert result["answer_status"] == STATUS_ANSWERED
+    warnings = [
+        record
+        for record in caplog.records
+        if record.message == "agent.no_evidence_marker_misplaced"
+    ]
+    assert len(warnings) == 1
+    record = cast(Any, warnings[0])  # extra 字段是运行时属性，LogRecord 类型上不存在
+    assert record.offset == draft.index(ANSWER_NO_EVIDENCE_MARKER)
+    assert record.answer_chars == len(draft)
+
+
+async def test_generate_marker_path_does_not_mutate_state() -> None:
+    """拒答分支同样不得原地修改入参状态（NO-04）。"""
+    state = _state(evidence=_two_evidence())
+    state["retrieval_meta"] = _outcome(_two_evidence()).meta
+    snapshot = deepcopy(state)
+    node = _answer_node(FakeChatModel([ANSWER_NO_EVIDENCE_MARKER]))
+
+    await node(state, config=_config())
+
+    assert state == snapshot
 
 
 async def test_generate_guardrail_block_replaces_draft() -> None:

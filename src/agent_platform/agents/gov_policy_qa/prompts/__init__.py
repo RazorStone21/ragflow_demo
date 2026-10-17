@@ -18,8 +18,15 @@ from jinja2 import Environment, StrictUndefined, Template, TemplateError
 
 from agent_platform.core.errors import AgentPlatformError
 
-ANSWER_SYSTEM_PROMPT = "answer.system.v1"
+ANSWER_SYSTEM_PROMPT = "answer.system.v2"
 ANSWER_HUMAN_PROMPT = "answer.human.v1"
+ANSWER_NO_EVIDENCE_MARKER = "【无据】"
+"""模型声明"证据完全无法支撑"的前缀标记（v2 起）。
+
+只在回答的**首个非空白字符**处生效：``nodes/no_evidence_marker`` 用流式前缀门
+判定，``generate_answer`` 据此把 ``answered`` 改判为 ``insufficient_evidence``。
+它是一条**结构化信号**，不参与文案匹配——答案正文里出现同样的字串不算声明。
+"""
 
 
 @lru_cache(maxsize=1)
@@ -68,4 +75,9 @@ def render_prompt(name: str, /, **variables: object) -> str:
         ) from exc
 
 
-__all__: list[str] = ["ANSWER_HUMAN_PROMPT", "ANSWER_SYSTEM_PROMPT", "render_prompt"]
+__all__: list[str] = [
+    "ANSWER_HUMAN_PROMPT",
+    "ANSWER_NO_EVIDENCE_MARKER",
+    "ANSWER_SYSTEM_PROMPT",
+    "render_prompt",
+]

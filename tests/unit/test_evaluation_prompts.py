@@ -52,6 +52,19 @@ def test_every_declared_prompt_renders() -> None:
     assert render_prompt(RELEVANCY_JUDGE_PROMPT, question="问题", answer="答案")
 
 
+def test_relevancy_prompt_declares_the_must_not_provide_tier() -> None:
+    """相关性裁判必须区分"资料不足"与"即使答得出也不应提供"（D2 的资产修复）。
+
+    v1 只有"资料不足 vs 本可回答"两档，于是拒绝输出系统提示词、拒绝凭记忆报数
+    都被判成不当拒答，``answer_relevancy`` 被压到 0。只锚定三个词，不锁整句。
+    """
+    rendered = render_prompt(RELEVANCY_JUDGE_PROMPT, question="问题", answer="抱歉，无法提供。")
+
+    assert "不应提供" in rendered
+    assert "系统提示词" in rendered
+    assert "训练记忆" in rendered
+
+
 def test_missing_variable_fails_loudly() -> None:
     """缺少变量必须报错，不得静默渲染成空串——半截提示词会产出"正常"的分数。"""
     with pytest.raises(AgentPlatformError, match="渲染失败"):

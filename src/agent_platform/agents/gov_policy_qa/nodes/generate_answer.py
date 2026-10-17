@@ -1,9 +1,10 @@
 """生成带引用的回答（CLAUDE.md 4.2 / 4.7 / 5.5 / 7.5 / 10.3）。
 
 流程：渲染提示词（证据以不可信数据栅栏隔离）→ 流式调用模型（逐 token 推
-``message.delta``）→ 校验答案确实带合法引用 → 输出护栏检查 → 写入状态。
+``message.delta``）→ 若模型在开头声明「无据」则落 ``insufficient_evidence`` →
+校验答案确实带合法引用 → 输出护栏检查 → 写入状态。
 
-三处刻意的设计取舍：
+四处刻意的设计取舍：
 
 1. **不重试带引用的生成**：答案已边生成边推送给用户，重试会让用户先看到被否决的
    文本；因此引用缺失时直接走确定性兜底（状态 ``citation_missing``），最终以
@@ -13,6 +14,9 @@
 3. **不用结构化输出（JSON/tool）**：本节点的产出需要逐 token 流式呈现，JSON 流对
    用户不可读；引用完整性改由上述边界校验保证（CLAUDE.md 5.6 允许"解析失败走
    兜底分支"）。
+4. **"模型自称无据"是结构化信号，不是文案匹配**（v2 起）：模型把「无据」标记写在
+   回答首字符，前缀门据此改判状态并丢弃草稿。检索层"有证据"与最终"答不了"可以
+   同时为真——检索只做阈值与重排，模型读完全文才知道证据是否够用（NO-12）。
 """
 
 from __future__ import annotations
@@ -24,10 +28,15 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.types import StreamWriter
 
-from agent_platform.agents.gov_policy_qa.nodes.result import answer_update
+from agent_platform.agents.gov_policy_qa.nodes.no_evidence_marker import NoEvidencePrefixGate
+from agent_platform.agents.gov_policy_qa.nodes.result import (
+    answer_update,
+    downgrade_retrieval_meta,
+)
 from agent_platform.agents.gov_policy_qa.nodes.types import GovPolicyQaNode
 from agent_platform.agents.gov_policy_qa.prompts import (
     ANSWER_HUMAN_PROMPT,
+    ANSWER_NO_EVIDENCE_MARKER,
     ANSWER_SYSTEM_PROMPT,
     render_prompt,
 )
@@ -67,6 +76,15 @@ _CITATION_MISSING_ANSWER = (
     "请换一种问法或补充政策名称、年份、地区后再试。"
 )
 _BLOCKED_ANSWER = "抱歉，本次回答未通过内容安全校验，已被拦截。请调整提问方式后重试。"
+_MODEL_NO_EVIDENCE_ANSWER = (
+    "抱歉，现有资料不足以回答这个问题，我不做无依据的推测。"
+    "请换一种问法，或补充政策名称、年份、地区、文号后再试。"
+)
+"""模型声明无据时的确定性拒答文案。
+
+模型草稿整体丢弃（含它写下的 `【无据】` 标记），最终文案由本地常量给出：
+标记只承担"改判状态"这一件事，不进入用户可见文本，也不依赖模型自述的措辞。
+"""
 
 
 def build_generate_answer_node(
@@ -125,7 +143,7 @@ def build_generate_answer_node(
         tenant_id = tenant_id_from_config(config)
         messages = build_answer_messages(question, evidence)
         started = time.perf_counter()
-        draft, token_usage = await _stream_answer(model, messages, writer)
+        draft, token_usage, refused = await _stream_answer(model, messages, writer)
         duration_ms = (time.perf_counter() - started) * 1000
         hook.record_model_call(
             logical_name=logical_name,
@@ -134,6 +152,35 @@ def build_generate_answer_node(
             token_usage=token_usage,
             agent="gov_policy_qa",
         )
+
+        if refused:
+            # 草稿整体丢弃：最终文案是本地常量，不经过输出护栏（也无需再过一遍引用校验）
+            logger.info(
+                "agent.model_declared_no_evidence",
+                extra={
+                    "event": "agent.model_declared_no_evidence",
+                    "tenant_id": tenant_id,
+                    "evidence_count": len(evidence),
+                    "duration_ms": round(duration_ms, 1),
+                    "token_usage": token_usage,
+                },
+            )
+            return answer_update(
+                answer=_MODEL_NO_EVIDENCE_ANSWER,
+                status=STATUS_INSUFFICIENT_EVIDENCE,
+                retrieval_meta=downgrade_retrieval_meta(state.get("retrieval_meta")),
+            )
+
+        if ANSWER_NO_EVIDENCE_MARKER in draft:
+            # 协议违规：标记出现在非前缀位置。只记偏移与长度，不记正文（NO-07）
+            logger.warning(
+                "agent.no_evidence_marker_misplaced",
+                extra={
+                    "event": "agent.no_evidence_marker_misplaced",
+                    "offset": draft.index(ANSWER_NO_EVIDENCE_MARKER),
+                    "answer_chars": len(draft),
+                },
+            )
 
         indices = extract_citation_indices(draft, max_index=len(evidence))
         if not draft or not indices:
@@ -206,21 +253,28 @@ def build_answer_messages(question: str, evidence: list[EvidenceItem]) -> list[B
 
 async def _stream_answer(
     model: ChatModel, messages: list[BaseMessage], writer: StreamWriter
-) -> tuple[str, dict[str, int] | None]:
-    """流式生成答案：逐增量推流并拼接完整文本。
+) -> tuple[str, dict[str, int] | None, bool]:
+    """流式生成答案：经前缀门逐增量推流，并判定模型是否声明无据。
 
     Returns:
-        ``(完整答案文本, token 用量)``；用量在网关未返回时为空。
+        ``(推送给用户的答案文本, token 用量, 是否声明无据)``。判为拒答时文本为空
+        ——标记及其之后的草稿全部丢弃，用户不会先看到再被撤回。
     """
+    gate = NoEvidencePrefixGate()
     parts: list[str] = []
     token_usage: dict[str, int] | None = None
+
+    def push(text: str) -> None:
+        """把已放行的文本追加到答案并推送 ``message.delta``。"""
+        parts.append(text)
+        writer(AgentStreamEvent(event=SseEventType.MESSAGE_DELTA, data={"delta": text}).to_chunk())
+
     async for chunk in model.astream(messages):
         delta = message_text(chunk)
         if delta:
-            parts.append(delta)
-            writer(
-                AgentStreamEvent(event=SseEventType.MESSAGE_DELTA, data={"delta": delta}).to_chunk()
-            )
+            released = gate.feed(delta)
+            if released:
+                push(released)
         usage = chunk.usage_metadata
         if usage:
             # 网关在流末给出累计用量；只取三个标准整型字段进埋点（CLAUDE.md 5.7）
@@ -229,7 +283,10 @@ async def _stream_answer(
                 "output_tokens": int(usage.get("output_tokens", 0)),
                 "total_tokens": int(usage.get("total_tokens", 0)),
             }
-    return "".join(parts).strip(), token_usage
+    tail = gate.flush()
+    if tail:
+        push(tail)
+    return "".join(parts).strip(), token_usage, gate.is_refused
 
 
 __all__: list[str] = ["build_answer_messages", "build_generate_answer_node"]

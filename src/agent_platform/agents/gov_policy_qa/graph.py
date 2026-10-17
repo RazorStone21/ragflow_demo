@@ -30,7 +30,7 @@ from agent_platform.core.models import ChatModel
 from agent_platform.guardrails import Guardrail
 from agent_platform.knowledge.retriever import Retriever
 
-AGENT_VERSION = "0.1.0"
+AGENT_VERSION = "0.2.0"
 """智能体版本（与 ``agents/registry.py`` 的声明保持一致）。"""
 
 

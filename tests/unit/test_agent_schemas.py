@@ -37,6 +37,7 @@ def _evidence(chunk_id: str, **overrides: Any) -> EvidenceItem:
         ("越界 [9]", []),
         ("零号 [0] 非法", []),
         ("正文里出现的方括号 [详见附件] 不算引用", []),
+        ("无据标记【无据】不含数字，不算引用", []),
     ],
 )
 def test_extract_citation_indices(answer: str, expected: list[int]) -> None:

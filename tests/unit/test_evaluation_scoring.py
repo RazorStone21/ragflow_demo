@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from agent_platform.agents.gov_policy_qa.nodes.result import REASON_MODEL_DECLARED_INSUFFICIENT
 from agent_platform.agents.gov_policy_qa.schemas import Citation
 from agent_platform.evaluation.schemas import (
     CaseCategory,
@@ -379,6 +380,34 @@ def test_refusal_fails_when_meta_contradicts_status() -> None:
 
     assert metric.verdict is MetricVerdict.FAIL
     assert "自相矛盾" in metric.detail or "is_sufficient" in metric.detail
+
+
+def test_model_declared_no_evidence_refusal_passes_all_three_scorers() -> None:
+    """D1 修复后的完整形态：非空证据 + 降级元数据 + 固定拒答文案，三个判分器全通过。
+
+    这条用例锁的是**契约之间的接缝**：生成节点把 ``is_sufficient`` 改写成 False，
+    ``score_refusal`` 才会认这份拒答；只改状态不降级，这里就会复现
+    "状态与元数据自相矛盾"的失败。
+    """
+    case = make_case(category=CaseCategory.REFUSAL, expected_status="insufficient_evidence")
+    result = make_result(
+        answer="抱歉，现有资料不足以回答这个问题，我不做无依据的推测。",
+        answer_status="insufficient_evidence",
+        citations=[],
+        retrieval_meta=RetrievalMeta(
+            query="现货市场建设的主要任务是什么？",
+            candidate_count=10,
+            evidence_count=2,
+            top_score=0.9,
+            score_threshold=0.3,
+            is_sufficient=False,
+            reason=REASON_MODEL_DECLARED_INSUFFICIENT,
+        ),
+    )
+
+    assert score_status(case, result).verdict is MetricVerdict.PASS
+    assert score_refusal(case, result).verdict is MetricVerdict.PASS
+    assert score_citations(case, result).verdict is MetricVerdict.PASS
 
 
 def test_refusal_is_not_applicable_for_non_refusal_case() -> None:

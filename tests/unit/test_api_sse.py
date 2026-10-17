@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from agent_platform.agents.gov_policy_qa.nodes.result import REASON_MODEL_DECLARED_INSUFFICIENT
+from agent_platform.agents.gov_policy_qa.prompts import ANSWER_NO_EVIDENCE_MARKER
 from agent_platform.agents.gov_policy_qa.state import AnswerStatus
 from agent_platform.core.errors import ErrorCode, ModelGatewayError, RetrievalFailedError
 from agent_platform.core.streaming import SseEventType
@@ -195,6 +197,25 @@ async def test_no_evidence_path_skips_model_events(api_factory: OpenApi) -> None
     ]
     assert entered == ["retrieve_evidence", "answer_without_evidence"]
     assert chat.stream_calls == 0
+
+
+async def test_model_declared_no_evidence_sends_no_deltas(api_factory: OpenApi) -> None:
+    """模型首字符声明无据：流里零 ``message.delta``，终态为拒答且元数据降级（NO-12）。
+
+    客户端按"没收到增量 + run.completed 是拒答"渲染，不会先看到标记再被撤回。
+    """
+    async with api_factory(chat=FakeChatModel(reply=ANSWER_NO_EVIDENCE_MARKER)) as harness:
+        thread_id = await harness.create_thread()
+        _, body = await stream_run(harness, thread_id)
+
+    parsed = parse_sse(body)
+    assert not payloads_of(parsed, SseEventType.MESSAGE_DELTA.value)
+    completed = payloads_of(parsed, SseEventType.RUN_COMPLETED.value)[0]
+    assert completed["answer_status"] == AnswerStatus.INSUFFICIENT_EVIDENCE.value
+    assert completed["citations"] == []
+    assert completed["answer"]
+    assert completed["retrieval_meta"]["is_sufficient"] is False
+    assert completed["retrieval_meta"]["reason"] == REASON_MODEL_DECLARED_INSUFFICIENT
 
 
 async def test_seq_is_monotonic_from_one_and_shared_across_events(api: ApiHarness) -> None:

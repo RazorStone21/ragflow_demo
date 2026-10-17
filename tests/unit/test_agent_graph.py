@@ -19,7 +19,12 @@ from agent_platform.agents.gov_policy_qa.nodes.answer_without_evidence import (
     _BASE_ANSWER,
     _REASON_HINTS,
 )
-from agent_platform.agents.gov_policy_qa.nodes.generate_answer import _BLOCKED_ANSWER
+from agent_platform.agents.gov_policy_qa.nodes.generate_answer import (
+    _BLOCKED_ANSWER,
+    _MODEL_NO_EVIDENCE_ANSWER,
+)
+from agent_platform.agents.gov_policy_qa.nodes.result import REASON_MODEL_DECLARED_INSUFFICIENT
+from agent_platform.agents.gov_policy_qa.prompts import ANSWER_NO_EVIDENCE_MARKER
 from agent_platform.agents.gov_policy_qa.state import (
     NODE_ANSWER_WITHOUT_EVIDENCE,
     NODE_GENERATE_ANSWER,
@@ -311,6 +316,32 @@ async def test_custom_stream_emits_evidence_then_deltas() -> None:
     invoked = await graph.ainvoke(initial_state(_QUESTION), _config("t-invoke"))
     assert invoked["answer"] == snapshot.values["answer"]
     assert invoked["answer_status"] == snapshot.values["answer_status"] == STATUS_ANSWERED
+
+
+async def test_model_declared_no_evidence_streams_no_delta() -> None:
+    """证据充足但模型读完声明无据：走生成节点却零 message.delta，状态落拒答（NO-12）。
+
+    这不是"检索没找到"的降级分支——检索确实给了证据；是生成侧推翻检索判断。
+    事件序列里只有 retrieval.evidence，用户不会先看到草稿再被撤回。
+    """
+    graph, _, chat = _build(
+        FakeRetriever(_sufficient_outcome("c1")),
+        FakeChatModel((ANSWER_NO_EVIDENCE_MARKER,)),
+    )
+    config = _config("t-model-refused")
+
+    streamed = await _collect_custom_chunks(graph, _QUESTION, config)
+
+    assert [chunk["event"] for chunk in streamed] == [SseEventType.RETRIEVAL_EVIDENCE.value]
+    assert len(chat.stream_calls) == 1
+    snapshot = await graph.aget_state(config)
+    assert snapshot.values["answer_status"] == STATUS_INSUFFICIENT_EVIDENCE
+    assert snapshot.values["answer"] == _MODEL_NO_EVIDENCE_ANSWER
+    assert snapshot.values["citations"] == []
+    meta = RetrievalMeta.model_validate(snapshot.values["retrieval_meta"])
+    assert meta.is_sufficient is False
+    assert meta.reason == REASON_MODEL_DECLARED_INSUFFICIENT
+    assert meta.evidence_count == 1, "排障字段必须保留，只改判定与理由"
 
 
 async def test_custom_stream_has_no_delta_on_degraded_path() -> None:

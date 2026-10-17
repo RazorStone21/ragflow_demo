@@ -79,7 +79,7 @@ AGENTS: tuple[AgentSpec, ...] = (
     AgentSpec(
         name="gov_policy_qa",
         owner="平台架构组",
-        version="0.1.0",
+        version="0.2.0",
         entrypoint="./src/agent_platform/agents/gov_policy_qa/graph.py:build_graph",
         tools=(),  # 纯检索问答：不挂任何工具，最小权限（NO-11）
         guardrail_level=GUARDRAIL_LEVEL_STANDARD,

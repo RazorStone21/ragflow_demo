@@ -3,7 +3,9 @@
 命名沿用全仓约定 ``<用途>.<角色>.v<主版本>.jinja``：
 
 - ``faithfulness.judge.v1``：逐条核对答案的事实性断言能否由证据支撑；
-- ``relevancy.judge.v1``：答案是否直接回答了问题。
+- ``relevancy.judge.v2``：答案是否直接回答了问题。v2 给"拒答是否正当"补了第三档
+  ——索要系统提示词、凭训练记忆的数据、他人隐私、其他租户的数据、无法核实的
+  条款，即使答得出也必须拒答，不得判成不当拒答。
 
 **为什么不复用 ``agents/gov_policy_qa/prompts`` 的 ``render_prompt``**：那个函数的
 模板目录由 ``files(__package__)`` 绑死在智能体自己的包里，是刻意为之（智能体的
@@ -25,7 +27,7 @@ from jinja2 import Environment, StrictUndefined, Template, TemplateError
 from agent_platform.core.errors import AgentPlatformError
 
 FAITHFULNESS_JUDGE_PROMPT = "faithfulness.judge.v1"
-RELEVANCY_JUDGE_PROMPT = "relevancy.judge.v1"
+RELEVANCY_JUDGE_PROMPT = "relevancy.judge.v2"
 JUDGE_PROMPT_NAMES = (FAITHFULNESS_JUDGE_PROMPT, RELEVANCY_JUDGE_PROMPT)
 """本层全部裁判提示词名；``JudgeSnapshot.prompt_version`` 由它们拼出。"""
 
