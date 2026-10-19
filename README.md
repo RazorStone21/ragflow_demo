@@ -68,7 +68,7 @@ uv run python -X utf8 scripts/eval_run.py --layer all \
 ```
 
 评估眼下处在观察期：报告、判定、留痕照常产出，`--baseline` 也照常检出回归，只是退出码
-还不接进 pre-commit。评估本身不进 pre-commit，它慢，要密钥，还要整套基础设施，硬塞进去
+还不接进 pre-commit。评估不进 pre-commit，因为它慢、要密钥、还要整套基础设施；硬塞进去
 只会让人养成加 `--no-verify` 的习惯。评审协议和缺陷登记在 `tests/evals/README.md`，框架
 选型以及 RAGAS 违反了哪几条，写在 [ADR-0003](docs/adr/0003-evaluation-framework-and-judge.md)。
 

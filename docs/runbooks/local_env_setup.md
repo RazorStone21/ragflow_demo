@@ -6,7 +6,7 @@
 
 **当前状态：本机环境已就绪**（2026-10-16 实测）——Docker Desktop 4.95.0 / Engine 29.8.2，
 WSL2 后端为 Ubuntu-24.04，`docker compose` 可用。下面的步骤保留为**换机或重装时的复用手册**；
-若本机已能跑 `docker compose ps`，直接从 [README](../../README.md) 的「本地启动」进入即可。
+若本机已能跑 `docker compose ps`，直接从 [README](../../README.md) 的「快速开始」进入即可。
 
 修复前实测到的阻塞事实（供判断当前是否又回到这个状态）：
 
@@ -66,7 +66,7 @@ http://127.0.0.1:7890
 ```
 
 注意：shell 里的 `HTTPS_PROXY` 对 **docker daemon 无效**，必须在这里单独配一次。
-（`git` / `npx` 等命令行工具则是相反 —— 见「代理速查」。）
+（`git` / `npx` 等命令行工具相反，见「代理速查」。）
 
 ## 步骤 7 · 配置 `%UserProfile%\.wslconfig`（16GB 机器必做）
 
