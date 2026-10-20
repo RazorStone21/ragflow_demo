@@ -1,6 +1,6 @@
 # 多模态证据链路手册（解析 → 入库 → 检索 → 取图）
 
-> 适用版本：ADR-0004 落地后的代码（CLAUDE.md v1.5.0）。
+> 适用版本：ADR-0004 落地后的代码（CLAUDE.md v1.5.1）。
 > 定位：扫描件、PDF 内嵌图、表格截图如何进入知识库，以及出问题时怎么查。
 > 设计取舍与生产迁移见 [ADR-0004](../adr/0004-multimodal-document-evidence.md)。
 
@@ -56,9 +56,18 @@ manifest 里每份文件多出四个计数，用来判断"图到底进没进来"
 | 字段 | 含义 | 期望 |
 |---|---|---|
 | `image_count` | 实际存下的图片张数 | 扫描件/图表页 > 0 |
-| `image_chunks` | 被识别为 `image` 的切分数 | 与图片页数大致对应 |
+| `image_chunks` | 被识别为 `image` 的切分数 | 只数 `doc_type_kwd=image`；RAGFlow 常把 VLM 描述过的图标成 `table`，本演示语料实测为 0，不能单独拿它判断链路是否正常 |
 | `missing_image_chunks` | 应有图却拿不到的切分数（表格/正文附图降级） | 0；非 0 查 WARNING `ingest.image_degraded` |
 | `skipped_empty_image_chunks` | 内容为空而被跳过的图片切分数 | 0；非 0 多半是视觉模型没生效 |
+
+**媒介类型必须从切分详情读**。RAGFlow v0.27.2 的切分列表接口遇到非字符串的
+`doc_type_kwd` 会一律写成 `"text"`，而 Infinity 存的是 keyword 列表，表格与图片
+因此也显示成 `text`。入库按 `RAGFLOW_CHUNK_DETAIL_CONCURRENCY`（默认 8）逐条读
+切分详情取原始值；任何一条读不到，整份文件判失败并补偿。类型错了还继续入库，
+图片就永远进不了索引，而清单看起来一切正常。
+
+每次入库会打一条 `ingest.doc_types` 日志，按类型统计切分数。`image_chunks` 持续
+为 0 时先看它：全是 `text` 说明类型链路没起作用，而不是语料里没有图。
 
 失败语义只有两档，没有"静默成功"：
 
@@ -108,6 +117,7 @@ curl -i -H "Authorization: Bearer $TOKEN" \
 
 | 现象 | 多半是 | 怎么办 |
 |---|---|---|
+| `ingest.doc_types` 只有 `text`，Milvus 行 `media_type` 全为 `text` | 条目还是 v2（按列表掩码值分类），或详情读取没生效 | 确认清单 `media_version=3`；重跑入库并看类型统计是否出现 `table`/`image` |
 | manifest 里 `skipped_empty_image_chunks` > 0，`image_count=0` | RAGFlow 没有默认视觉模型；图框内又没有文字，切分直接为空 | 按 ragflow_setup.md 设 `vision` 默认模型后重入库 |
 | `missing_image_chunks` > 0，日志有 `ingest.image_degraded` | 单张图下载失败（超时/404/超过 `EVIDENCE_IMAGE_MAX_BYTES`） | 查 RAGFlow 图片端点与上限；表格截图允许缺，图片切分会直接判失败 |
 | 入库报 `KnowledgeImageExportError` | 图片切分的图下载或落盘失败 | 查 RAGFlow 解析产物、磁盘空间、目录权限；该文件已整体回滚 |

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ParseStatus(StrEnum):
@@ -74,8 +74,12 @@ class ChunkInfo(BaseModel):
 
     ``image_id`` 与 ``doc_type_kwd`` 的取值规律见 ADR-0004：前者形如
     ``{dataset_id}-{chunk_id}``，任一位置都可能出现连字符，只能按**首个**
-    连字符拆分；后者经典 ``naive`` 解析器只会写 ``table`` / ``image``，
-    其余回落为 ``text``。
+    连字符拆分。
+
+    ``doc_type_kwd`` 在本接口上**不能用来判媒介类型**：RAGFlow v0.27.2 的
+    ``chunk_api.py`` 遇到非字符串取值一律写成 ``"text"``，而 Infinity 引擎
+    把 ``*_kwd`` 字段存成 keyword 列表，于是表格/图片切分也读成 ``"text"``。
+    真实类型只能从切分详情接口取（``ChunkDetailInfo`` / ``RagFlowClient.get_chunk``）。
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -90,8 +94,59 @@ class ChunkInfo(BaseModel):
         default="", max_length=256, description="切分关联图片 ID（空串表示无图，ADR-0004）"
     )
     doc_type_kwd: str = Field(
-        default="", max_length=32, description="切分媒介类型：table / image / text（ADR-0004）"
+        default="",
+        max_length=32,
+        description="列表接口的媒介类型；非字符串一律被上游压成 text，不可信（ADR-0004）",
     )
+
+
+def normalize_doc_type_kwd(value: object) -> str:
+    """把切分详情的 ``doc_type_kwd`` 归一成单个类型名。
+
+    RAGFlow 的存储引擎决定字段形状：Infinity 把 ``*_kwd`` 当 keyword 列表
+    存取，详情接口因此回 ``["table"]`` 或 ``[]``；换回关系型引擎时是字符串。
+    两种形状都要认，空列表代表"既不是表格也不是图片"。
+
+    ``["image", "table"]`` 同时出现时按 ``image`` 归类：图片切分的失败语义
+    更严（取不到图整份文件判失败），宁可按严的一档处理。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip().lower()
+    if isinstance(value, (list, tuple)):
+        items = [item.strip().lower() for item in value if isinstance(item, str)]
+        if "image" in items:
+            return "image"
+        if "table" in items:
+            return "table"
+        return items[0] if items else ""
+    return ""
+
+
+class ChunkDetailInfo(BaseModel):
+    """切分详情：只取 ``doc_type_kwd`` 的**原始**取值。
+
+    详情接口返回整条存储记录，字段远多于列表接口（``img_id``、``content``
+    等），本仓只需要类型字段，其余字段 ``extra="ignore"`` 丢弃。这里刻意
+    不声明图片字段：列表接口已提供 ``image_id``，详情接口的字段名在版本间
+    出现过 ``img_id`` / ``image_id`` 两种写法，依赖它会平添一个版本雷。
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(min_length=1, description="切分主键")
+    doc_type_kwd: str = Field(
+        default="",
+        max_length=32,
+        description="归一后的媒介类型：table / image / 其余为空（ADR-0004）",
+    )
+
+    @field_validator("doc_type_kwd", mode="before")
+    @classmethod
+    def _normalize_doc_type_kwd(cls, value: object) -> str:
+        """构造函数即归一，调用方拿到的永远是单个小写类型名。"""
+        return normalize_doc_type_kwd(value)
 
 
 class DocumentPage(BaseModel):

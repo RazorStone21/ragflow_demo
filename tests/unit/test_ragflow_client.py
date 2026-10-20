@@ -385,6 +385,56 @@ async def test_iter_chunks_stops_on_empty_page() -> None:
     assert len(pages) == 1
 
 
+async def test_get_chunk_normalizes_keyword_list_doc_type() -> None:
+    """详情接口回 Infinity 的 keyword 列表，归一成单个类型名。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/datasets/ds1/documents/d1/chunks/k1"
+        return _ok({"id": "k1", "doc_type_kwd": ["table"], "img_id": "ignored"})
+
+    detail = await _client(handler).get_chunk("ds1", "d1", "k1")
+
+    assert detail.id == "k1"
+    assert detail.doc_type_kwd == "table"
+
+
+async def test_get_chunk_maps_empty_keyword_list_to_empty_string() -> None:
+    """普通切分的类型是空列表（不是 "text"），归一成空串。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _ok({"id": "k1", "doc_type_kwd": []})
+
+    assert (await _client(handler).get_chunk("ds1", "d1", "k1")).doc_type_kwd == ""
+
+
+async def test_get_chunk_prefers_image_when_both_types_present() -> None:
+    """同时出现 table/image 时按 image 归类（图片失败语义更严）。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _ok({"id": "k1", "doc_type_kwd": ["table", "image"]})
+
+    assert (await _client(handler).get_chunk("ds1", "d1", "k1")).doc_type_kwd == "image"
+
+
+async def test_get_chunk_accepts_plain_string_doc_type() -> None:
+    """换回关系型引擎时字段是字符串，同样要做大小写归一。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _ok({"id": "k1", "doc_type_kwd": " Table "})
+
+    assert (await _client(handler).get_chunk("ds1", "d1", "k1")).doc_type_kwd == "table"
+
+
+async def test_get_chunk_missing_id_is_a_contract_breach() -> None:
+    """详情缺主键属于契约破坏，不得当成无害响应放行。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _ok({"doc_type_kwd": ["table"]})
+
+    with pytest.raises(KnowledgeError, match="不符合契约"):
+        await _client(handler).get_chunk("ds1", "d1", "k1")
+
+
 async def test_delete_documents_reports_deleted_count() -> None:
     """删除返回实际删除数（v0.27.2 代码返回 data.deleted）。"""
 

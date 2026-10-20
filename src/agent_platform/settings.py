@@ -121,6 +121,12 @@ class Settings(BaseSettings):
     ragflow_task_page_size: int = Field(
         default=12, ge=1, le=64, description="解析任务分片页数（CPU 模式下影响单任务耗时）"
     )
+    ragflow_chunk_detail_concurrency: int = Field(
+        default=8,
+        ge=1,
+        le=32,
+        description="入库时逐条读取切分详情（取真实 doc_type_kwd）的并发上限，ADR-0004",
+    )
 
     # --- 证据图片（ADR-0004；演示期本地文件存储，生产换对象存储）---
     evidence_image_store_dir: Path = Path("local_data/evidence_images")

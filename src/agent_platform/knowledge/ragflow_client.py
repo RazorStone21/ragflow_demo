@@ -16,6 +16,11 @@ RAGFlow 的可视化画布与内置检索不得承载核心流程（NO-01）。
 - 文档列表：``GET /datasets/{id}/documents`` → ``data.docs[]`` + ``data.total``；
   状态字段 ``run``，进度 ``progress``（0~1，取消为 -1）。
 - 切分列表：``GET /datasets/{id}/documents/{doc_id}/chunks`` → ``data.chunks[]`` + ``data.total``。
+  该接口的 ``doc_type_kwd`` **不可信**：源码 ``chunk_api.py`` 对非字符串取值一律
+  落成 ``"text"``，而 Infinity 存的是 keyword 列表（表格/图片均读成 ``"text"``）。
+- 切分详情：``GET /datasets/{id}/documents/{doc_id}/chunks/{chunk_id}`` → ``data``
+  为整条存储记录，``doc_type_kwd`` 保持原始形状（``["table"]`` / ``[]``），
+  是入库判媒介类型的唯一可靠来源。
 - 数据集更新：``PUT /datasets/{id}``，``parser_config`` 由服务端 **deep_merge** 进已有配置
   （``api/apps/services/dataset_api_service.py:update_dataset``）；上传接口则只白名单
   ``table_column_mode`` / ``table_column_roles`` 两个键（``document_api.py``）。
@@ -51,6 +56,7 @@ from agent_platform.core.logging import get_logger
 from agent_platform.core.retry import build_retry, is_retryable
 from agent_platform.knowledge.images import detect_image_mime
 from agent_platform.knowledge.ragflow_schemas import (
+    ChunkDetailInfo,
     ChunkPage,
     DatasetInfo,
     DocumentInfo,
@@ -416,6 +422,22 @@ class RagFlowClient:
             params={"page": page, "page_size": page_size},
         )
         return _parse_object(body, ChunkPage, "切分列表")
+
+    async def get_chunk(self, dataset_id: str, document_id: str, chunk_id: str) -> ChunkDetailInfo:
+        """读取单条切分详情，取**未被打码**的 ``doc_type_kwd``。
+
+        列表接口会把列表形状的类型字段压成 ``"text"``（见模块文档），入库
+        必须逐条走这里才能分清表格/图片。``doc_type_kwd`` 在构造时就归一成
+        单个小写类型名。
+
+        Raises:
+            KnowledgeError: 传输失败、服务端业务错误或响应不合契约。
+        """
+        body = await self._request(
+            "GET",
+            f"/api/v1/datasets/{dataset_id}/documents/{document_id}/chunks/{chunk_id}",
+        )
+        return _parse_object(body, ChunkDetailInfo, "切分详情")
 
     async def iter_chunks(
         self, dataset_id: str, document_id: str, *, page_size: int = DEFAULT_PAGE_SIZE

@@ -38,6 +38,7 @@ import argparse
 import asyncio
 import json
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -46,6 +47,7 @@ from typing import Any
 from agent_platform.core.errors import (
     AgentPlatformError,
     ConfigurationError,
+    KnowledgeError,
     KnowledgeImageExportError,
     KnowledgeParseFailedError,
 )
@@ -76,12 +78,17 @@ EXIT_FATAL = 3
 MANIFEST_VERSION = 1
 """清单格式版本。结构变更时必须递增，旧清单将被视为不兼容而拒绝加载。"""
 
-MEDIA_VERSION = 2
+MEDIA_VERSION = 3
 """条目级媒体版本（ADR-0004）。
 
 顶层清单版本**不升**：``manifest.files[*]`` 是逐条追加的，旧条目缺
 ``media_version`` 只影响该文件是否需要重入库，不影响清单能被读懂。缺该字段
-或值不等于 2 的条目一律视为"未按多模态链路入库"，重跑一次即可补上。
+或值不等于 3 的条目一律视为"未按多模态链路入库"，重跑一次即可补上。
+
+版本史：2 = 引入图片导出；3 = 媒介类型改从切分详情读取。v2 依据列表接口的
+``doc_type_kwd`` 分类，而该字段在上游被打码成 ``"text"``，实测导致所有图片
+切分退化为文本、清单却显示成功（``image_chunks=0``）。同内容文件必须按 v3
+重入库一次，否则库里永远没有图片。
 """
 
 SUPPORTED_SUFFIXES = frozenset(
@@ -252,6 +259,50 @@ def media_type_of(chunk: ChunkInfo) -> MediaType:
     会让一张不存在的图挡住整份文件的入库。
     """
     return _MEDIA_BY_DOC_TYPE.get(chunk.doc_type_kwd.strip().lower(), MediaType.TEXT)
+
+
+async def _enrich_doc_types(
+    chunks: list[ChunkInfo],
+    *,
+    rel_path: str,
+    dataset_id: str,
+    document_id: str,
+    ragflow: RagFlowClient,
+    concurrency: int,
+) -> list[ChunkInfo]:
+    """逐条读取切分详情，用**原始** ``doc_type_kwd`` 替换列表接口的掩码值。
+
+    列表接口对非字符串的类型字段一律写 ``"text"``（Infinity 存的是 keyword
+    列表），只靠它就分不出表格与图片；详情接口才返回原始形状。
+
+    这里**不做降级**：任何一条详情读不到，媒介类型就会整片退化成文本——
+    图片不入索引、取图链路静默失效，而清单看起来仍然"成功"。因此宁可让
+    整份文件失败并走补偿，让问题在重跑时暴露。
+
+    Raises:
+        KnowledgeError: 详情读取出现平台异常之外的错误。
+        AgentPlatformError: 详情接口本身报告的业务/传输错误，原样上抛。
+    """
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def enrich(chunk: ChunkInfo) -> ChunkInfo:
+        async with semaphore:
+            detail = await ragflow.get_chunk(dataset_id, document_id, chunk.id)
+        return chunk.model_copy(update={"doc_type_kwd": detail.doc_type_kwd})
+
+    results = await asyncio.gather(*(enrich(chunk) for chunk in chunks), return_exceptions=True)
+    enriched: list[ChunkInfo] = []
+    for chunk, result in zip(chunks, results, strict=True):
+        if isinstance(result, BaseException):
+            if isinstance(result, Exception) and not isinstance(result, AgentPlatformError):
+                raise KnowledgeError(
+                    f"读取切分详情失败: {rel_path} chunk={chunk.id}: {result}"
+                ) from result
+            # 平台异常原样上抛（调用方按它做补偿）；CancelledError 等不是 Exception，
+            # 也必须按取消语义继续向上传播，不能包装成业务错误。
+            raise result
+        enriched.append(result)
+    return enriched
 
 
 def _image_position(chunk: ChunkInfo) -> tuple[int | None, ImageBBox | None]:
@@ -460,6 +511,7 @@ async def ingest_one(
     image_store: ImageStore,
     image_max_bytes: int,
     image_concurrency: int,
+    detail_concurrency: int,
     previous_document_id: str | None,
 ) -> IngestOutcome:
     """处理单个文件：上传 → 解析 → 拉取切分 → 导出图片 → 嵌入 → 写入 Milvus。
@@ -471,6 +523,7 @@ async def ingest_one(
         image_store: 证据图片存储（ADR-0004）。
         image_max_bytes: 单张图片的字节上限。
         image_concurrency: 单份文件内并发下载图片的上限。
+        detail_concurrency: 并发读取切分详情（取真实媒介类型）的上限。
     """
     if previous_document_id:
         # 内容变更后的重入：先清旧产物，否则旧 chunk 会以孤儿行形式永久留在索引里。
@@ -535,6 +588,7 @@ async def ingest_one(
             image_store=image_store,
             image_max_bytes=image_max_bytes,
             image_concurrency=image_concurrency,
+            detail_concurrency=detail_concurrency,
         )
     except AgentPlatformError:
         # 补偿：RAGFlow **拒绝同名重复上传**（实测 "Duplicated document name in the
@@ -632,8 +686,12 @@ async def collect_and_index(
     image_store: ImageStore,
     image_max_bytes: int,
     image_concurrency: int,
+    detail_concurrency: int,
 ) -> CollectResult:
-    """拉取切分 → 导出图片 → 映射 → 嵌入 → 写入 Milvus。
+    """拉取切分 → 补读详情 → 导出图片 → 映射 → 嵌入 → 写入 Milvus。
+
+    媒介类型不能信列表接口（见 ``ragflow_schemas.ChunkInfo`` 的说明），必须
+    逐条读详情补齐；详情读取失败同样**整份文件判失败**。
 
     图片导出的失败语义（ADR-0004）按媒介类型分档：
 
@@ -646,22 +704,44 @@ async def collect_and_index(
     Raises:
         KnowledgeParseFailedError: 解析成功但一条可用切分都没有（"零入库"不得算成功）。
         KnowledgeImageExportError: 图片切分的图片下载或落盘失败。
+        KnowledgeError: 切分详情读取失败。
     """
     updated_at = int(datetime.now(UTC).timestamp())
+    available_chunks: list[ChunkInfo] = []
+    async for _page_index, page in ragflow.iter_chunks(dataset_id, doc.id):
+        # 被人工禁用的切分不入索引：它不应作为回答依据出现。
+        available_chunks.extend(chunk for chunk in page.chunks if chunk.available)
+
+    available_chunks = await _enrich_doc_types(
+        available_chunks,
+        rel_path=rel_path,
+        dataset_id=dataset_id,
+        document_id=doc.id,
+        ragflow=ragflow,
+        concurrency=detail_concurrency,
+    )
+    # 类型分布进日志：类型读错时最直接的证据就是这里全是 text。
+    type_counts = Counter(chunk.doc_type_kwd or "text" for chunk in available_chunks)
+    logger.info(
+        "切分媒介类型统计",
+        extra={
+            "event": "ingest.doc_types",
+            "source": rel_path,
+            "document_id": doc.id,
+            "chunks_by_type": dict(type_counts),
+        },
+    )
+
     usable: list[ChunkInfo] = []
     skipped_empty_image_chunks = 0
-    async for _page_index, page in ragflow.iter_chunks(dataset_id, doc.id):
-        for chunk in page.chunks:
-            if not chunk.available:
-                # 被人工禁用的切分不入索引：它不应作为回答依据出现。
-                continue
-            if not chunk.content.strip():
-                # 空切分无法向量化（ChunkRecord.content 要求 min_length=1），跳过。
-                # 图片切分额外计数：它们可能只是 RAGFlow 没跑 OCR/VLM，值得显式观察。
-                if media_type_of(chunk) is MediaType.IMAGE:
-                    skipped_empty_image_chunks += 1
-                continue
-            usable.append(chunk)
+    for chunk in available_chunks:
+        if not chunk.content.strip():
+            # 空切分无法向量化（ChunkRecord.content 要求 min_length=1），跳过。
+            # 图片切分额外计数：它们可能只是 RAGFlow 没跑 OCR/VLM，值得显式观察。
+            if media_type_of(chunk) is MediaType.IMAGE:
+                skipped_empty_image_chunks += 1
+            continue
+        usable.append(chunk)
 
     image_chunks = sum(1 for chunk in usable if media_type_of(chunk) is MediaType.IMAGE)
     missing_image_chunks = 0
@@ -930,6 +1010,7 @@ async def run(args: argparse.Namespace, settings: Settings) -> int:
                     image_store=image_store,
                     image_max_bytes=settings.evidence_image_max_bytes,
                     image_concurrency=settings.evidence_image_download_concurrency,
+                    detail_concurrency=settings.ragflow_chunk_detail_concurrency,
                     previous_document_id=previous,
                 )
             except AgentPlatformError as exc:

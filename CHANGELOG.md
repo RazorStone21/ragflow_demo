@@ -612,6 +612,29 @@ LiteLLM 均无关；不同前向批的浮点归约顺序不同，故低位有差
 
 ---
 
+## [v1.5.1] — 2026-10-20 — 纠正：媒介类型改从切分详情读取
+
+| 项 | 内容 |
+|---|---|
+| **版本** | v1.5.1（PATCH；只纠正第 7.9 条的取数来源，约束强度不变） |
+| **日期** | 2026-10-20 |
+| **变更摘要** | 第 7.9 条写明 `doc_type_kwd` 必须来自切分详情接口；新增环境变量 `RAGFLOW_CHUNK_DETAIL_CONCURRENCY`（默认 8）。 |
+| **动机** | 实测发现列表接口不可信：RAGFlow v0.27.2 的 `chunk_api.py` 遇到非字符串取值一律写成 `"text"`，而 Infinity 把 `*_kwd` 存成 keyword 列表，表格与图片切分于是全被读成 `text`。按 v1.5.0 原文实现后，两份演示文件共 79 条切分、79 张图片全部入库，清单里 `image_chunks` 却是 0：媒介分类整片失效，取图链路没有可引用的证据，而入库显示成功。 |
+| **影响面** | `CLAUDE.md` 第 7.9 条与文件头版本号；`settings.py` / `.env.example` 新增一个配置项。入库条目的媒体版本由 2 升到 3，同内容文件需按新链路重入库一次（manifest 会记 `ingest.media_version_outdated`）；旧 checkpoint 与旧基线不受影响。 |
+
+**变更明细**：
+
+1. **取数来源改为切分详情**。`GET /api/v1/datasets/{id}/documents/{doc_id}/chunks/{chunk_id}` 返回原始存储记录，`doc_type_kwd` 保持 `["table"]` / `[]` 的形状；客户端新增 `ChunkDetailInfo` 做归一（列表取可识别类型，`image` 优先于 `table`），入库按 `RAGFLOW_CHUNK_DETAIL_CONCURRENCY` 有界并发逐条补齐。
+2. **失败语义不降级**。详情读不到会让类型整片退化成 `text`，那比直接失败更危险——问题被"成功"掩盖。因此任一条读不到即整份文件失败并走补偿删除，文件不写入清单，重跑会再试。
+3. **`MEDIA_VERSION` 2 → 3**。v2 条目按掩码值分类，必须重跑一次；重入沿用旧 `document_id` 清理旧文档与图片目录，不会撞 RAGFlow 的同名限制。
+4. **诊断留痕**。每次入库新增 `ingest.doc_types` INFO 日志，按类型统计切分数；类型读错时能直接看到"全是 text"。
+
+**验证**：新增 7 条单测，覆盖详情归一（keyword 列表、空列表、`image`/`table` 并存、字符串、缺主键）与入库路径（详情并发上限、详情失败整份失败）；全量单测 765 条通过，ruff 与 mypy 无告警。真实入库复跑（2026-10-20，`MILVUS_COLLECTION=gov_policy_chunks_v2`）：0100 的类型统计从全 `text` 变为 `{"text": 45, "table": 28}`，Milvus 中 73 行全部带 `images`；0052 为 `{"table": 2, "text": 4}`。两份语料的图都被 RAGFlow 标成 `table`，所以 `image_chunks`（只数 `media_type=image`）本来就是 0——验收要看 `chunks_by_type` 与 Milvus 行的 `images`，不能拿它当判据。
+
+**关联**：[ADR-0004](docs/adr/0004-multimodal-document-evidence.md)；字段行为依据 RAGFlow v0.27.2 源码 `api/apps/restful_apis/chunk_api.py`（列表接口掩码）与 `rag/utils/infinity_conn.py`（`*_kwd` 按 keyword 列表存取）。
+
+---
+
 ## [v1.4.0] — 2026-10-17 — 总则新增第 9 条：减少生成文本的 AI 味
 
 | 项 | 内容 |

@@ -28,6 +28,7 @@ from agent_platform.core.errors import (
 )
 from agent_platform.knowledge.images import StoredImage
 from agent_platform.knowledge.ragflow_schemas import (
+    ChunkDetailInfo,
     ChunkInfo,
     ChunkPage,
     DocumentInfo,
@@ -86,6 +87,18 @@ class FakeRagFlow:
         self.in_flight = 0
         self.max_in_flight = 0
         self.image_delay_s = 0.0
+        self.doc_types: dict[str, object] = {}
+        """chunk_id → 详情接口返回的原始 ``doc_type_kwd``（列表或字符串）。
+
+        列表接口的取值由 ``iter_chunks`` 统一打码成 ``"text"``，与 RAGFlow
+        v0.27.2 的行为一致；真实类型只能从这里读。
+        """
+        self.detail_failures: set[str] = set()
+        """chunk_id 进入此集合 ⇒ 详情读取抛 ``KnowledgeError``。"""
+        self.detail_requests: list[str] = []
+        self.detail_in_flight = 0
+        self.detail_max_in_flight = 0
+        self.detail_delay_s = 0.0
         self._doc_seq = 0
 
     async def ensure_dataset(
@@ -173,7 +186,30 @@ class FakeRagFlow:
         chunks.extend(
             chunk.model_copy(update={"document_id": document_id}) for chunk in self.extra_chunks
         )
-        yield 1, ChunkPage(chunks=chunks, total=len(chunks))
+        for chunk in chunks:
+            # 登记详情接口的真实取值；基础切分没有类型字段，Infinity 回空列表。
+            self.doc_types.setdefault(chunk.id, [chunk.doc_type_kwd] if chunk.doc_type_kwd else [])
+        # 上游列表接口把非字符串取值一律压成 "text"（chunk_api.py）；替身若原样
+        # 返回 image/table，媒介分类用例就会在**没有**详情链路时也能通过。
+        masked = [chunk.model_copy(update={"doc_type_kwd": "text"}) for chunk in chunks]
+        yield 1, ChunkPage(chunks=masked, total=len(masked))
+
+    async def get_chunk(self, dataset_id: str, document_id: str, chunk_id: str) -> ChunkDetailInfo:
+        del dataset_id, document_id
+        self.detail_requests.append(chunk_id)
+        self.detail_in_flight += 1
+        self.detail_max_in_flight = max(self.detail_max_in_flight, self.detail_in_flight)
+        try:
+            if self.detail_delay_s:
+                await asyncio.sleep(self.detail_delay_s)
+            if chunk_id in self.detail_failures:
+                raise KnowledgeError(f"fake 切分详情不存在: {chunk_id}")
+            # 走 model_validate 模拟真实响应：类型字段在外部是列表，由校验器归一。
+            return ChunkDetailInfo.model_validate(
+                {"id": chunk_id, "doc_type_kwd": self.doc_types.get(chunk_id, [])}
+            )
+        finally:
+            self.detail_in_flight -= 1
 
     async def delete_documents(self, dataset_id: str, document_ids: list[str]) -> int:
         del dataset_id
@@ -788,6 +824,7 @@ async def test_ingest_one_exposes_parse_failure_with_root_cause(
             image_store=stack["image_store"],
             image_max_bytes=8 * 1024 * 1024,
             image_concurrency=4,
+            detail_concurrency=4,
             previous_document_id=None,
         )
 
@@ -1061,6 +1098,42 @@ async def test_image_download_concurrency_is_bounded(
     assert code == ingest.EXIT_OK
     assert len(stack["ragflow"].image_requests) == 6
     assert stack["ragflow"].max_in_flight <= 2, "并发下载不得突破配置上限"
+
+
+async def test_chunk_detail_requests_are_bounded(
+    tmp_path: Path, stack: dict[str, Any], settings: Settings
+) -> None:
+    """逐条读详情必须限制并发：切分多的文档一次打满是同步接口的常见事故。"""
+    stack["ragflow"].chunks_per_doc = 6
+    stack["ragflow"].detail_delay_s = 0.01
+    settings = settings.model_copy(update={"ragflow_chunk_detail_concurrency": 2})
+    corpus = write_corpus(tmp_path, {"a.pdf": "甲"})
+
+    code = await ingest.run(make_args(corpus), settings)
+
+    assert code == ingest.EXIT_OK
+    assert stack["ragflow"].detail_requests == [f"doc-1-c{n}" for n in range(6)]
+    assert stack["ragflow"].detail_max_in_flight <= 2, "详情读取不得突破配置上限"
+
+
+async def test_chunk_detail_failure_fails_whole_file(
+    tmp_path: Path, stack: dict[str, Any], settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """详情读不到 ⇒ 整份文件失败并补偿，不得把类型静默退化成文本。"""
+    stack["ragflow"].detail_failures = {"doc-1-c0"}
+    corpus = write_corpus(tmp_path, {"a.pdf": "甲"})
+
+    with caplog.at_level(logging.INFO):
+        code = await ingest.run(make_args(corpus), settings)
+
+    assert code == ingest.EXIT_PARTIAL
+    assert stack["store"].rows == {}, "类型不确定的文档不得写入任何向量"
+    assert stack["ragflow"].deleted == [["doc-1"]], "失败文档必须做补偿删除"
+    manifest = ingest.Manifest.load(settings.ingest_manifest_path)
+    assert manifest.fingerprint_of("a.pdf") is None
+    events = {log_extras(record).get("event", ""): record for record in caplog.records}
+    failure = log_extras(events["ingest.file_failed"])
+    assert failure["error_code"] == KnowledgeError.code.value
 
 
 async def test_reingest_clears_previous_document_images(
