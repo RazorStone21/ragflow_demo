@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from copy import deepcopy
 from importlib.resources import files
@@ -20,7 +21,7 @@ from agent_platform.agents.gov_policy_qa.schemas import build_citations, extract
 from agent_platform.agents.gov_policy_qa.state import message_text
 from agent_platform.core.errors import AgentPlatformError
 from agent_platform.guardrails.sanitize import EVIDENCE_CLOSE_MARKER, EVIDENCE_OPEN_MARKER
-from agent_platform.knowledge.schemas import EvidenceItem
+from agent_platform.knowledge.schemas import EvidenceItem, ImageRef, build_image_id
 
 _PROMPTS_PACKAGE = "agent_platform.agents.gov_policy_qa.prompts"
 _VERSIONED_TEMPLATE_NAME = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+\.v\d+\.jinja$")
@@ -153,6 +154,26 @@ def test_human_prompt_numbers_evidence_from_one_matching_citation_parser() -> No
 
     assert rendered.count(EVIDENCE_OPEN_MARKER) == 1
     assert rendered.count(EVIDENCE_CLOSE_MARKER) == 1
+
+
+def test_answer_prompt_excludes_image_metadata_and_binary() -> None:
+    """图片元数据不进提示词：模型只读文本，image_id / sha256 / data URI 都是噪声（ADR-0004）。
+
+    这一条同时也是"图片没有被塞进 checkpoint 当二进制"的旁证：渲染结果里
+    若出现 base64 或 data URI，说明有人把图当文本拼进了证据正文。
+    """
+    sha = hashlib.sha256(b"figure").hexdigest()
+    ref = ImageRef(image_id=build_image_id(sha), sha256=sha, mime="image/png", page=3)
+    evidence = [_evidence(1, document_name="政策.pdf", page_numbers=[3], content="正文")]
+    evidence[0] = evidence[0].model_copy(update={"images": [ref]})
+
+    rendered = _render_human(_QUESTION, evidence)
+
+    assert "正文" in rendered
+    assert ref.image_id not in rendered
+    assert ref.sha256 not in rendered
+    assert "data:image" not in rendered
+    assert "base64" not in rendered
 
 
 @pytest.mark.parametrize(

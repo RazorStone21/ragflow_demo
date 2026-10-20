@@ -13,7 +13,7 @@ import re
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from agent_platform.knowledge.schemas import EvidenceItem
+from agent_platform.knowledge.schemas import EvidenceItem, ImageRef
 
 # 半角 ``[1]`` 与全角 ``【1】`` 都接受：中文模型偶发全角括号，语义无歧义；
 # 逗号分隔的多引用 ``[1,3]`` 拆为两个下标。
@@ -31,6 +31,11 @@ class Citation(BaseModel):
     document_name: str = Field(default="", description="文档名")
     page_numbers: list[int] = Field(default_factory=list, description="页码")
     source_uri: str = Field(default="", description="来源路径/URI")
+    images: list[ImageRef] = Field(
+        default_factory=list,
+        max_length=8,
+        description="引用证据附带的图片元数据（ADR-0004）；客户端据此调用取图端点",
+    )
 
 
 def extract_citation_indices(answer: str, *, max_index: int) -> list[int]:
@@ -74,6 +79,9 @@ def build_citations(evidence: list[EvidenceItem], indices: list[int]) -> list[Ci
                     document_name=item.document_name,
                     page_numbers=list(item.page_numbers),
                     source_uri=item.source_uri,
+                    # 显式复制而非依赖默认值：漏了这一行，引用里永远没有图，
+                    # 取图端点就永远只能 404，而所有测试依然"绿"。
+                    images=list(item.images),
                 )
             )
     return citations

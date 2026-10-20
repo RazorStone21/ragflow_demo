@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 import pytest
 
-from agent_platform.agents.gov_policy_qa.schemas import build_citations, extract_citation_indices
-from agent_platform.knowledge.schemas import EvidenceItem
+from agent_platform.agents.gov_policy_qa.schemas import (
+    Citation,
+    build_citations,
+    extract_citation_indices,
+)
+from agent_platform.knowledge.schemas import EvidenceItem, ImageRef, build_image_id
 
 
 def _evidence(chunk_id: str, **overrides: Any) -> EvidenceItem:
@@ -66,6 +71,30 @@ def test_build_citations_maps_index_to_evidence() -> None:
 def test_build_citations_skips_out_of_range() -> None:
     """越界下标被跳过，不抛异常（调用方已保证合法，双保险）。"""
     assert build_citations([_evidence("c1")], [1, 5]) == build_citations([_evidence("c1")], [1])
+
+
+def test_build_citations_copies_images_from_evidence() -> None:
+    """引用原样复制证据的图片元数据（ADR-0004）；漏复制会让取图端点永远 404。"""
+    sha = hashlib.sha256(b"fig").hexdigest()
+    ref = ImageRef(image_id=build_image_id(sha), sha256=sha, mime="image/png", page=3)
+    citation = build_citations([_evidence("c1", images=[ref])], [1])[0]
+
+    assert citation.images == [ref]
+
+
+def test_citation_without_images_accepts_legacy_payload() -> None:
+    """旧 checkpoint/旧响应没有 images 字段，必须仍能反序列化（默认空列表）。"""
+    citation = Citation.model_validate(
+        {
+            "index": 1,
+            "chunk_id": "c1",
+            "document_name": "政策.pdf",
+            "page_numbers": [2],
+            "source_uri": "gov_doc/政策.pdf",
+        }
+    )
+
+    assert citation.images == []
 
 
 def test_citation_is_immutable() -> None:
