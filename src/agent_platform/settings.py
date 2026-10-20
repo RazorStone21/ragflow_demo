@@ -100,11 +100,47 @@ class Settings(BaseSettings):
     ragflow_api_key: SecretStr = Field(description="RAGFlow 控制台生成的 API Key")
     ragflow_dataset_name: str = Field(default="gov_policy", min_length=1, max_length=128)
     ragflow_parse_timeout_s: int = Field(default=3600, ge=60, le=86400)
+    # 数据集级解析配置（RAGFlow v0.27.2 的上传接口只认 table_column_* 两个键，
+    # 其余键必须在创建/更新数据集时设置，详见 ADR-0004 与 ragflow_client.ensure_dataset）
+    ragflow_layout_recognize: str = Field(
+        default="DeepDOC",
+        min_length=1,
+        max_length=32,
+        description="版面/表格识别器；`DeepDOC` 启用 OCR 与表格结构识别",
+    )
+    ragflow_image_context_size: int = Field(
+        default=0,
+        ge=0,
+        le=4096,
+        description="图片切分上溯的相邻文本字符数；0 表示不附带上下文",
+    )
+    ragflow_table_context_size: int = Field(
+        default=0, ge=0, le=4096, description="表格切分上溯的相邻文本字符数"
+    )
+    ragflow_chunk_token_num: int = Field(default=512, ge=64, le=8192)
+    ragflow_task_page_size: int = Field(
+        default=12, ge=1, le=64, description="解析任务分片页数（CPU 模式下影响单任务耗时）"
+    )
+
+    # --- 证据图片（ADR-0004；演示期本地文件存储，生产换对象存储）---
+    evidence_image_store_dir: Path = Path("local_data/evidence_images")
+    evidence_image_max_bytes: int = Field(
+        default=8 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024, description="单张图片字节上限"
+    )
+    evidence_image_download_timeout_s: float = Field(default=60.0, gt=0, le=600)
+    evidence_image_download_concurrency: int = Field(
+        default=4, ge=1, le=16, description="入库时并发下载图片的上限"
+    )
 
     # --- Milvus（检索主链路，ADR-0002）---
     milvus_uri: str = "http://localhost:19530"
     milvus_token: SecretStr = SecretStr("")
-    milvus_collection: str = Field(default="gov_policy_chunks", min_length=1, max_length=128)
+    milvus_collection: str = Field(
+        default="gov_policy_chunks_v2",
+        min_length=1,
+        max_length=128,
+        description="ADR-0004 起为 v2 集合（含 media_type/images 字段）；旧集合保留用于回滚",
+    )
     milvus_dim: int = Field(default=4096, ge=64, le=16384)
 
     # --- 检索策略（变更须过评估门禁，CLAUDE.md 9.2 / NO-16）---

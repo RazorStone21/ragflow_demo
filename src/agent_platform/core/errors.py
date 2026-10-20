@@ -44,6 +44,7 @@ class ErrorCode(StrEnum):
     KNOWLEDGE_UNAVAILABLE = "KNOWLEDGE_UNAVAILABLE"
     KNOWLEDGE_PARSE_TIMEOUT = "KNOWLEDGE_PARSE_TIMEOUT"
     KNOWLEDGE_PARSE_FAILED = "KNOWLEDGE_PARSE_FAILED"
+    KNOWLEDGE_IMAGE_EXPORT_FAILED = "KNOWLEDGE_IMAGE_EXPORT_FAILED"
     RETRIEVAL_FAILED = "RETRIEVAL_FAILED"
     EVIDENCE_INSUFFICIENT = "EVIDENCE_INSUFFICIENT"
 
@@ -222,6 +223,18 @@ class KnowledgeParseFailedError(KnowledgeError):
     """
 
     code = ErrorCode.KNOWLEDGE_PARSE_FAILED
+    retryable = False
+
+
+class KnowledgeImageExportError(KnowledgeError):
+    """入库时导出切分图片失败（ADR-0004）。
+
+    图片切分的正文就是图片本身，下载或落盘失败时这条切分没有可用内容，
+    **整份文件判失败**并走补偿删除。``retryable=False``：这是确定性结果
+    （图片已不存在、格式不在白名单、超出上限），自动重试只会重复同一次失败。
+    """
+
+    code = ErrorCode.KNOWLEDGE_IMAGE_EXPORT_FAILED
     retryable = False
 
 

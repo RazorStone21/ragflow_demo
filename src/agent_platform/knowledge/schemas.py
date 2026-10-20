@@ -11,9 +11,10 @@
 
 from __future__ import annotations
 
-from typing import Any
+from enum import StrEnum
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # RAGFlow 的 positions 结构随解析器而变（PDF 为 bbox 列表，文本为页号列表），
 # 因此只做"列表"级别的约束，页号经 page_numbers() 防御式提取。
@@ -21,6 +22,72 @@ Position = list[Any]
 
 _MAX_PAGE_HINT = 10000
 """浮点页号的采信上限：超过该值视为坐标而非页号，避免把 bbox 误当页号。"""
+
+ImageMime = Literal["image/jpeg", "image/png", "image/webp", "image/gif", "image/bmp", "image/tiff"]
+"""允许进入证据链的图片类型。
+
+白名单而非通配：取图端点会把 MIME 原样写进 ``Content-Type``，放开等于让
+上游内容决定响应类型；这几类是 RAGFlow 解析与浏览器展示的公共交集。
+"""
+
+_IMAGE_ID_PREFIX = "img_"
+_IMAGE_ID_SHA_CHARS = 32
+
+
+def build_image_id(sha256_hex: str) -> str:
+    """由图片内容的 sha256 生成平台图片 ID。
+
+    Args:
+        sha256_hex: 64 位小写十六进制摘要。
+
+    Returns:
+        ``img_`` 加摘要前 32 位；同一张图片在任何租户、任何次入库下 ID 都相同。
+    """
+    return f"{_IMAGE_ID_PREFIX}{sha256_hex[:_IMAGE_ID_SHA_CHARS]}"
+
+
+class MediaType(StrEnum):
+    """切分的媒介类型（供检索、引用与前端渲染区分）。"""
+
+    TEXT = "text"
+    IMAGE = "image"
+    TABLE = "table"
+
+
+class ImageBBox(BaseModel):
+    """图片在页面中的坐标（RAGFlow ``positions`` 的 left/right/top/bottom）。"""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    left: int = Field(ge=0)
+    right: int = Field(ge=0)
+    top: int = Field(ge=0)
+    bottom: int = Field(ge=0)
+
+
+class ImageRef(BaseModel):
+    """证据图片的对外元数据（ADR-0004）。
+
+    **刻意不含**路径、URL、base64、存储 key 或 RAGFlow 内部 ID：客户端只拿得到
+    平台生成的标识，取图必须走会话内的鉴权端点。``image_id`` 与 ``sha256``
+    由校验器强制对应，二者对不上说明数据被拼过。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    image_id: str = Field(pattern=r"^img_[0-9a-f]{32}$", description="平台图片 ID")
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$", description="图片内容 sha256")
+    mime: ImageMime = Field(description="图片 MIME（白名单）")
+    caption: str = Field(default="", max_length=240, description="图注或描述")
+    page: int | None = Field(default=None, ge=1, description="所在页码（1 起）")
+    bbox: ImageBBox | None = Field(default=None, description="页面内坐标")
+
+    @model_validator(mode="after")
+    def _image_id_derives_from_sha256(self) -> ImageRef:
+        expected = build_image_id(self.sha256)
+        if self.image_id != expected:
+            raise ValueError(f"image_id 必须由 sha256 生成（期望 {expected}）")
+        return self
 
 
 class ChunkRecord(BaseModel):
@@ -44,6 +111,10 @@ class ChunkRecord(BaseModel):
         default="", max_length=64, description="内容指纹（sha256 前 64 位十六进制），幂等键组成"
     )
     updated_at: int = Field(default=0, ge=0, description="UTC epoch 秒")
+    media_type: MediaType = Field(default=MediaType.TEXT, description="切分媒介类型")
+    images: list[ImageRef] = Field(
+        default_factory=list, max_length=8, description="切分关联的图片（只存元数据）"
+    )
 
     def page_numbers(self) -> list[int]:
         """从 ``positions`` 中防御式提取页号（去重、升序）。
@@ -69,6 +140,10 @@ class EvidenceItem(BaseModel):
     document_name: str = Field(default="", description="文档名")
     page_numbers: list[int] = Field(default_factory=list, description="页码（引用展示用）")
     source_uri: str = Field(default="", description="来源路径/URI")
+    media_type: MediaType = Field(default=MediaType.TEXT, description="证据媒介类型")
+    images: list[ImageRef] = Field(
+        default_factory=list, max_length=8, description="证据关联的图片（只存元数据）"
+    )
 
 
 class RetrievalMeta(BaseModel):
