@@ -272,6 +272,56 @@ curl -s -X PATCH http://localhost:9380/api/v1/models/default \
 **顺序很重要**：先做完这一步再跑 `scripts/ingest.py`。否则会得到一批 `run=FAIL` 的文档，
 而 RAGFlow **拒绝同名重复上传**（下一节），必须先删掉失败文档才能重跑。
 
+### 多模态解析额外要配的：视觉模型（model_type=`vision`）
+
+扫描件整页、PDF 内嵌图与表格截图由 DeepDOC 的 `VisionFigureParser` 交给视觉模型生成
+描述，描述进入 chunk 正文，后续检索与作答仍是文本链路（ADR-0004）。网关侧的逻辑名是
+`vision-chat`（`deploy/docker/litellm/config.yaml`，映射 SiliconFlow 的
+`Qwen/Qwen3-VL-30B-A3B-Instruct`）。
+
+**发现规则与 chat/embedding 不同，要注意**：`rag/llm/model_meta.py` 的
+`_infer_model_types` 先按名字猜主类型（含 `embed`/`bge` → embedding，含 `rerank` →
+rerank，其余 → chat），再对名字里含 `vision` 的模型**追加** `vision`
+（`_VISION_HINTS` 见同文件）。因此 `vision-chat` 会被发现成 **chat + vision** 两条类型：
+既不用手工"添加自定义模型"，也不要把它的默认 chat 设成它。
+
+- 若该供应商是在本版网关新增 `vision-chat` **之前**注册的，模型发现不会自己刷新，
+  要给它补一条。控制台可重新拉取模型列表；也可以直接用 v1 REST（**2026-10-20 实测
+  生效**，实例名从 `GET /api/v1/providers/OpenAI-API-Compatible/instances` 取）：
+
+```bash
+curl -s -X POST http://localhost:9380/api/v1/providers/OpenAI-API-Compatible/instances/kevin/models \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model_name":"vision-chat","model_type":"vision"}'
+# 期望 {"code":0}；随后 GET /providers/.../models 应出现 model_type=["vision"] 的 vision-chat
+# 新加模型 verify 为 "unknown" 是正常的：设置默认只校验 status=active，
+# 真正的验证在第一次解析（或直接对网关发一张图）。
+```
+
+- 到 **设置默认模型** 把 **Vision model** 选成 `vision-chat`；界面若无此槽位，用 v1
+  REST 补（`model_type` 必须是 `vision`；写成 `chat` 会返回"成功"，但解析时仍然找不到
+  视觉模型）：
+
+```bash
+MID=$(curl -s -H "Authorization: Bearer $KEY" http://localhost:9380/api/v1/models \
+      | python -c "import json,sys; print([m['model_id'] for m in json.load(sys.stdin)['data'] if m['name']=='vision-chat'][0])")
+curl -s -X PATCH http://localhost:9380/api/v1/models/default \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d "{\"model_id\":\"$MID\",\"model_type\":\"vision\"}"
+# 期望 {"code":0}；随后 GET /models/default 应出现 model_type=vision 的一条
+```
+
+**没配视觉模型的后果是"安静地少东西"，不是报错**：`vision_figure_parser_pdf_wrapper`
+用 `except Exception: vision_model = None` 吞掉查找失败（`deepdoc/parser/figure_parser.py:130-135`），
+随后跳过图片描述、原样返回。缺少描述时，图片框内的文字（多半只有图注或零散标签）
+仍会被当成 chunk 正文；框内一个字都没有的图则在 `pdf_parser._extract_table_figure`
+里就被 `if not txt: continue` 丢掉。两种情形都不会产生可检索的图片描述，入库脚本
+也拿不到像样的文本——最终现象是"这批文件里没有图"，日志里找不到任何错误。所以入库前
+必须先确认 `GET /models/default` 里有 `model_type=vision` 的一条。
+
+> 该路由指向云端 API，图片内容出域。仅限公开演示语料，客户数据不得走这条链路；
+> 生产切私有化 VLM 时只改网关映射，RAGFlow 与业务代码都不动。
+
 ## 步骤 6 · 核实 SiliconFlow 模型 ID 与维度
 
 > **已于 2026-10-16 用真实密钥核实完毕**：`Qwen/Qwen3-Embedding-8B` 确实出现在上游

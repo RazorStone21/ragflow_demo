@@ -12,9 +12,14 @@
 （v0.27.2，文档引擎设为 Infinity）管文档工程，解析、OCR、清洗、切分和文档生命周期都在它那里；
 Milvus（v2.6）管检索，稠密向量与 BM25 混合检索、Rerank、引用溯源、租户过滤都由它承担。
 
+扫描件、PDF 内嵌图与表格截图也走这条链路：RAGFlow 在解析期用视觉模型生成图片描述，
+平台把图片二进制另存一份，检索证据和引用带上图片元数据，客户端凭会话取图
+（[ADR-0004](docs/adr/0004-multimodal-document-evidence.md)）。
+
 模型调用统一走 LiteLLM Proxy，业务代码不直连厂商（NO-02）。模型按逻辑名引用：`primary-chat`
-对应 deepseek-chat，`embedding` 和 `rerank` 对应 SiliconFlow 的 Qwen3 系列。演示期这些请求
-发往云端 API，上线换成私有化部署只需改网关映射。
+对应 deepseek-chat，`embedding` 和 `rerank` 对应 SiliconFlow 的 Qwen3 系列，`vision-chat`
+对应 Qwen3-VL（解析期的图片理解）。演示期这些请求发往云端 API，上线换成私有化部署只需改
+网关映射。
 
 架构决策记在 [`docs/adr/`](docs/adr/)，版本演进记在 [`CHANGELOG.md`](CHANGELOG.md)。
 
@@ -32,7 +37,7 @@ docker compose up -d
 docker compose ps           # 等全部 healthy
 
 # 3) 第一次用 RAGFlow，先按 docs/runbooks/ragflow_setup.md 初始化并生成 API Key，
-#    再核实 SiliconFlow 的模型 ID 和嵌入维度
+#    再核实 SiliconFlow 的模型 ID 和嵌入维度，并设置默认的 vision 模型（多模态解析必需）
 
 # 4) 同步依赖
 uv sync
@@ -40,6 +45,8 @@ uv sync
 # 5) 入库语料。先 dry-run 看清单，再真入库；语料目录本身不进仓库
 uv run python scripts/ingest.py --source "e:\BaiduNetdiskDownload\gov_doc" --subset scripts/energy_subset.txt --dry-run
 uv run python scripts/ingest.py --source "e:\BaiduNetdiskDownload\gov_doc" --subset scripts/energy_subset.txt
+#    多模态演示集单独跑一遍（扫描件 + 图表报告），细节见 docs/runbooks/multimodal_evidence.md
+uv run python scripts/ingest.py --source "e:\BaiduNetdiskDownload\gov_doc" --subset scripts/multimodal_subset.txt
 
 # 6) 启动 API。main.py 刻意没有模块级 app，所以这里用工厂形态
 uv run uvicorn --factory agent_platform.main:create_app \
@@ -51,6 +58,26 @@ uv run uvicorn --factory agent_platform.main:create_app \
 # 7) 端到端冒烟，另开一个终端
 uv run python scripts/demo_chat.py --question "2025年新能源电价机制的主要内容？"
 ```
+
+## 多模态证据
+
+链路分三段：RAGFlow 解析时把扫描页、内嵌图与表格截图交给视觉模型，生成描述并入切分
+正文；入库脚本把图片二进制另存到 `EVIDENCE_IMAGE_STORE_DIR`（默认
+`local_data/evidence_images`，按租户和文档分目录），Milvus 行里只存图片元数据
+（`image_id`、`sha256`、`mime`、页码）；检索命中后，证据与引用带同样的元数据，客户端
+凭会话取图：
+
+```text
+GET /api/v1/threads/{thread_id}/evidence/{chunk_id}/images/{image_id}
+```
+
+取图只认**本次会话证据里真实存在的图片**，URL 里的 ID 不当作全局查找键；除未认证返回
+401 外，其余取不到的情形一律 404，避免把"图存在与否"暴露成探针。`scripts/demo_chat.py`
+会把带图引用打印成可直接打开的地址。
+
+配置、验证与故障处理见 [docs/runbooks/multimodal_evidence.md](docs/runbooks/multimodal_evidence.md)。
+演示期视觉模型指向云端，图片内容出域，仅限公开演示语料；生产必须切私有化 VLM。图片存本地
+文件系统也没有备份与生命周期管理，生产换对象存储是后续 ADR 项。
 
 ## 开发门禁
 
@@ -93,7 +120,7 @@ CLAUDE.md 12.4。
 | `tests/unit/` | 离线单测，外部依赖全部 fake 掉，要快、要确定 |
 | `tests/integration/` | 需要真实基础设施，由 `RUN_INTEGRATION_TESTS` 门控，服务没起自动 skip |
 | `docs/adr/` | 架构决策记录，只增不改 |
-| `docs/runbooks/` | 环境与组件手册：本机环境、RAGFlow 部署 |
+| `docs/runbooks/` | 环境与组件手册：本机环境、RAGFlow 部署、多模态证据链路 |
 | `deploy/` | 本地 compose 片段与 K8s 模板 |
 
 ## 进度与边界
@@ -108,9 +135,10 @@ CLAUDE.md 12.4。
 K8s 部署（`deploy/k8s/` 只有一个占位 README）；HITL 中断恢复（全仓还没有任何 `interrupt()`，
 所以黄金集里这个类别是 0 条，没有编造）。
 
-演示期有两处偏离，边界都写在 ADR 里。嵌入和重排经网关指向云端 API（ADR-0002）；裁判和
-生成共用同一个上游模型，存在自偏好偏置（ADR-0003）。生产环境必须换成私有化的 Qwen3 和
-独立家族的本地裁判模型，届时只改网关映射，业务代码不用动。语料不得出域，演示期只用
+演示期的偏离都写在 ADR 里。嵌入、重排与视觉理解经网关指向云端 API（ADR-0002、ADR-0004）；
+裁判和生成共用同一个上游模型，存在自偏好偏置（ADR-0003）；图片存本地文件系统而不是对象存储
+（ADR-0004）。生产环境必须换成私有化的 Qwen3 与 VLM、独立家族的本地裁判模型，图片迁到
+MinIO/S3，前三项届时只改网关映射与存储实现，业务代码不用动。语料不得出域，演示期只用
 公开语料。
 
 剩下的质量缺口是 D3：三条边界题的检索没取到支持答案的段落，模型照着现有证据拒答，
