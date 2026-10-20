@@ -40,6 +40,7 @@ from agent_platform.evaluation.schemas import (
     RunMeta,
     RunVerdict,
 )
+from agent_platform.knowledge.schemas import ImageRef
 
 
 class Thresholds(BaseModel):
@@ -587,13 +588,15 @@ def render_case_detail(result: CaseResult, *, question: str = "") -> str:
         lines.extend(
             f"  [{item.index}] {item.document_name}"
             f"（页码 {item.page_numbers or '—'}）chunk {item.chunk_id}"
+            f"{_describe_images(item.images)}"
             for item in result.citations
         )
     if result.evidence:
         lines.append("检索到的证据：")
         lines.extend(
             f"  [{position}] {item.document_name or item.chunk_id}"
-            f"（页码 {item.page_numbers or '—'}）分数 {item.score:.4f}"
+            f"（页码 {item.page_numbers or '—'}，媒介 {item.media_type.value}）"
+            f"分数 {item.score:.4f}{_describe_images(item.images)}"
             for position, item in enumerate(result.evidence, start=1)
         )
     if result.metrics:
@@ -604,6 +607,21 @@ def render_case_detail(result: CaseResult, *, question: str = "") -> str:
             for metric in result.metrics
         )
     return "\n".join(lines)
+
+
+def _describe_images(images: Sequence[ImageRef]) -> str:
+    """渲染图片引用的简短说明（image_id、页码、哈希前缀），无图返回空串。
+
+    哈希只给前 12 位：完整哈希 64 位会把一行挤得没法读，而评审要做的
+    "两张图是不是同一张"的判断，12 位已经足够区分。
+    """
+    if not images:
+        return ""
+    parts = []
+    for ref in images:
+        page = f"第 {ref.page} 页" if ref.page else "页码—"
+        parts.append(f"{ref.image_id}（{page}，sha256 {ref.sha256[:12]}…）")
+    return "；图片 " + "、".join(parts)
 
 
 def render_comparison(comparison: Comparison) -> str:

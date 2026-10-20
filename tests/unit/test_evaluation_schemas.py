@@ -7,9 +7,12 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 from pydantic import ValidationError
 
+from agent_platform.agents.gov_policy_qa.schemas import Citation
 from agent_platform.evaluation.schemas import (
     SCHEMA_VERSION,
     STRIPPED_EVIDENCE_CONTENT,
@@ -18,6 +21,8 @@ from agent_platform.evaluation.schemas import (
     CorpusSnapshot,
     EvalArtifact,
     EvalLayer,
+    ExpectedImage,
+    GoldenCase,
     GoldenSnapshot,
     MetricName,
     MetricResult,
@@ -27,7 +32,7 @@ from agent_platform.evaluation.schemas import (
     RunMeta,
     RunVerdict,
 )
-from agent_platform.knowledge.schemas import EvidenceItem
+from agent_platform.knowledge.schemas import EvidenceItem, ImageRef, build_image_id
 
 
 def test_not_applicable_metric_cannot_carry_a_score() -> None:
@@ -124,6 +129,61 @@ def test_compact_for_baseline_does_not_mutate_the_original() -> None:
     original.compact_for_baseline()
 
     assert original.cases[0].evidence[0].content == "受版权约束的语料正文"
+
+
+def _image_ref(*, caption: str) -> ImageRef:
+    """构造一张带图注的图片引用。"""
+    sha = hashlib.sha256(b"figure").hexdigest()
+    return ImageRef(
+        image_id=build_image_id(sha), sha256=sha, mime="image/png", caption=caption, page=2
+    )
+
+
+def test_expected_images_are_optional_and_page_is_nullable() -> None:
+    """旧黄金集没有 expected_images 仍可装载；独立图片文件没有页码。"""
+    base = {
+        "id": "typical-01",
+        "category": CaseCategory.TYPICAL,
+        "capability": "能力",
+        "question": "问题",
+        "expected_status": "answered",
+    }
+    legacy = GoldenCase.model_validate(base)
+    assert legacy.expected_images == []
+
+    with_image = GoldenCase.model_validate(
+        {**base, "expected_images": [{"document_name": "扫描件.pdf"}]}
+    )
+    assert with_image.expected_images[0].page is None
+    assert with_image.expected_images[0].must_hit is True
+
+
+def test_expected_image_page_must_be_positive() -> None:
+    """页码从 1 起，0 是出题时的笔误而不是合法值。"""
+    with pytest.raises(ValidationError):
+        ExpectedImage(document_name="扫描件.pdf", page=0)
+
+
+def test_compact_for_baseline_strips_image_captions_but_keeps_ids() -> None:
+    """基线保留图片 ID/哈希/页码，但图注是 VLM 生成、可能复述原文，必须剥掉。"""
+    caption = "图中整段复述的政策原文"
+    ref = _image_ref(caption=caption)
+    original = _make_artifact()
+    case = original.cases[0].model_copy(
+        update={
+            "evidence": [original.cases[0].evidence[0].model_copy(update={"images": [ref]})],
+            "citations": [Citation(index=1, chunk_id="c1", images=[ref])],
+        }
+    )
+
+    compact = original.model_copy(update={"cases": [case]}).compact_for_baseline()
+
+    for images in (compact.cases[0].evidence[0].images, compact.cases[0].citations[0].images):
+        assert images[0].caption == ""
+        assert images[0].image_id == ref.image_id
+        assert images[0].sha256 == ref.sha256
+        assert images[0].page == ref.page
+    assert caption not in compact.model_dump_json()
 
 
 def test_run_verdict_has_an_incomplete_member() -> None:

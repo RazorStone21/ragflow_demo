@@ -32,7 +32,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from agent_platform.agents.gov_policy_qa.schemas import Citation
 from agent_platform.agents.gov_policy_qa.state import AnswerStatus
-from agent_platform.knowledge.schemas import EvidenceItem, RetrievalMeta
+from agent_platform.knowledge.schemas import EvidenceItem, ImageRef, RetrievalMeta
 
 SCHEMA_VERSION = 1
 """产物结构版本。对比时版本不符即判"基线不兼容"（退出码 4），不做跨版本推断。"""
@@ -78,6 +78,11 @@ class MetricName(StrEnum):
     PROMPT_HYGIENE = "prompt_hygiene"
     FAITHFULNESS = "faithfulness"
     ANSWER_RELEVANCY = "answer_relevancy"
+    IMAGE_EVIDENCE_HIT = "image_evidence_hit"
+    """期望的图片（按文档名 + 页码）是否随证据被检索到（ADR-0004）。"""
+
+    IMAGE_CITATION_INTEGRITY = "image_citation_integrity"
+    """被引用的证据若带图，引用条目是否原样带出同样的图片（ADR-0004）。"""
 
 
 class MetricVerdict(StrEnum):
@@ -136,6 +141,23 @@ class ExpectedDocument(BaseModel):
     pages: list[int] = Field(default_factory=list, description="期望涉及的页码（弱校验，仅供参考）")
 
 
+class ExpectedImage(BaseModel):
+    """期望随证据出现的图片（ADR-0004）。
+
+    按**文档名 + 页码**匹配而非 ``image_id``：图片 ID 由图片内容哈希生成，
+    重新解析/重新导出都可能变（换了 OCR 引擎、裁切框变了都会变），拿它当判据
+    会在每次重入库后集体失效——与 ``ExpectedDocument`` 按文件名匹配同理。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    document_name: str = Field(min_length=1, max_length=512, description="语料文件名（不含目录）")
+    page: int | None = Field(
+        default=None, ge=1, description="页码；独立图片文件等无页码的语料可为 None"
+    )
+    must_hit: bool = Field(default=True, description="未命中是否判失败；False 为弱期望")
+
+
 class GoldenCase(BaseModel):
     """一条黄金集样例。
 
@@ -157,6 +179,10 @@ class GoldenCase(BaseModel):
     expected_status: AnswerStatus = Field(description="期望的答案状态（五态之一）")
     expected_documents: list[ExpectedDocument] = Field(
         default_factory=list, description="期望命中的文档；拒答类通常为空"
+    )
+    expected_images: list[ExpectedImage] = Field(
+        default_factory=list,
+        description="期望随证据出现的图片；空表示本题不考图片（多模态指标判不适用）",
     )
     reference_answer: str = Field(default="", description="参考答案全文；拒答题可为空字符串")
     reference_answer_source: ReferenceSource | None = Field(
@@ -389,12 +415,26 @@ class EvalArtifact(BaseModel):
         ``--baseline`` 对它恒报"基线不可读"，而 ``--promote-baseline`` 当时照样打印
         "基线已提升"：写路径从不校验，读路径才校验，两者的缝正好把它漏了过去。
         """
+
+        def _strip_captions(images: list[ImageRef]) -> list[ImageRef]:
+            """去掉图注：图注由 VLM 生成，可能整段复述原文（与正文同类风险）。"""
+            return [image.model_copy(update={"caption": ""}) for image in images]
+
         stripped = [
             case.model_copy(
                 update={
                     "evidence": [
-                        item.model_copy(update={"content": STRIPPED_EVIDENCE_CONTENT})
+                        item.model_copy(
+                            update={
+                                "content": STRIPPED_EVIDENCE_CONTENT,
+                                "images": _strip_captions(item.images),
+                            }
+                        )
                         for item in case.evidence
+                    ],
+                    "citations": [
+                        citation.model_copy(update={"images": _strip_captions(citation.images)})
+                        for citation in case.citations
                     ],
                     "judge_raw": "",
                 }
@@ -413,6 +453,7 @@ __all__: list[str] = [
     "EvalArtifact",
     "EvalLayer",
     "ExpectedDocument",
+    "ExpectedImage",
     "GoldenCase",
     "GoldenSnapshot",
     "JudgeSnapshot",

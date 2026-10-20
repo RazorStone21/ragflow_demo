@@ -751,6 +751,50 @@ def test_render_case_detail_gives_the_reviewer_a_path_back_to_the_source() -> No
     assert "分数 0.7654" in rendered
 
 
+def test_render_case_detail_shows_media_type_and_image_ids() -> None:
+    """多模态证据的明细要能让评审人认出"是哪张图"（ADR-0004）。
+
+    给 image_id、页码与哈希前 12 位：完整哈希会挤爆一行，12 位足够回答
+    "界面上这张图和证据里那张是不是同一张"。
+    """
+    import hashlib
+
+    from agent_platform.agents.gov_policy_qa.schemas import Citation
+    from agent_platform.knowledge.schemas import (
+        EvidenceItem,
+        ImageRef,
+        MediaType,
+        build_image_id,
+    )
+
+    sha = hashlib.sha256(b"figure").hexdigest()
+    ref = ImageRef(image_id=build_image_id(sha), sha256=sha, mime="image/png", page=3)
+    result = _case("typical-01").model_copy(
+        update={
+            "citations": [
+                Citation(index=1, chunk_id="c1", document_name="扫描件.pdf", images=[ref])
+            ],
+            "evidence": [
+                EvidenceItem(
+                    chunk_id="c1",
+                    content="正文",
+                    score=0.8,
+                    document_name="扫描件.pdf",
+                    page_numbers=[3],
+                    media_type=MediaType.IMAGE,
+                    images=[ref],
+                )
+            ],
+        }
+    )
+
+    rendered = render_case_detail(result)
+
+    assert "媒介 image" in rendered
+    assert ref.image_id in rendered
+    assert f"sha256 {sha[:12]}…" in rendered
+
+
 def test_render_case_detail_marks_absent_page_numbers_with_a_dash() -> None:
     """页码缺失要显示 ``—``：渲染成空列表会让人以为"第 0 页"。"""
     from agent_platform.knowledge.schemas import EvidenceItem

@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 import pytest
@@ -20,6 +21,7 @@ from agent_platform.evaluation.schemas import (
     CaseResult,
     EvalLayer,
     ExpectedDocument,
+    ExpectedImage,
     GoldenCase,
     MetricName,
     MetricVerdict,
@@ -28,13 +30,21 @@ from agent_platform.evaluation.scoring import (
     REFUSAL_STATUSES,
     score_case,
     score_citations,
+    score_image_citation_integrity,
+    score_image_evidence_hit,
     score_prompt_hygiene,
     score_refusal,
     score_retrieval_hit,
     score_status,
     score_tenant_isolation,
 )
-from agent_platform.knowledge.schemas import EvidenceItem, RetrievalMeta
+from agent_platform.knowledge.schemas import (
+    EvidenceItem,
+    ImageRef,
+    MediaType,
+    RetrievalMeta,
+    build_image_id,
+)
 
 SPOT_MARKET = "0116.china-power-spot-market-construction-guideline-2025-cn.pdf"
 CAPACITY = "0095.china-power-generation-side-capacity-price-mechanism-notice-2026-cn.pdf"
@@ -61,6 +71,12 @@ def make_evidence(
         page_numbers=[3],
         source_uri=source_uri if source_uri is not None else f"/corpus/{document_name}",
     )
+
+
+def make_image_ref(seed: bytes = b"figure", *, page: int | None = 3) -> ImageRef:
+    """构造一张图片引用（image_id 由内容哈希推导，与生产侧一致）。"""
+    sha = hashlib.sha256(seed).hexdigest()
+    return ImageRef(image_id=build_image_id(sha), sha256=sha, mime="image/png", page=page)
 
 
 def make_case(case_id: str = "typical-01", **overrides: object) -> GoldenCase:
@@ -490,6 +506,152 @@ def test_prompt_hygiene_is_not_applicable_without_evidence() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 图片证据命中（ADR-0004）
+# ---------------------------------------------------------------------------
+def test_image_evidence_hit_passes_when_expected_image_found() -> None:
+    """图片随证据命中文档与页码即通过。"""
+    case = make_case(expected_images=[ExpectedImage(document_name=SPOT_MARKET, page=3)])
+    evidence = make_evidence("c1").model_copy(update={"images": [make_image_ref()]})
+
+    metric = score_image_evidence_hit(case, make_result(evidence=[evidence]))
+
+    assert metric.verdict is MetricVerdict.PASS
+    assert metric.score == pytest.approx(1.0)
+
+
+def test_image_evidence_hit_counts_table_screenshots() -> None:
+    """表格截图的媒介类型是 table，但它同样是可引用的图，不得按媒介过滤掉。"""
+    case = make_case(expected_images=[ExpectedImage(document_name=SPOT_MARKET, page=3)])
+    evidence = make_evidence("c1").model_copy(
+        update={"media_type": MediaType.TABLE, "images": [make_image_ref()]}
+    )
+
+    assert score_image_evidence_hit(case, make_result(evidence=[evidence])).verdict is (
+        MetricVerdict.PASS
+    )
+
+
+def test_image_evidence_hit_fails_on_page_mismatch_and_names_missing() -> None:
+    """页码不符即未命中；失败明细要写清是哪份文档哪一页。"""
+    case = make_case(expected_images=[ExpectedImage(document_name=SPOT_MARKET, page=4)])
+    evidence = make_evidence("c1").model_copy(update={"images": [make_image_ref(page=3)]})
+
+    metric = score_image_evidence_hit(case, make_result(evidence=[evidence]))
+
+    assert metric.verdict is MetricVerdict.FAIL
+    assert metric.score == pytest.approx(0.0)
+    assert "第 4 页" in metric.detail
+
+
+def test_image_evidence_hit_without_page_matches_any_page() -> None:
+    """期望未给页码时只按文档名匹配（独立图片文件没有稳定页码）。"""
+    case = make_case(expected_images=[ExpectedImage(document_name=SPOT_MARKET)])
+    evidence = make_evidence("c1").model_copy(update={"images": [make_image_ref(page=None)]})
+
+    assert score_image_evidence_hit(case, make_result(evidence=[evidence])).verdict is (
+        MetricVerdict.PASS
+    )
+
+
+def test_image_evidence_hit_scores_partial_hits() -> None:
+    """多张期望图片按比例给分：命中一半记 0.5 且判失败。"""
+    case = make_case(
+        expected_images=[
+            ExpectedImage(document_name=SPOT_MARKET, page=3),
+            ExpectedImage(document_name=CAPACITY, page=3),
+            ExpectedImage(document_name=CAPACITY, page=3, must_hit=False),
+        ]
+    )
+    evidence = make_evidence("c1").model_copy(update={"images": [make_image_ref()]})
+
+    metric = score_image_evidence_hit(case, make_result(evidence=[evidence]))
+
+    assert metric.score == pytest.approx(0.5), "must_hit=False 的弱期望不计分"
+    assert metric.verdict is MetricVerdict.FAIL
+
+
+def test_image_evidence_hit_is_not_applicable_without_expectations() -> None:
+    """没声明图片期望的样例不考这项（不是 0 分）。"""
+    metric = score_image_evidence_hit(make_case(), make_result())
+
+    assert metric.verdict is MetricVerdict.NOT_APPLICABLE
+    assert metric.score is None
+
+
+# ---------------------------------------------------------------------------
+# 图片引用完整性（ADR-0004）
+# ---------------------------------------------------------------------------
+def _cited_figure_result(ref: ImageRef, cited: list[ImageRef] | None = None) -> CaseResult:
+    """构造"证据带图、引用也带图"的正常结果，按需替换引用里的图片。
+
+    替换必须等到 ``CaseResult`` 构造完之后再用 ``model_copy`` 注入：``ImageRef``
+    的校验器在嵌套验证时同样会执行，"哈希对不上"这种坏数据只有绕过构造才能造出来。
+    """
+    evidence = make_evidence("c1").model_copy(update={"images": [ref]})
+    citation = Citation(index=1, chunk_id="c1", document_name=SPOT_MARKET, images=[ref])
+    result = make_result(evidence=[evidence, make_evidence("c2", score=0.8)], citations=[citation])
+    if cited is not None:
+        result = result.model_copy(
+            update={"citations": [citation.model_copy(update={"images": cited})]}
+        )
+    return result
+
+
+def test_image_citation_integrity_passes_when_images_copied() -> None:
+    """引用原样带出证据的图片即通过。"""
+    metric = score_image_citation_integrity(make_case(), _cited_figure_result(make_image_ref()))
+
+    assert metric.verdict is MetricVerdict.PASS
+    assert metric.score == pytest.approx(1.0)
+
+
+def test_image_citation_integrity_fails_when_citation_drops_image() -> None:
+    """引用丢了图，客户端就取不到图——判失败并点名缺了哪张。"""
+    ref = make_image_ref()
+    metric = score_image_citation_integrity(make_case(), _cited_figure_result(ref, cited=[]))
+
+    assert metric.verdict is MetricVerdict.FAIL
+    assert ref.image_id in metric.detail
+
+
+def test_image_citation_integrity_fails_on_extra_image() -> None:
+    """引用多出一张证据从未包含的图更危险：界面会展示不存在于证据的图片。"""
+    ref = make_image_ref()
+    metric = score_image_citation_integrity(
+        make_case(), _cited_figure_result(ref, cited=[ref, make_image_ref(b"other")])
+    )
+
+    assert metric.verdict is MetricVerdict.FAIL
+    assert "多出" in metric.detail
+
+
+def test_image_citation_integrity_fails_on_hash_mismatch() -> None:
+    """同一 image_id 却给了不同哈希，说明引用被篡改或错配。"""
+    ref = make_image_ref()
+    forged = ref.model_copy(update={"sha256": hashlib.sha256(b"forged").hexdigest()})
+    metric = score_image_citation_integrity(make_case(), _cited_figure_result(ref, cited=[forged]))
+
+    assert metric.verdict is MetricVerdict.FAIL
+    assert "哈希" in metric.detail
+
+
+def test_image_citation_integrity_is_not_applicable_without_image_evidence() -> None:
+    """引用到的证据都不带图，本指标不适用。"""
+    metric = score_image_citation_integrity(make_case(), make_result())
+
+    assert metric.verdict is MetricVerdict.NOT_APPLICABLE
+
+
+def test_image_citation_integrity_is_not_applicable_on_retrieval_layer() -> None:
+    """检索层没有引用条目，无从判起。"""
+    metric = score_image_citation_integrity(
+        make_case(), make_result(layer=EvalLayer.RETRIEVAL, answer="", answer_status="")
+    )
+
+    assert metric.verdict is MetricVerdict.NOT_APPLICABLE
+
+
+# ---------------------------------------------------------------------------
 # 组合入口
 # ---------------------------------------------------------------------------
 def test_score_case_attaches_metrics_without_mutating_input() -> None:
@@ -514,7 +676,10 @@ def test_score_case_retrieval_layer_skips_answer_metrics() -> None:
         make_case(), make_result(layer=EvalLayer.RETRIEVAL, answer="", answer_status="")
     )
 
-    assert {m.name for m in scored.metrics} == {MetricName.RETRIEVAL_HIT}
+    assert {m.name for m in scored.metrics} == {
+        MetricName.RETRIEVAL_HIT,
+        MetricName.IMAGE_EVIDENCE_HIT,
+    }
 
 
 def test_score_case_preserves_judge_metrics_already_present() -> None:

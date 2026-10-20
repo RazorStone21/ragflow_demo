@@ -25,13 +25,14 @@ from agent_platform.evaluation.schemas import (
     CaseCategory,
     CaseResult,
     EvalLayer,
+    ExpectedImage,
     GoldenCase,
     MetricName,
     MetricResult,
     MetricVerdict,
 )
 from agent_platform.guardrails.sanitize import EVIDENCE_CLOSE_MARKER, EVIDENCE_OPEN_MARKER
-from agent_platform.knowledge.schemas import EvidenceItem
+from agent_platform.knowledge.schemas import EvidenceItem, ImageRef
 
 REFUSAL_STATUSES: frozenset[str] = frozenset(
     {
@@ -87,6 +88,105 @@ def score_retrieval_hit(case: GoldenCase, result: CaseResult) -> MetricResult:
         MetricVerdict.FAIL,
         score,
         f"未命中 {len(missing)}/{len(required)} 份：{'、'.join(missing)}",
+    )
+
+
+def score_image_evidence_hit(case: GoldenCase, result: CaseResult) -> MetricResult:
+    """期望的图片是否随证据被检索到（ADR-0004）。
+
+    匹配键是**文档名 + 页码**，不看 ``image_id``：后者由图片内容哈希生成，
+    重解析、换 OCR 引擎都会让它变，拿它当判据会在重入库后集体失效。
+    也不要求证据 ``media_type == image``——表格截图的媒介类型是 ``table``，
+    但它同样是一张可引用的图，按媒介类型过滤会把它误判成"没命中"。
+
+    ``ExpectedImage.page`` 为 ``None`` 时只按文档名匹配（独立图片文件等没有
+    稳定页码的语料）；给了页码则要求图片记录里的页码与之相等。
+
+    Args:
+        case: 黄金集样例。
+        result: 该样例的执行结果。
+
+    Returns:
+        ``NOT_APPLICABLE``（没有 must_hit 图片期望）；否则为命中比例，全部命中记 ``PASS``。
+    """
+    required = [image for image in case.expected_images if image.must_hit]
+    if not required:
+        return _na(MetricName.IMAGE_EVIDENCE_HIT, "本题未声明必须命中的图片")
+
+    positions = [(item, ref) for item in result.evidence for ref in item.images]
+    missing = [
+        image
+        for image in required
+        if not any(_image_matches(image, item, ref) for item, ref in positions)
+    ]
+    total = len(required)
+    score = (total - len(missing)) / total
+    if missing:
+        shown = "、".join(
+            f"{image.document_name}（第 {image.page} 页）" if image.page else image.document_name
+            for image in missing
+        )
+        return _metric(
+            MetricName.IMAGE_EVIDENCE_HIT,
+            MetricVerdict.FAIL,
+            score,
+            f"未命中期望图片：{shown}；实际检索到 {len(positions)} 张图",
+        )
+    return _metric(
+        MetricName.IMAGE_EVIDENCE_HIT,
+        MetricVerdict.PASS,
+        score,
+        f"期望的 {total} 张图片全部随证据命中",
+    )
+
+
+def score_image_citation_integrity(case: GoldenCase, result: CaseResult) -> MetricResult:
+    """引用条目是否原样带出所引证据的图片（ADR-0004）。
+
+    只检查**被引用且目标证据带图**的条目：没有图片的引用不归本指标管，
+    一条引用都没碰带图证据时判不适用。判据是图片 ID 集合完全一致——
+    少了是"引用丢图"（客户端取不到图），多了是"引用凭空多图"（更危险：
+    界面上会出现一条证据从未包含的图片），两者都判失败。
+    """
+    del case  # 统一签名，便于批量分派
+    if result.layer is EvalLayer.RETRIEVAL or not result.answer_status:
+        return _na(MetricName.IMAGE_CITATION_INTEGRITY, "检索层无引用，不判图片引用")
+
+    checked = 0
+    problems: list[str] = []
+    for citation in result.citations:
+        position = citation.index - 1
+        if not 0 <= position < len(result.evidence):
+            continue  # 越界由 citation_integrity 判，不在这里重复计一次
+        target = result.evidence[position]
+        if not target.images:
+            continue
+        checked += 1
+        cited = {ref.image_id: ref for ref in citation.images}
+        expected = {ref.image_id: ref for ref in target.images}
+        if cited.keys() != expected.keys():
+            missing = sorted(expected.keys() - cited.keys())
+            extra = sorted(cited.keys() - expected.keys())
+            parts = [f"缺 {missing}"] if missing else []
+            if extra:
+                parts.append(f"多出 {extra}")
+            problems.append(f"引用 [{citation.index}] 图片与证据不一致（{'，'.join(parts)}）")
+            continue
+        for image_id, ref in expected.items():
+            if cited[image_id].sha256 != ref.sha256:
+                problems.append(f"引用 [{citation.index}] 的 {image_id} 哈希与证据不符")
+
+    if not checked:
+        return _na(MetricName.IMAGE_CITATION_INTEGRITY, "本题引用的证据都不带图片")
+    if problems:
+        return _metric(
+            MetricName.IMAGE_CITATION_INTEGRITY, MetricVerdict.FAIL, 0.0, " | ".join(problems)
+        )
+    return _metric(
+        MetricName.IMAGE_CITATION_INTEGRITY,
+        MetricVerdict.PASS,
+        1.0,
+        f"{checked} 条带图引用与证据一致",
     )
 
 
@@ -270,11 +370,15 @@ def score_case(
     Returns:
         新的 ``CaseResult``（原对象不被修改——`frozen=True` 的模型本就不能原地改）。
     """
-    metrics: list[MetricResult] = [score_retrieval_hit(case, result)]
+    metrics: list[MetricResult] = [
+        score_retrieval_hit(case, result),
+        score_image_evidence_hit(case, result),
+    ]
     if result.layer is not EvalLayer.RETRIEVAL:
         metrics.append(score_status(case, result))
         metrics.append(score_citations(case, result))
         metrics.append(score_refusal(case, result))
+        metrics.append(score_image_citation_integrity(case, result))
     if case.category is CaseCategory.SECURITY:
         metrics.append(score_tenant_isolation(case, foreign_evidence))
     if rendered_prompt is not None:
@@ -306,6 +410,14 @@ def _find_misplaced_citations(result: CaseResult) -> list[str]:
     return problems
 
 
+def _image_matches(expected: ExpectedImage, item: EvidenceItem, ref: ImageRef) -> bool:
+    """判断证据里的一张图是否对应期望图片（文档名 + 可选页码）。"""
+    names = {_normalize_name(item.document_name), _normalize_name(item.source_uri)}
+    if _normalize_name(expected.document_name) not in names:
+        return False
+    return expected.page is None or ref.page == expected.page
+
+
 def _fence_tokens() -> tuple[str, str]:
     """生产模板里实际使用的两种栅栏标记。"""
     return (EVIDENCE_OPEN_MARKER, EVIDENCE_CLOSE_MARKER)
@@ -335,6 +447,8 @@ __all__: list[str] = [
     "REFUSAL_STATUSES",
     "score_case",
     "score_citations",
+    "score_image_citation_integrity",
+    "score_image_evidence_hit",
     "score_prompt_hygiene",
     "score_refusal",
     "score_retrieval_hit",
