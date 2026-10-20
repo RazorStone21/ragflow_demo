@@ -89,7 +89,9 @@ Prompt 改动跑回归，裁判提示词也是 Prompt）；以及给
 ### 1. 参考答案只许来自原文
 
 每条样例的 `reference_answer_source.file` + `.page` 必填，评审人开原始文档
-逐字核对。语料在 `E:\BaiduNetdiskDownload\gov_doc`（19 份白名单文档）。
+逐字核对。语料在 `E:\BaiduNetdiskDownload\gov_doc`：19 份能源白名单
+（`scripts/energy_subset.txt`）+ 2 份多模态子集（`scripts/multimodal_subset.txt`，
+扫描件与图表报告）。
 
 **逐页核对而非全文检索**：只验"引文出现在全文某处"会放过页码写错，而页码错了
 就等于引用不可溯源。
@@ -125,12 +127,18 @@ uv run python scripts/eval_run.py --validate-only --require-reviewed
 §9.2 原文。首版预留了 3 个位置承接阶段五实测缺陷（`demo_chat` 引用编号错位、
 0061 移出白名单等）。**加样例是在补证据，不是在调分**：新样例同样要签署。
 
-### 当前状态：28 / 28 已签署
+### 当前状态：32 / 32 已签署
 
 首版 28 条由 AI 起草（`added_by="ai-draft"`），经**人工逐条对照原文核对**后签署
 （`draft=false` + `reviewed_by` 非空，见 `schemas.py` 的 `_check_review_consistency`）。
 签署是一次独立的 `test(evals)` 提交，其 diff 对全部 28 行而言**只有**
 `draft` / `reviewed_by` / `reviewed_at` 三个字段——**题目内容一字未动**。
+
+2026-10-20 追加 4 条多模态样例（`multimodal.jsonl`）：起草后经人工核对签署，
+以独立的 `test(evals)` 提交入库（该文件首次入库即签署态，不存在可观察的
+草稿→签署 diff）。评审重点是图片期望：`expected_images` 的页码与 must_hit
+均对照原页核过，并确认 RAGFlow 把整页扫描图与图表标成 `table` 而非 `image`，
+因此命中判定按文档名 + 页码做，不看 `media_type`（见第四节）。
 
 签署**不表示**样例已被证明正确：评审人确认的是"参考答案与原文出处属实、题目表述
 无歧义"，而不是"系统答得对"。因此 D1/D2 的失败仍然成立，D3 的裁定问题（见 5.1）
@@ -163,7 +171,8 @@ tests/evals/
 │   ├── typical.jsonl       # 单文档可直接回答的事实题
 │   ├── boundary.jsonl      # 跨文档综合、表格题、阈值边缘、需页码级引用
 │   ├── refusal.jsonl       # 语料外问题 + 主题相邻但被排除的（必须拒答而非幻觉）
-│   └── security.jsonl      # 越权、直接/间接注入、伪 PII 回显、超长诱导
+│   ├── security.jsonl      # 越权、直接/间接注入、伪 PII 回显、超长诱导
+│   └── multimodal.jsonl    # 扫描件 OCR、PDF 内嵌图/表格截图（ADR-0004）
 ├── config/thresholds.toml  # 门禁阈值与最小样本量（逐条附理由）
 ├── baselines/              # 入库的基线产物（JSON，供 --baseline 对比）
 └── conftest.py / _support.py / test_eval_smoke.py   # 需真实基础设施，默认 skip
@@ -215,6 +224,33 @@ tests/evals/
   结论使用**，也不应据它调阈值——先修度量，再看分布。
 - 达标的四条离阈值都有余量（`faithfulness` 0.9392 vs 0.80），不收紧：
   首轮样本量还小（`tenant_isolation` 仅 6 条），此时收紧只是把统计噪声当信号。
+
+### 多模态图片指标实测（2026-10-20，4 条）
+
+两项图片指标随 ADR-0004 引入，只有 `multimodal.jsonl` 的 4 条样例采集它们。
+校准跑 `eval-20261020T070508Z-23b2f4af`（`--layer graph --skip-judge`，
+`MILVUS_COLLECTION=gov_policy_chunks_v2`）：
+
+| 指标 | 实测 | 阈值 | 样本 | 判定 |
+|---|---|---|---|---|
+| `image_evidence_hit` | 1.0000 | 0.90 | 4 | 达标 |
+| `image_citation_integrity` | 1.0000 | 1.00 | 4 | 达标 |
+
+两条口径要点：
+
+- `image_evidence_hit` 按**文档名 + 页码**匹配证据里的 `images`，**不要求**
+  `media_type=image`。本语料里 RAGFlow 把 VLM 描述过的整页扫描图与图表都标成
+  `table`，按 `media_type` 过滤会把 4 条样例全判成未命中。没有 `must_hit` 的
+  样例不进分母。
+- `image_citation_integrity` 只在**非 `retrieval` 层**采集（需要引用才有得比）。
+  阈值写入后，`--layer retrieval` 会把它报成"未采集"并判不通过——这是设计内
+  语义（没测就是没证据），不是缺陷。
+- 两项都走三态：无适用样例为 `not_applicable`，测量失败（`ERROR`）不带分数，
+  也都不会计为通过。
+
+**样本下限设 3 的理由**：4 条样例恰好覆盖扫描件 OCR、PDF 内嵌饼图、表格截图三种
+形态，但 4 条只够得出"链路通"的结论，不够支撑"质量稳定"的判断；低于 3 条
+连链路都验不全，一律不判通过。
 
 ---
 
@@ -472,6 +508,38 @@ UTC 日期**（`run_id` 里的那一段），不是本地日期。本机是 UTC+
 **顺带记一处文案不符**：`--help` 说 `graph` 只做"检索+生成"，但 `--layer graph`
 实际会跑裁判，只有 `--skip-judge` 才跳过（`scripts/eval_run.py` 的
 `_LAYERS_NEEDING_GRAPH`）。本轮窄跑因此多花了裁判调用。行为不改，先记录。
+
+### 5.8 多模态黄金集签署与图片阈值（2026-10-20）
+
+4 条多模态样例经人工逐条核对原文与页面图片后签署，diff 只含
+`draft` / `reviewed_by` / `reviewed_at`。签署后对 `_v2` 集合做了一次
+**只含这 4 条**的校准跑（临时黄金集目录，产物放仓库外，不污染
+`local_data/evals/runs`）：
+
+```bash
+MILVUS_COLLECTION=gov_policy_chunks_v2 uv run python -X utf8 scripts/eval_run.py \
+  --golden-dir <含 multimodal.jsonl 的临时目录> --layer graph --skip-judge \
+  --require-reviewed --out <临时目录>/calib.json
+```
+
+产物 `eval-20261020T070508Z-23b2f4af`：4 条全部通过，
+`image_evidence_hit` / `image_citation_integrity` 均为 1.0000（各 4 条）。
+`--show` 抽查 `typical-scanned-credit-repair-ratio`：证据与引用都带
+`img_be7fbf2b…`（第 3 页），`media_type` 是 `text` 但图片照常命中——
+与 ADR-0004 的口径一致。整轮 `verdict=incomplete` 是因为 `--skip-judge`，
+属预期。
+
+**本轮不提升基线**，两个原因：
+
+1. `gov_policy_chunks_v2` 目前只有 2 份多模态文档（79 行）。19 份文本文档
+   仍在旧集合 `gov_policy_chunks`，32 条全量评估要先把它们按 `media_version=3`
+   重入库，否则其余 28 条会集体"检索不到"。
+2. D11（拒答文案的 faithfulness 被记成测量失败，见 5.7）尚未修复。按 §5.6
+   的核对表，"测量失败 0"这一条过不去。
+
+因此入库基线仍是 `2026-10-16-phase7-signed.json`（28 条、无图片指标）。
+它**不覆盖多模态**；在下一轮全量重入库并提升基线之前，别把它的分数当成
+32 条全集的结论。
 
 ---
 

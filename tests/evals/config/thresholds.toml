@@ -35,6 +35,11 @@ prompt_hygiene = 1.00
 # 它断言的是"生产渲染路径确实调用了 neutralize_untrusted"这一件事——
 # 接线是否存在，非黑即白。
 
+image_citation_integrity = 1.00
+# 图片引用完整性（ADR-0004）：被引用证据若带图，引用条目必须原样带出同样的图。
+# 缺图、多图、错图都算失败——与 citation_integrity 同属引用红线：
+# 引用里少了图，前端就永远展示不出证据图，而这种失败在文本上看不出来。
+
 # --- 具备统计性质：允许低于满分，但初值从严 ---
 
 status_accuracy = 0.90
@@ -47,6 +52,12 @@ retrieval_hit = 0.90
 # 允许 10% 失败：rerank 与阈值裁掉边缘证据是设计内行为，
 # 而**逐题**的检索失败由 citation_integrity / faithfulness 兜底捕获。
 # 校准提示：连续两轮低于 0.90 应视为检索策略退化，而非调低本值。
+
+image_evidence_hit = 0.90
+# 期望图片（must_hit，按文档名 + 页码）随证据被检索到的比例（ADR-0004）。
+# 按文档名 + 页码匹配，**不要求** media_type=image：RAGFlow 常把 VLM 描述过的
+# 图标成 table，按 media_type 过滤会把真实用例全判成未命中。
+# 与 retrieval_hit 同值同理由；四个多模态样例实测 1.0000（2026-10-20）。
 
 faithfulness = 0.80
 # 答案事实性断言中"有证据支撑"的占比（裁判判定）。
@@ -75,3 +86,5 @@ status_accuracy = 10
 retrieval_hit = 10
 faithfulness = 10         # 需裁判；--skip-judge 时为 0，必然"样本不足"而非"通过"
 answer_relevancy = 10
+image_evidence_hit = 3        # 仅带 must_hit 图片的多模态样例采样（当前 4 条）
+image_citation_integrity = 3  # 同上；且只在非 retrieval 层采集，--layer retrieval 必"未采集"

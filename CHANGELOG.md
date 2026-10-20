@@ -12,6 +12,26 @@
 
 本条以下为**平台侧**变更记录（按时间倒序），正式发布时归档为对应版本；**规范本身的版本演进以 `## [v1.3.0]`、`## [v1.2.0]` 与 `## [v1.1.1]` 三条为权威**。此处原列的「v1.2.0 待写清单」（变更 / ADR / 基线版本实测值 / 已知偏离 / 新增环境变量 / 占位与顺延）已由 v1.2.0 条落实，不再重复。
 
+### 未发布 · 多模态黄金集签署与图片指标阈值（`test(evals)`）
+
+**日期**：2026-10-20　**规范版本**：CLAUDE.md **v1.5.1**（本次不改规范）　**关联**：[ADR-0004](docs/adr/0004-multimodal-document-evidence.md)、`tests/evals/README.md` 5.8
+
+**变更摘要**：
+
+- `tests/evals/golden/multimodal.jsonl` 的 4 条样例经人工逐条核对原文与页面图片后签署（`draft=false` + `reviewed_by` / `reviewed_at`），diff 只含签署字段，题目内容一字未动。黄金集 32 / 32 已签署。
+- `tests/evals/config/thresholds.toml` 新增两项图片指标：`image_citation_integrity = 1.00`（引用必须原样带出证据图片，缺图/多图/错图都算失败，属引用红线）、`image_evidence_hit = 0.90`（按文档名 + 页码命中，不要求 `media_type=image`）；`[min_samples]` 均设 3。
+- `tests/evals/README.md` 更新签署状态、语料范围与目录树，新增第四节图片指标实测小节与 §5.8 记录。
+
+**动机**：ADR-0004 的两项指标此前只报告、无门禁；4 条样例全是草稿，`--require-reviewed` 会拒跑整轮。签署后写入阈值，图片链路才真正进入 §9.2 的评估门禁。
+
+**影响面**：
+
+- 门禁开始覆盖图片指标。`image_citation_integrity` 只在非 `retrieval` 层采集，`--layer retrieval` 下会显示"未采集"，按既有语义不判通过。
+- 观察期语义不变：不阻断提交，只报告。
+- **未提升基线**。`gov_policy_chunks_v2` 当前只有 2 份多模态文档（79 行），19 份文本文档仍在旧集合，32 条全量跑需先按 `media_version=3` 重入库；且 D11（拒答样例的 faithfulness 被记成测量失败）未修复，不满足 §5.6 的提升核对表。入库基线仍是 `2026-10-16-phase7-signed.json`（28 条、无图片指标），不覆盖多模态。
+
+**验证**（`eval-20261020T070508Z-23b2f4af`，4 条多模态，`--layer graph --skip-judge`）：4 条全部通过；`image_evidence_hit` / `image_citation_integrity` 均 1.0000（各 4 条）。`--validate-only --require-reviewed`：32 已签署、0 草稿。ruff / mypy / 单测全过。
+
 ### 未发布 · 阶段七（修复 D1 / D2 并跑回归，`feat(agents)` / `fix(evaluation)` / `test`）
 
 **日期**：2026-10-17　**规范版本**：CLAUDE.md **v1.4.0**（本次不改规范文件）　**关联**：`tests/evals/README.md` 5.1 / 5.7
