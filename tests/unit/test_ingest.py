@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import hashlib
 import json
 import logging
 from collections.abc import AsyncIterator, Callable
@@ -20,15 +22,18 @@ import pytest
 from agent_platform.core.errors import (
     ConfigurationError,
     KnowledgeError,
+    KnowledgeImageExportError,
     KnowledgeParseFailedError,
     KnowledgeParseTimeoutError,
 )
+from agent_platform.knowledge.images import StoredImage
 from agent_platform.knowledge.ragflow_schemas import (
     ChunkInfo,
     ChunkPage,
     DocumentInfo,
     ParseStatus,
 )
+from agent_platform.knowledge.schemas import MediaType, build_image_id
 from agent_platform.settings import Settings
 from agent_platform.utils.text import content_fingerprint
 from scripts import ingest
@@ -39,6 +44,9 @@ PARSE_FAILURE_MSG = (
     "14:39:17 [ERROR][Exception]: No default embedding model is set.\n"
 )
 """RAGFlow 真实报出的解析失败日志（2026-10-16 实测原文，用于锁失败详情提取）。"""
+
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+"""最小 PNG 魔数样本（图片下载替身返回它）。"""
 
 # ---------------------------------------------------------------------------
 # 测试替身
@@ -52,9 +60,12 @@ class FakeRagFlow:
         self.chunks_per_doc = chunks_per_doc
         self.include_noise = False
         """置位后每个文档额外产出"被人工禁用"与"空白正文"两种切分。"""
+        self.extra_chunks: list[ChunkInfo] = []
+        """追加到每个文档的切分（图片/表格用例注入用）。"""
         self.uploaded: list[str] = []
         self.started: list[str] = []
         self.deleted: list[list[str]] = []
+        self.parser_configs: list[dict[str, Any]] = []
         self.parse_failures: set[str] = set()
         """文件名进入此集合 ⇒ 上传阶段即抛超时（模拟"根本没提交成功"）。"""
         self.fail_on_parse: set[str] = set()
@@ -67,11 +78,38 @@ class FakeRagFlow:
         一律成功，"上一轮遗留文档已不在"这条最常见的真实路径就永远走不到，兜底逻辑
         也就无从验证——这正是"替身比现实宽松"式的假绿。
         """
+        self.image_data: dict[str, bytes] = {}
+        """image_id → 图片字节；缺省返回一张最小 PNG。"""
+        self.image_failures: set[str] = set()
+        """image_id 进入此集合 ⇒ 下载抛 ``KnowledgeError``（模拟图片已不存在）。"""
+        self.image_requests: list[str] = []
+        self.in_flight = 0
+        self.max_in_flight = 0
+        self.image_delay_s = 0.0
         self._doc_seq = 0
 
-    async def ensure_dataset(self, name: str) -> str:
+    async def ensure_dataset(
+        self, name: str, *, parser_config: dict[str, Any] | None = None
+    ) -> str:
         del name
+        self.parser_configs.append(dict(parser_config or {}))
         return "ds-1"
+
+    async def download_document_image(self, image_id: str, *, max_bytes: int) -> bytes:
+        self.image_requests.append(image_id)
+        self.in_flight += 1
+        self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        try:
+            if self.image_delay_s:
+                await asyncio.sleep(self.image_delay_s)
+            if image_id in self.image_failures:
+                raise KnowledgeError(f"fake 图片不存在: {image_id}")
+            payload = self.image_data.get(image_id, _PNG)
+            if len(payload) > max_bytes:
+                raise KnowledgeError(f"fake 图片超限: {image_id}")
+            return payload
+        finally:
+            self.in_flight -= 1
 
     async def upload_document(self, dataset_id: str, path: Path) -> DocumentInfo:
         del dataset_id
@@ -132,6 +170,9 @@ class FakeRagFlow:
             chunks.append(
                 ChunkInfo(id=f"{document_id}-blank", content="  \n ", document_id=document_id)
             )
+        chunks.extend(
+            chunk.model_copy(update={"document_id": document_id}) for chunk in self.extra_chunks
+        )
         yield 1, ChunkPage(chunks=chunks, total=len(chunks))
 
     async def delete_documents(self, dataset_id: str, document_ids: list[str]) -> int:
@@ -144,6 +185,47 @@ class FakeRagFlow:
         return len(document_ids)
 
 
+class FakeImageStore:
+    """ImageStore 的离线替身（内存字典，遵守同一套契约）。"""
+
+    def __init__(self) -> None:
+        self.images: dict[tuple[str, str, str, str], bytes] = {}
+        self.deleted: list[tuple[str, str]] = []
+        self.put_calls = 0
+        self.ensure_ready_calls = 0
+
+    async def ensure_ready(self) -> None:
+        self.ensure_ready_calls += 1
+
+    async def put(
+        self, *, tenant_id: str, document_id: str, chunk_id: str, data: bytes
+    ) -> StoredImage:
+        self.put_calls += 1
+        sha256 = hashlib.sha256(data).hexdigest()
+        image_id = build_image_id(sha256)
+        self.images[(tenant_id, document_id, chunk_id, image_id)] = data
+        return StoredImage(image_id=image_id, sha256=sha256, mime="image/png", size=len(data))
+
+    async def get(
+        self,
+        *,
+        tenant_id: str,
+        document_id: str,
+        chunk_id: str,
+        image_id: str,
+        mime: str,
+    ) -> bytes | None:
+        del mime
+        return self.images.get((tenant_id, document_id, chunk_id, image_id))
+
+    async def delete_document(self, tenant_id: str, document_id: str) -> int:
+        self.deleted.append((tenant_id, document_id))
+        keys = [key for key in self.images if key[0] == tenant_id and key[1] == document_id]
+        for key in keys:
+            del self.images[key]
+        return len(keys)
+
+
 class FakeMilvusStore:
     """MilvusStore 的离线替身（记录写入的行，不做真实索引）。"""
 
@@ -151,6 +233,7 @@ class FakeMilvusStore:
         self.collection = "fake_chunks"
         self.dim = 8
         self.rows: dict[str, str] = {}
+        self.records: dict[str, Any] = {}
         self.deleted: list[tuple[str, str]] = []
         self.upsert_batches = 0
         self.flush_calls = 0
@@ -164,6 +247,7 @@ class FakeMilvusStore:
         for record in records:
             # 主键沿用 chunk_id ⇒ 重复入库是覆盖而非新增（幂等契约的落点）
             self.rows[record.chunk_id] = record.content
+            self.records[record.chunk_id] = record
         return len(records)
 
     async def flush(self) -> None:
@@ -180,6 +264,7 @@ class FakeMilvusStore:
         removed = [key for key in self.rows if key.startswith(f"{document_id}-")]
         for key in removed:
             del self.rows[key]
+            self.records.pop(key, None)
         return len(removed)
 
 
@@ -235,18 +320,27 @@ def stack(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """
     ragflow = FakeRagFlow()
     store = FakeMilvusStore()
+    image_store = FakeImageStore()
     embedder = FakeEmbedder()
     spies = {
         "ragflow": Spy(lambda: _open(ragflow)),
         "gateway": Spy(lambda: _open(object())),
         "milvus": Spy(lambda: _open(store)),
         "embedder": Spy(lambda: embedder),
+        "images": Spy(lambda: image_store),
     }
     monkeypatch.setattr(ingest, "RagFlowClient", spies["ragflow"])
     monkeypatch.setattr(ingest, "GatewayHttpClient", spies["gateway"])
     monkeypatch.setattr(ingest, "open_milvus_store", spies["milvus"])
     monkeypatch.setattr(ingest, "LiteLLMEmbedder", spies["embedder"])
-    return {"ragflow": ragflow, "store": store, "embedder": embedder, "spies": spies}
+    monkeypatch.setattr(ingest, "open_image_store", spies["images"])
+    return {
+        "ragflow": ragflow,
+        "store": store,
+        "image_store": image_store,
+        "embedder": embedder,
+        "spies": spies,
+    }
 
 
 @pytest.fixture
@@ -312,6 +406,26 @@ def make_chunk(chunk_id: str = "c-1", content: str = "居民电价按年度核�
     return ChunkInfo(id=chunk_id, content=content, document_id="doc-1", docnm_kwd="文件.pdf")
 
 
+def make_image_chunk(
+    chunk_id: str = "doc-1-img",
+    *,
+    content: str = "图 1：年度电价曲线",
+    image_id: str = "ds-1-doc-1-img",
+    doc_type: str = "image",
+    positions: list[list[int]] | None = None,
+) -> ChunkInfo:
+    """构造一个带图切分（``image`` 或 ``table``，ADR-0004）。"""
+    return ChunkInfo(
+        id=chunk_id,
+        content=content,
+        document_id="doc-1",
+        docnm_kwd="图表.pdf",
+        doc_type_kwd=doc_type,
+        image_id=image_id,
+        positions=[[2, 10, 20, 30, 40]] if positions is None else positions,
+    )
+
+
 def _write_manifest(tmp_path: Path, files: dict[str, dict[str, Any]]) -> Path:
     """按 ``{"version": ..., "files": ...}`` 结构写出清单文件，返回其路径。"""
     path = tmp_path / "ingest_manifest.json"
@@ -336,6 +450,7 @@ def manifest_with(tmp_path: Path, **files: str) -> Path:
                 "fingerprint": content_fingerprint(content.encode("utf-8")),
                 "document_id": "doc-1",
                 "chunk_count": 2,
+                "media_version": ingest.MEDIA_VERSION,
             }
             for name, content in files.items()
         },
@@ -355,6 +470,8 @@ def manifest_with_zero_chunk_entry(tmp_path: Path, name: str, content: str) -> P
                 "fingerprint": content_fingerprint(content.encode("utf-8")),
                 "document_id": "doc-gone",
                 "chunk_count": 0,
+                # 媒体版本正常：让本用例只考察"零切分"这一个变量
+                "media_version": ingest.MEDIA_VERSION,
             }
         },
     )
@@ -668,6 +785,9 @@ async def test_ingest_one_exposes_parse_failure_with_root_cause(
             ragflow=stack["ragflow"],
             embedder=stack["embedder"],
             store=stack["store"],
+            image_store=stack["image_store"],
+            image_max_bytes=8 * 1024 * 1024,
+            image_concurrency=4,
             previous_document_id=None,
         )
 
@@ -799,6 +919,229 @@ async def test_tenant_override_reaches_stored_records(
 
 
 # ---------------------------------------------------------------------------
+# 多模态图片入库（ADR-0004）
+# ---------------------------------------------------------------------------
+
+
+async def test_image_chunk_is_exported_with_metadata(
+    tmp_path: Path, stack: dict[str, Any], settings: Settings
+) -> None:
+    """图片切分：下载 → 落盘 → 记录携带图片引用与页码坐标。"""
+    stack["ragflow"].extra_chunks = [make_image_chunk()]
+    corpus = write_corpus(tmp_path, {"charts.pdf": "甲"})
+
+    code = await ingest.run(make_args(corpus), settings)
+
+    assert code == ingest.EXIT_OK
+    assert stack["ragflow"].image_requests == ["ds-1-doc-1-img"]
+    expected_id = build_image_id(hashlib.sha256(_PNG).hexdigest())
+    assert ("t1", "doc-1", "doc-1-img", expected_id) in stack["image_store"].images
+
+    record = stack["store"].records["doc-1-img"]
+    assert record.media_type is MediaType.IMAGE
+    assert len(record.images) == 1
+    ref = record.images[0]
+    assert ref.image_id == expected_id
+    assert ref.page == 2
+    assert ref.bbox is not None
+    assert (ref.bbox.left, ref.bbox.right) == (10, 20)
+    assert ref.caption == "图 1：年度电价曲线"
+
+    manifest = ingest.Manifest.load(settings.ingest_manifest_path)
+    entry = manifest.files["charts.pdf"]
+    assert entry["image_count"] == 1
+    assert entry["image_chunks"] == 1
+    assert entry["missing_image_chunks"] == 0
+
+
+async def test_image_download_failure_fails_whole_file(
+    tmp_path: Path,
+    stack: dict[str, Any],
+    settings: Settings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """图片切分取不到图 ⇒ 整份文件失败，旧产物与已落盘图片一并清掉。"""
+    chunk = make_image_chunk()
+    stack["ragflow"].extra_chunks = [chunk]
+    stack["ragflow"].image_failures = {chunk.image_id}
+    corpus = write_corpus(tmp_path, {"charts.pdf": "甲"})
+
+    with caplog.at_level(logging.INFO):
+        code = await ingest.run(make_args(corpus), settings)
+
+    assert code == ingest.EXIT_PARTIAL
+    assert stack["store"].rows == {}, "图片切分失败的文档不得写入任何向量"
+    assert stack["ragflow"].deleted == [["doc-1"]], "失败文档必须做补偿删除"
+    assert ("t1", "doc-1") in stack["image_store"].deleted, "已落盘图片必须一并清掉"
+    manifest = ingest.Manifest.load(settings.ingest_manifest_path)
+    assert manifest.fingerprint_of("charts.pdf") is None
+    events = {log_extras(record).get("event", ""): record for record in caplog.records}
+    failure = log_extras(events["ingest.file_failed"])
+    assert failure["error_code"] == KnowledgeImageExportError.code.value
+
+
+async def test_table_image_failure_degrades_to_html_only(
+    tmp_path: Path, stack: dict[str, Any], settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """表格截图下载失败只降级为无图，正文 HTML 照常入库，但必须计数与留痕。"""
+    chunk = make_image_chunk(
+        chunk_id="doc-1-tbl",
+        doc_type="table",
+        content="<table><tr><td>电价</td></tr></table>",
+        image_id="ds-1-doc-1-tbl",
+    )
+    stack["ragflow"].extra_chunks = [chunk]
+    stack["ragflow"].image_failures = {chunk.image_id}
+    corpus = write_corpus(tmp_path, {"charts.pdf": "甲"})
+
+    with caplog.at_level(logging.INFO):
+        code = await ingest.run(make_args(corpus), settings)
+
+    assert code == ingest.EXIT_OK
+    record = stack["store"].records["doc-1-tbl"]
+    assert record.media_type is MediaType.TABLE
+    assert record.images == []
+    manifest = ingest.Manifest.load(settings.ingest_manifest_path)
+    assert manifest.files["charts.pdf"]["missing_image_chunks"] == 1
+    events = {log_extras(record).get("event", "") for record in caplog.records}
+    assert "ingest.image_degraded" in events
+
+
+async def test_image_chunk_without_image_id_keeps_text_and_counts(
+    tmp_path: Path, stack: dict[str, Any], settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """图片切分没有 image_id：保留文字内容，不造图，但必须计入缺失。"""
+    stack["ragflow"].extra_chunks = [make_image_chunk(image_id="")]
+    corpus = write_corpus(tmp_path, {"charts.pdf": "甲"})
+
+    with caplog.at_level(logging.INFO):
+        code = await ingest.run(make_args(corpus), settings)
+
+    assert code == ingest.EXIT_OK
+    record = stack["store"].records["doc-1-img"]
+    assert record.media_type is MediaType.IMAGE
+    assert record.images == []
+    assert stack["ragflow"].image_requests == [], "没有 image_id 就不该发起下载"
+    manifest = ingest.Manifest.load(settings.ingest_manifest_path)
+    assert manifest.files["charts.pdf"]["missing_image_chunks"] == 1
+    events = {log_extras(record).get("event", "") for record in caplog.records}
+    assert "ingest.image_missing" in events
+
+
+async def test_empty_image_chunk_is_skipped_and_counted(
+    tmp_path: Path, stack: dict[str, Any], settings: Settings
+) -> None:
+    """空的图片切分无法向量化，跳过且不下载图片，但单独计数。"""
+    stack["ragflow"].extra_chunks = [make_image_chunk(content="  \n ", image_id="ds-1-empty")]
+    corpus = write_corpus(tmp_path, {"charts.pdf": "甲"})
+
+    code = await ingest.run(make_args(corpus), settings)
+
+    assert code == ingest.EXIT_OK
+    assert set(stack["store"].rows) == {"doc-1-c0", "doc-1-c1"}
+    assert stack["ragflow"].image_requests == []
+    manifest = ingest.Manifest.load(settings.ingest_manifest_path)
+    assert manifest.files["charts.pdf"]["skipped_empty_image_chunks"] == 1
+
+
+async def test_image_download_concurrency_is_bounded(
+    tmp_path: Path, stack: dict[str, Any], settings: Settings
+) -> None:
+    """图片下载并发受配置上限约束：一次性打满会把 RAGFlow 与本地磁盘一起拖慢。"""
+    stack["ragflow"].extra_chunks = [
+        make_image_chunk(chunk_id=f"doc-1-img{n}", image_id=f"ds-1-img{n}", positions=[])
+        for n in range(6)
+    ]
+    stack["ragflow"].image_delay_s = 0.01
+    settings = settings.model_copy(update={"evidence_image_download_concurrency": 2})
+    corpus = write_corpus(tmp_path, {"charts.pdf": "甲"})
+
+    code = await ingest.run(make_args(corpus), settings)
+
+    assert code == ingest.EXIT_OK
+    assert len(stack["ragflow"].image_requests) == 6
+    assert stack["ragflow"].max_in_flight <= 2, "并发下载不得突破配置上限"
+
+
+async def test_reingest_clears_previous_document_images(
+    tmp_path: Path, stack: dict[str, Any], settings: Settings
+) -> None:
+    """重入时旧文档的图片目录必须清掉，否则会留下无人引用的孤儿文件。"""
+    corpus = write_corpus(tmp_path, {"a.pdf": "甲"})
+    _write_manifest(
+        tmp_path,
+        {
+            "a.pdf": {
+                "fingerprint": content_fingerprint("旧内容".encode()),
+                "document_id": "doc-old",
+                "chunk_count": 1,
+                "media_version": ingest.MEDIA_VERSION,
+            }
+        },
+    )
+
+    code = await ingest.run(make_args(corpus), settings)
+
+    assert code == ingest.EXIT_OK
+    assert ("t1", "doc-old") in stack["image_store"].deleted
+
+
+async def test_parser_config_reaches_dataset(
+    tmp_path: Path, stack: dict[str, Any], settings: Settings
+) -> None:
+    """解析配置必须建在数据集上（上传接口不收这些键，ADR-0004）。"""
+    corpus = write_corpus(tmp_path, {"a.pdf": "甲"})
+
+    await ingest.run(make_args(corpus), settings)
+
+    config = stack["ragflow"].parser_configs[0]
+    assert config["layout_recognize"] == settings.ragflow_layout_recognize
+    assert config["chunk_token_num"] == settings.ragflow_chunk_token_num
+    assert config["image_context_size"] == settings.ragflow_image_context_size
+    assert config["table_context_size"] == settings.ragflow_table_context_size
+    assert stack["image_store"].ensure_ready_calls == 1
+
+
+async def test_entry_without_media_version_is_reingested(
+    tmp_path: Path, stack: dict[str, Any], settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """旧链路入库的条目（无 media_version）必须重跑，否则图片永远补不进索引。"""
+    corpus = write_corpus(tmp_path, {"a.pdf": "甲"})
+    _write_manifest(
+        tmp_path,
+        {
+            "a.pdf": {
+                "fingerprint": content_fingerprint("甲".encode()),
+                "document_id": "doc-1",
+                "chunk_count": 2,
+            }
+        },
+    )
+
+    with caplog.at_level(logging.INFO):
+        code = await ingest.run(make_args(corpus), settings)
+
+    assert code == ingest.EXIT_OK
+    assert stack["ragflow"].uploaded == ["a.pdf"], "旧媒体版本的条目不得按指纹跳过"
+    events = {log_extras(record).get("event", "") for record in caplog.records}
+    assert "ingest.media_version_outdated" in events, "重跑原因必须留痕"
+    manifest = ingest.Manifest.load(settings.ingest_manifest_path)
+    assert manifest.files["a.pdf"]["media_version"] == ingest.MEDIA_VERSION
+
+
+def test_should_skip_requires_current_media_version() -> None:
+    """跳过判定三条件缺一不可：指纹、非零切分、媒体版本。"""
+    entry = {"fingerprint": "abc", "chunk_count": 2, "media_version": ingest.MEDIA_VERSION}
+    outdated = {"fingerprint": "abc", "chunk_count": 2}
+    assert ingest.should_skip(entry, "abc", "abc") is True
+    assert ingest.should_skip({**entry, "media_version": 1}, "abc", "abc") is False
+    assert ingest.should_skip(outdated, "abc", "abc") is False
+    assert ingest.should_skip({**entry, "chunk_count": 0}, "abc", "abc") is False
+    assert ingest.should_skip(entry, "abc", "changed") is False
+    assert ingest.should_skip(entry, None, "abc") is False
+
+
+# ---------------------------------------------------------------------------
 # 失败处理
 # ---------------------------------------------------------------------------
 
@@ -838,8 +1181,8 @@ async def test_setup_failure_aborts_whole_run(
 ) -> None:
     """前置条件（数据集）建不起来属致命错误：整体抛出，不逐文件撞墙。"""
 
-    async def _boom(name: str) -> str:
-        del name
+    async def _boom(name: str, *, parser_config: dict[str, Any] | None = None) -> str:
+        del name, parser_config
         raise KnowledgeError("RAGFlow 不可达")
 
     monkeypatch.setattr(stack["ragflow"], "ensure_dataset", _boom)

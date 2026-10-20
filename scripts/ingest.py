@@ -5,6 +5,7 @@
 
     读文件 → 幂等前置判断 → RagFlowClient.upload_document
            → start_parsing → wait_parse_done → iter_chunks
+           → 图片切分下载并落 ImageStore（ADR-0004）
            → ChunkInfo → ChunkRecord 映射（本脚本自建，库内无此转换器）
            → LiteLLMEmbedder.embed_documents → MilvusStore.upsert_chunks
 
@@ -45,15 +46,23 @@ from typing import Any
 from agent_platform.core.errors import (
     AgentPlatformError,
     ConfigurationError,
+    KnowledgeImageExportError,
     KnowledgeParseFailedError,
 )
 from agent_platform.core.logging import configure_logging, enable_utf8_console, get_logger
 from agent_platform.knowledge.embedder import LiteLLMEmbedder
 from agent_platform.knowledge.gateway_client import GatewayHttpClient
+from agent_platform.knowledge.images import ImageStore, StoredImage, open_image_store
 from agent_platform.knowledge.milvus_store import MilvusStore, open_milvus_store
 from agent_platform.knowledge.ragflow_client import RagFlowClient
 from agent_platform.knowledge.ragflow_schemas import ChunkInfo, DocumentInfo
-from agent_platform.knowledge.schemas import ChunkRecord
+from agent_platform.knowledge.schemas import (
+    ChunkRecord,
+    ImageBBox,
+    ImageRef,
+    MediaType,
+    extract_page_numbers,
+)
 from agent_platform.settings import Settings, load_settings
 from agent_platform.utils.text import content_fingerprint
 
@@ -67,13 +76,43 @@ EXIT_FATAL = 3
 MANIFEST_VERSION = 1
 """清单格式版本。结构变更时必须递增，旧清单将被视为不兼容而拒绝加载。"""
 
+MEDIA_VERSION = 2
+"""条目级媒体版本（ADR-0004）。
+
+顶层清单版本**不升**：``manifest.files[*]`` 是逐条追加的，旧条目缺
+``media_version`` 只影响该文件是否需要重入库，不影响清单能被读懂。缺该字段
+或值不等于 2 的条目一律视为"未按多模态链路入库"，重跑一次即可补上。
+"""
+
 SUPPORTED_SUFFIXES = frozenset(
-    {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".md", ".csv", ".html"}
+    {
+        ".pdf",
+        ".doc",
+        ".docx",
+        ".xls",
+        ".xlsx",
+        ".ppt",
+        ".pptx",
+        ".txt",
+        ".md",
+        ".csv",
+        ".html",
+        # 独立图片文件（ADR-0004）：经 RAGFlow OCR / VLM 转成文字后入库
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".bmp",
+        ".webp",
+        ".tif",
+        ".tiff",
+        ".gif",
+    }
 )
 """未指定 --subset 时递归扫描的文件类型。
 
-刻意保守：只列本演示语料实际出现的类型（pdf/xlsx）与 RAGFlow 明确支持的常见文档
-类型。宁可漏扫让人补参数，也不要扫描未知二进制把噪声灌进知识库。
+刻意保守：只列本演示语料实际出现的类型（pdf/xlsx/图片）与 RAGFlow 明确支持的
+常见文档类型。宁可漏扫让人补参数，也不要扫描未知二进制把噪声灌进知识库。
+不放视频后缀：本仓没有播放与转码能力，扫进来只会是零切分失败。
 """
 
 EMBED_BATCH_SIZE = 32
@@ -90,6 +129,21 @@ class IngestOutcome:
     document_id: str = ""
     is_skipped: bool = False
     reason: str = ""
+    image_count: int = 0
+    image_chunks: int = 0
+    missing_image_chunks: int = 0
+    skipped_empty_image_chunks: int = 0
+
+
+@dataclass(frozen=True)
+class CollectResult:
+    """单份文件的切分收集结果（含图片导出的计数，供清单与日志留痕）。"""
+
+    written: int
+    image_count: int = 0
+    image_chunks: int = 0
+    missing_image_chunks: int = 0
+    skipped_empty_image_chunks: int = 0
 
 
 @dataclass
@@ -166,6 +220,101 @@ def is_stale_manifest_entry(entry: dict[str, Any] | None) -> bool:
         return False
     count = entry.get("chunk_count")
     return not isinstance(count, int) or count <= 0
+
+
+def should_skip(entry: dict[str, Any] | None, recorded: str | None, current: str) -> bool:
+    """该文件是否可以跳过（干跑与真实入库共用，避免两处判断漂移）。
+
+    三个条件都满足才跳过：指纹一致、不是零切分的陈旧条目、条目按当前
+    ``MEDIA_VERSION`` 入库。升级入库链路（如 ADR-0004 引入图片）后旧条目
+    必须重跑一次，否则库里只有文本、图片永远补不进来。
+    """
+    return (
+        recorded is not None
+        and recorded == current
+        and not is_stale_manifest_entry(entry)
+        and isinstance(entry, dict)
+        and entry.get("media_version") == MEDIA_VERSION
+    )
+
+
+_MEDIA_BY_DOC_TYPE: dict[str, MediaType] = {
+    "image": MediaType.IMAGE,
+    "table": MediaType.TABLE,
+}
+
+
+def media_type_of(chunk: ChunkInfo) -> MediaType:
+    """把 RAGFlow 的 ``doc_type_kwd`` 映射为平台媒介类型（ADR-0004）。
+
+    只认 ``image`` 与 ``table``，其余（含空串、``text``、将来可能新增的
+    ``video``）一律按 ``text`` 处理：未知类型当文本不会丢内容，而猜成图片
+    会让一张不存在的图挡住整份文件的入库。
+    """
+    return _MEDIA_BY_DOC_TYPE.get(chunk.doc_type_kwd.strip().lower(), MediaType.TEXT)
+
+
+def _image_position(chunk: ChunkInfo) -> tuple[int | None, ImageBBox | None]:
+    """从切分的 ``positions`` 中取图片页码与坐标（取不到就返回 None）。
+
+    坐标不合法（负数、字段不足）时只丢 bbox，不阻断入库：RAGFlow 各解析器
+    输出的位置结构并不一致，为一条坐标放弃整张图不划算。
+    """
+    for position in chunk.positions:
+        if len(position) >= 5:
+            page, left, right, top, bottom = position[:5]
+            if page >= 1 and min(left, right, top, bottom) >= 0:
+                return page, ImageBBox(left=left, right=right, top=top, bottom=bottom)
+    pages = extract_page_numbers(chunk.positions)
+    return (pages[0] if pages else None), None
+
+
+def image_caption(
+    chunk: ChunkInfo, *, media_type: MediaType, document_name: str, page: int | None
+) -> str:
+    """生成图片图注（≤240 字符）。
+
+    图片切分的正文通常是 VLM 描述或 OCR 文本，直接取用；表格截图与正文附图
+    不能用 HTML/长正文当图注，改用"表格：文档名 第 N 页"这类短标签。
+    """
+    if media_type is MediaType.TABLE:
+        label = f"表格：{document_name}" if document_name else "表格"
+        return label if page is None else f"{label} 第 {page} 页"
+    return " ".join(chunk.content.split())[:240]
+
+
+def build_image_ref(
+    chunk: ChunkInfo,
+    stored: StoredImage,
+    *,
+    media_type: MediaType,
+    document_name: str,
+) -> ImageRef:
+    """把已落盘的图片包装成对外引用（只含元数据，ADR-0004）。"""
+    page, bbox = _image_position(chunk)
+    return ImageRef(
+        image_id=stored.image_id,
+        sha256=stored.sha256,
+        mime=stored.mime,
+        caption=image_caption(chunk, media_type=media_type, document_name=document_name, page=page),
+        page=page,
+        bbox=bbox,
+    )
+
+
+def build_parser_config(settings: Settings) -> dict[str, Any]:
+    """数据集级解析配置（键名取自 RAGFlow ``ParserConfig``）。
+
+    这些键**不能**随上传接口传：v0.27.2 的上传接口只白名单
+    ``table_column_mode`` / ``table_column_roles``，其余会被静默丢弃
+    （见 ``ragflow_client.upload_document``）。
+    """
+    return {
+        "layout_recognize": settings.ragflow_layout_recognize,
+        "chunk_token_num": settings.ragflow_chunk_token_num,
+        "image_context_size": settings.ragflow_image_context_size,
+        "table_context_size": settings.ragflow_table_context_size,
+    }
 
 
 def load_subset(subset_path: Path) -> list[str]:
@@ -251,6 +400,8 @@ def to_chunk_record(
     document_name: str,
     source_rel: str,
     updated_at: int,
+    media_type: MediaType = MediaType.TEXT,
+    images: list[ImageRef] | None = None,
 ) -> ChunkRecord:
     """把 RAGFlow 的 ``ChunkInfo`` 映射为 Milvus 的 ``ChunkRecord``。
 
@@ -262,6 +413,9 @@ def to_chunk_record(
       判断单条切分是否变化，用文件级指纹会让"文件里改一个字 → 全部 chunk 都显得变了"。
     - ``source_uri`` 存**相对路径**而非绝对路径：绝对路径随机器而变，一旦写入索引
       就成了不可复现的引用；相对路径配合数据集名足以定位来源。
+
+    媒介类型与图片引用由调用方先算好再传入：图片的下载与落盘是 IO，不能塞进
+    这个纯映射函数（下一阶段的单测才能继续保持零 IO）。
     """
     return ChunkRecord(
         chunk_id=chunk.id,
@@ -274,6 +428,8 @@ def to_chunk_record(
         source_uri=source_rel,
         content_fingerprint=content_fingerprint(chunk.content.encode("utf-8")),
         updated_at=updated_at,
+        media_type=media_type,
+        images=list(images or ()),
     )
 
 
@@ -301,16 +457,27 @@ async def ingest_one(
     ragflow: RagFlowClient,
     embedder: LiteLLMEmbedder,
     store: MilvusStore,
+    image_store: ImageStore,
+    image_max_bytes: int,
+    image_concurrency: int,
     previous_document_id: str | None,
 ) -> IngestOutcome:
-    """处理单个文件：上传 → 解析 → 拉取切分 → 嵌入 → 写入 Milvus。
+    """处理单个文件：上传 → 解析 → 拉取切分 → 导出图片 → 嵌入 → 写入 Milvus。
 
     任一环节失败即抛出平台异常，由调用方登记为失败文件并继续下一个——
     单个坏文件不得中断整批（CLAUDE.md 7.3 的"失败文件单独登记"要求）。
+
+    Args:
+        image_store: 证据图片存储（ADR-0004）。
+        image_max_bytes: 单张图片的字节上限。
+        image_concurrency: 单份文件内并发下载图片的上限。
     """
     if previous_document_id:
         # 内容变更后的重入：先清旧产物，否则旧 chunk 会以孤儿行形式永久留在索引里。
         removed = await store.delete_by_document(previous_document_id, tenant_id)
+        # 图片目录按 document_id 分，旧文档的图片同样要清：新文档 ID 不同，
+        # 旧目录不会被覆盖，留着就是无人引用的磁盘垃圾。
+        removed_images = await image_store.delete_document(tenant_id, previous_document_id)
         # 尽力而为：这里删的是**上一轮尝试**的遗留物。RAGFlow 对"删一个不属于该
         # 数据集的 id"是**报错**而非幂等成功（实测源码 document_api.py 的
         # delete_documents：id 不在 dataset_doc_ids 里即返回错误）。于是只要那个文档
@@ -334,6 +501,7 @@ async def ingest_one(
                 "source": rel_path,
                 "document_id": previous_document_id,
                 "removed_chunks": removed,
+                "removed_images": removed_images,
             },
         )
 
@@ -356,7 +524,7 @@ async def ingest_one(
                     "该文件未计入成功，处理后重跑本命令即可；已成功的文件会按指纹跳过。"
                 ),
             )
-        written = await collect_and_index(
+        collected = await collect_and_index(
             doc=doc,
             rel_path=rel_path,
             tenant_id=tenant_id,
@@ -364,6 +532,9 @@ async def ingest_one(
             ragflow=ragflow,
             embedder=embedder,
             store=store,
+            image_store=image_store,
+            image_max_bytes=image_max_bytes,
+            image_concurrency=image_concurrency,
         )
     except AgentPlatformError:
         # 补偿：RAGFlow **拒绝同名重复上传**（实测 "Duplicated document name in the
@@ -372,11 +543,50 @@ async def ingest_one(
         await _delete_document_best_effort(
             ragflow, dataset_id, doc.id, rel_path, context="解析失败后的补偿删除"
         )
+        # 图片与文档同生共死：已下载的图片若随失败文档留在盘上，就是一批
+        # 没有证据引用、也永远不会被检索到的孤儿文件。
+        await _delete_images_best_effort(image_store, tenant_id, doc.id, rel_path)
         raise
 
     return IngestOutcome(
-        source_rel=rel_path, is_success=True, document_id=doc.id, chunk_count=written
+        source_rel=rel_path,
+        is_success=True,
+        document_id=doc.id,
+        chunk_count=collected.written,
+        image_count=collected.image_count,
+        image_chunks=collected.image_chunks,
+        missing_image_chunks=collected.missing_image_chunks,
+        skipped_empty_image_chunks=collected.skipped_empty_image_chunks,
     )
+
+
+async def _delete_images_best_effort(
+    image_store: ImageStore, tenant_id: str, document_id: str, rel_path: str
+) -> None:
+    """尽力删除文档图片；清理自身出错只记日志，不得掩盖原始异常（NO-06）。"""
+    try:
+        removed = await image_store.delete_document(tenant_id, document_id)
+    except (OSError, AgentPlatformError) as cleanup_exc:
+        logger.warning(
+            "清理证据图片未成功，请检查图片存储目录",
+            extra={
+                "event": "ingest.image_cleanup_failed",
+                "source": rel_path,
+                "document_id": document_id,
+                "error_type": type(cleanup_exc).__name__,
+            },
+        )
+        return
+    if removed:
+        logger.info(
+            "已清理证据图片",
+            extra={
+                "event": "ingest.images_removed",
+                "source": rel_path,
+                "document_id": document_id,
+                "removed_images": removed,
+            },
+        )
 
 
 async def _delete_document_best_effort(
@@ -419,14 +629,27 @@ async def collect_and_index(
     ragflow: RagFlowClient,
     embedder: LiteLLMEmbedder,
     store: MilvusStore,
-) -> int:
-    """拉取切分 → 映射 → 嵌入 → 写入 Milvus，返回写入条数。
+    image_store: ImageStore,
+    image_max_bytes: int,
+    image_concurrency: int,
+) -> CollectResult:
+    """拉取切分 → 导出图片 → 映射 → 嵌入 → 写入 Milvus。
+
+    图片导出的失败语义（ADR-0004）按媒介类型分档：
+
+    - ``image`` 切分的正文就是图片，取不到图 = 这条切分没有任何可用内容，
+      **整份文件判失败**（``KnowledgeImageExportError``），由调用方补偿删除；
+    - ``table`` 与 ``text`` 附图允许降级为 ``images=[]``，但必须记 WARNING
+      并计入 ``missing_image_chunks``——"静默少一张图"与"从来没这张图"
+      在检索结果里长得一模一样，不留痕就无从追查。
 
     Raises:
         KnowledgeParseFailedError: 解析成功但一条可用切分都没有（"零入库"不得算成功）。
+        KnowledgeImageExportError: 图片切分的图片下载或落盘失败。
     """
     updated_at = int(datetime.now(UTC).timestamp())
-    records: list[ChunkRecord] = []
+    usable: list[ChunkInfo] = []
+    skipped_empty_image_chunks = 0
     async for _page_index, page in ragflow.iter_chunks(dataset_id, doc.id):
         for chunk in page.chunks:
             if not chunk.available:
@@ -434,18 +657,61 @@ async def collect_and_index(
                 continue
             if not chunk.content.strip():
                 # 空切分无法向量化（ChunkRecord.content 要求 min_length=1），跳过。
+                # 图片切分额外计数：它们可能只是 RAGFlow 没跑 OCR/VLM，值得显式观察。
+                if media_type_of(chunk) is MediaType.IMAGE:
+                    skipped_empty_image_chunks += 1
                 continue
-            records.append(
-                to_chunk_record(
-                    chunk,
-                    tenant_id=tenant_id,
-                    dataset_id=dataset_id,
-                    document_id=doc.id,
-                    document_name=doc.name,
-                    source_rel=rel_path,
-                    updated_at=updated_at,
-                )
+            usable.append(chunk)
+
+    image_chunks = sum(1 for chunk in usable if media_type_of(chunk) is MediaType.IMAGE)
+    missing_image_chunks = 0
+    for chunk in usable:
+        if media_type_of(chunk) is MediaType.IMAGE and not chunk.image_id:
+            missing_image_chunks += 1
+            logger.warning(
+                "图片切分缺少 image_id，只能保留文字内容",
+                extra={"event": "ingest.image_missing", "source": rel_path, "chunk_id": chunk.id},
             )
+
+    stored = await _export_images(
+        chunks=usable,
+        rel_path=rel_path,
+        tenant_id=tenant_id,
+        document_id=doc.id,
+        ragflow=ragflow,
+        image_store=image_store,
+        image_max_bytes=image_max_bytes,
+        image_concurrency=image_concurrency,
+    )
+    missing_image_chunks += stored.missing
+    for chunk_id in stored.missing_chunk_ids:
+        logger.warning(
+            "切分图片下载失败，已降级为无图",
+            extra={"event": "ingest.image_degraded", "source": rel_path, "chunk_id": chunk_id},
+        )
+
+    records: list[ChunkRecord] = []
+    for chunk in usable:
+        media_type = media_type_of(chunk)
+        stored_image = stored.images.get(chunk.id)
+        images = (
+            [build_image_ref(chunk, stored_image, media_type=media_type, document_name=doc.name)]
+            if stored_image is not None
+            else []
+        )
+        records.append(
+            to_chunk_record(
+                chunk,
+                tenant_id=tenant_id,
+                dataset_id=dataset_id,
+                document_id=doc.id,
+                document_name=doc.name,
+                source_rel=rel_path,
+                updated_at=updated_at,
+                media_type=media_type,
+                images=images,
+            )
+        )
 
     if not records:
         # 解析成功却一条可用切分都没有 ⇒ 这份文件对知识库零贡献。记成成功会把
@@ -460,7 +726,81 @@ async def collect_and_index(
         batch = records[start : start + EMBED_BATCH_SIZE]
         vectors = await embedder.embed_documents([record.content for record in batch])
         written += await store.upsert_chunks(batch, vectors)
-    return written
+    return CollectResult(
+        written=written,
+        image_count=sum(len(record.images) for record in records),
+        image_chunks=image_chunks,
+        missing_image_chunks=missing_image_chunks,
+        skipped_empty_image_chunks=skipped_empty_image_chunks,
+    )
+
+
+@dataclass(frozen=True)
+class _ExportedImages:
+    """单份文件的图片导出结果。"""
+
+    images: dict[str, StoredImage]
+    missing_chunk_ids: list[str]
+
+    @property
+    def missing(self) -> int:
+        """应到未到的图片数（表格截图、正文附图降级）。"""
+        return len(self.missing_chunk_ids)
+
+
+async def _export_images(
+    *,
+    chunks: list[ChunkInfo],
+    rel_path: str,
+    tenant_id: str,
+    document_id: str,
+    ragflow: RagFlowClient,
+    image_store: ImageStore,
+    image_max_bytes: int,
+    image_concurrency: int,
+) -> _ExportedImages:
+    """有界并发地下载并落盘切分图片，返回 ``chunk_id`` → 图片摘要。
+
+    图片切分失败直接抛异常；表格/正文附图失败只登记进 ``missing_chunk_ids``，
+    由调用方记 WARNING 并降级。
+    """
+    targets = [chunk for chunk in chunks if chunk.image_id]
+    if not targets:
+        return _ExportedImages(images={}, missing_chunk_ids=[])
+
+    semaphore = asyncio.Semaphore(image_concurrency)
+
+    async def _export(chunk: ChunkInfo) -> StoredImage:
+        async with semaphore:
+            payload = await ragflow.download_document_image(
+                chunk.image_id, max_bytes=image_max_bytes
+            )
+            return await image_store.put(
+                tenant_id=tenant_id,
+                document_id=document_id,
+                chunk_id=chunk.id,
+                data=payload,
+            )
+
+    results = await asyncio.gather(*(_export(chunk) for chunk in targets), return_exceptions=True)
+    images: dict[str, StoredImage] = {}
+    missing_chunk_ids: list[str] = []
+    for chunk, result in zip(targets, results, strict=True):
+        if isinstance(result, BaseException):
+            if not isinstance(result, Exception):  # 取消等 BaseException 必须原样上抛
+                raise result
+            if media_type_of(chunk) is MediaType.IMAGE:
+                raise KnowledgeImageExportError(
+                    f"图片切分导出失败: {rel_path}（chunk {chunk.id}）— {result}",
+                    detail=(
+                        "该切分的正文就是图片，取不到图时这条切分不能作为证据；"
+                        "整份文件已判失败，请检查 RAGFlow 的解析产物，或把该文件移出多模态子集。"
+                    ),
+                ) from result
+            missing_chunk_ids.append(chunk.id)
+            continue
+        images[chunk.id] = result
+    return _ExportedImages(images=images, missing_chunk_ids=missing_chunk_ids)
 
 
 async def _print_plan(pairs: list[tuple[str, Path]], existing: Manifest) -> None:
@@ -475,9 +815,7 @@ async def _print_plan(pairs: list[tuple[str, Path]], existing: Manifest) -> None
         recorded = existing.fingerprint_of(rel_path)
         current = content_fingerprint(await asyncio.to_thread(abs_path.read_bytes))
         # 干跑必须与真实入库给出同一个答案，否则"先 --dry-run 确认"就成了误导。
-        is_unchanged = recorded == current and not is_stale_manifest_entry(
-            existing.files.get(rel_path)
-        )
+        is_unchanged = should_skip(existing.files.get(rel_path), recorded, current)
         (to_skip if is_unchanged else to_ingest).append(rel_path)
     logger.info(
         "干跑完成：未发起任何网络请求",
@@ -523,7 +861,13 @@ async def run(args: argparse.Namespace, settings: Settings) -> int:
         embedder = LiteLLMEmbedder(
             gateway, logical_model=settings.embedding_model, expected_dim=settings.milvus_dim
         )
-        dataset_id = await ragflow.ensure_dataset(dataset_name)
+        # 图片存储的目录在启动期建好并验证可写：等到第一份带图文件才失败，
+        # 会让整批入库跑到一半才停（CLAUDE.md 3.5 fail-fast）。
+        image_store = open_image_store(settings)
+        await image_store.ensure_ready()
+        dataset_id = await ragflow.ensure_dataset(
+            dataset_name, parser_config=build_parser_config(settings)
+        )
         created = await store.ensure_collection()
         logger.info(
             "集合就绪",
@@ -553,7 +897,19 @@ async def run(args: argparse.Namespace, settings: Settings) -> int:
                         "recorded_chunk_count": entry.get("chunk_count") if entry else None,
                     },
                 )
-            elif recorded == fingerprint:
+            elif recorded == fingerprint and not should_skip(entry, recorded, fingerprint):
+                # 指纹一致但仍不跳过，只剩媒体版本这一种可能：条目来自引入图片
+                # 证据之前的旧链路。重入库才能把图片补进索引，且必须出声。
+                logger.warning(
+                    "清单条目未按当前媒体版本入库，重跑该文件",
+                    extra={
+                        "event": "ingest.media_version_outdated",
+                        "source": rel_path,
+                        "recorded_media_version": entry.get("media_version") if entry else None,
+                        "current_media_version": MEDIA_VERSION,
+                    },
+                )
+            elif should_skip(entry, recorded, fingerprint):
                 outcomes.append(
                     IngestOutcome(source_rel=rel_path, is_success=True, is_skipped=True)
                 )
@@ -571,6 +927,9 @@ async def run(args: argparse.Namespace, settings: Settings) -> int:
                     ragflow=ragflow,
                     embedder=embedder,
                     store=store,
+                    image_store=image_store,
+                    image_max_bytes=settings.evidence_image_max_bytes,
+                    image_concurrency=settings.evidence_image_download_concurrency,
                     previous_document_id=previous,
                 )
             except AgentPlatformError as exc:
@@ -602,6 +961,11 @@ async def run(args: argparse.Namespace, settings: Settings) -> int:
                         "dataset_id": dataset_id,
                         "tenant_id": tenant_id,
                         "chunk_count": outcome.chunk_count,
+                        "media_version": MEDIA_VERSION,
+                        "image_count": outcome.image_count,
+                        "image_chunks": outcome.image_chunks,
+                        "missing_image_chunks": outcome.missing_image_chunks,
+                        "skipped_empty_image_chunks": outcome.skipped_empty_image_chunks,
                         "ingested_at": datetime.now(UTC).isoformat(),
                     },
                 )
@@ -627,6 +991,7 @@ async def run(args: argparse.Namespace, settings: Settings) -> int:
             "skipped": len(skipped),
             "failed": len(failed),
             "chunks": total_chunks,
+            "images": sum(o.image_count for o in succeeded),
             "manifest": str(manifest.path),
         },
     )
