@@ -17,6 +17,8 @@
 ``positions``       JSON                    解析器位置信息（页号提取用）
 ``fingerprint``     VARCHAR                 内容指纹（幂等键组成）
 ``updated_at``      INT64                   UTC epoch 秒
+``media_type``      VARCHAR                 切分媒介类型：text / image / table（ADR-0004）
+``images``          JSON                    证据图片元数据列表（只存 ImageRef，ADR-0004）
 ==================  ======================  ==========================================
 
 字段名集中在此模块导出，检索、入库、测试三处共用同一常量，杜绝拼写漂移。
@@ -43,11 +45,36 @@ FIELD_SOURCE_URI = "source_uri"
 FIELD_POSITIONS = "positions"
 FIELD_FINGERPRINT = "fingerprint"
 FIELD_UPDATED_AT = "updated_at"
+FIELD_MEDIA_TYPE = "media_type"
+FIELD_IMAGES = "images"
 
 BM25_FUNCTION_NAME = "content_bm25"
 
 CONTENT_MAX_LEN = 65535
 """VARCHAR 上限；RAGFlow 单个 chunk 远小于此，超长时由调用方截断。"""
+
+COLLECTION_SCHEMA_VERSION = 2
+"""集合结构版本（ADR-0004）。
+
+v2 增加 ``media_type`` 与 ``images``。v1 集合本身结构完好、只是缺这两列，
+Milvus 不支持给已有集合加列，只能新建集合并重入库；旧集合保留用于回滚。
+"""
+
+REQUIRED_SCHEMA_FIELDS: tuple[str, ...] = (
+    FIELD_CHUNK_ID,
+    FIELD_CONTENT,
+    FIELD_CONTENT_EMBEDDING,
+    FIELD_TENANT_ID,
+    FIELD_DATASET_ID,
+    FIELD_DOCUMENT_ID,
+    FIELD_MEDIA_TYPE,
+    FIELD_IMAGES,
+)
+"""``ensure_collection`` 必须校验存在的字段。
+
+缺任一列都会让写入或检索在**运行中**、按文件或按请求地失败；启动时一次性
+校验完，失败信息可以带上重建命令（CLAUDE.md 3.5 fail-fast）。
+"""
 
 # 检索需要回读的字段（稀疏向量与 BM25 原始分不可直接输出，故不在列）
 SEARCH_OUTPUT_FIELDS: tuple[str, ...] = (
@@ -59,6 +86,8 @@ SEARCH_OUTPUT_FIELDS: tuple[str, ...] = (
     FIELD_SOURCE_URI,
     FIELD_POSITIONS,
     FIELD_UPDATED_AT,
+    FIELD_MEDIA_TYPE,
+    FIELD_IMAGES,
 )
 
 
@@ -94,6 +123,10 @@ def build_collection_schema(dim: int) -> CollectionSchema:
     schema.add_field(field_name=FIELD_POSITIONS, datatype=DataType.JSON)
     schema.add_field(field_name=FIELD_FINGERPRINT, datatype=DataType.VARCHAR, max_length=64)
     schema.add_field(field_name=FIELD_UPDATED_AT, datatype=DataType.INT64)
+    # 媒介类型只存枚举值（text/image/table），长度给足冗余但无自由文本空间
+    schema.add_field(field_name=FIELD_MEDIA_TYPE, datatype=DataType.VARCHAR, max_length=16)
+    # 图片只存元数据（image_id/sha256/mime/caption/page/bbox），二进制落 ImageStore
+    schema.add_field(field_name=FIELD_IMAGES, datatype=DataType.JSON)
     schema.add_function(
         Function(
             name=BM25_FUNCTION_NAME,
@@ -149,6 +182,10 @@ def to_row(record: ChunkRecord, embedding: list[float]) -> dict[str, Any]:
         FIELD_POSITIONS: record.positions,
         FIELD_FINGERPRINT: record.content_fingerprint,
         FIELD_UPDATED_AT: record.updated_at,
+        FIELD_MEDIA_TYPE: record.media_type.value,
+        # model_dump(mode="json") 把嵌套的 bbox 摊成普通 dict：Milvus 的 JSON
+        # 字段只接受 JSON 原生类型，直接塞 Pydantic 模型会在序列化处失败。
+        FIELD_IMAGES: [image.model_dump(mode="json") for image in record.images],
     }
 
 

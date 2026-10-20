@@ -203,6 +203,8 @@ def _to_evidence(hit: MilvusHit, score: float) -> EvidenceItem:
         document_name=hit.document_name,
         page_numbers=extract_page_numbers(hit.positions),
         source_uri=hit.source_uri,
+        media_type=hit.media_type,
+        images=list(hit.images),
     )
 
 

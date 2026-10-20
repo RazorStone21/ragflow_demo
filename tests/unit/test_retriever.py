@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 import pytest
@@ -16,6 +17,7 @@ from agent_platform.knowledge.retriever import (
     REASON_SUFFICIENT,
     Retriever,
 )
+from agent_platform.knowledge.schemas import ImageRef, MediaType, build_image_id
 
 _DIM = 4
 
@@ -127,6 +129,18 @@ async def test_search_returns_evidence_with_citations() -> None:
     assert outcome.evidence[0].page_numbers == [3]
     assert outcome.evidence[0].document_name == "政策.pdf"
     assert outcome.evidence[0].source_uri == "gov_doc/政策.pdf"
+
+
+async def test_search_evidence_carries_media_and_images() -> None:
+    """证据原样带出媒介类型与图片引用，供引用与取图使用（ADR-0004）。"""
+    sha = hashlib.sha256(b"fig").hexdigest()
+    ref = ImageRef(image_id=build_image_id(sha), sha256=sha, mime="image/png", page=3)
+    store = FakeStore([_hit(1, 0.9, media_type=MediaType.IMAGE, images=[ref])])
+
+    outcome = await _retriever(store).search("电价曲线图", tenant_id="demo")
+
+    assert outcome.evidence[0].media_type is MediaType.IMAGE
+    assert outcome.evidence[0].images == [ref]
 
 
 async def test_search_passes_tenant_filter_to_store() -> None:

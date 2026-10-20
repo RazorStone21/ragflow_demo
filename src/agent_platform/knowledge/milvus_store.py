@@ -17,15 +17,15 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pymilvus import AnnSearchRequest, AsyncMilvusClient, WeightedRanker
 from pymilvus.exceptions import MilvusException
 
-from agent_platform.core.errors import KnowledgeError, RetrievalFailedError
+from agent_platform.core.errors import ConfigurationError, KnowledgeError, RetrievalFailedError
 from agent_platform.core.logging import get_logger
 from agent_platform.core.retry import build_retry, is_retryable
 from agent_platform.knowledge import milvus_schema as schema
-from agent_platform.knowledge.schemas import ChunkRecord, Position
+from agent_platform.knowledge.schemas import ChunkRecord, ImageRef, MediaType, Position
 from agent_platform.settings import Settings
 
 logger = get_logger(__name__)
@@ -48,6 +48,10 @@ class MilvusHit(BaseModel):
     source_uri: str = ""
     positions: list[Position] = Field(default_factory=list)
     updated_at: int = 0
+    media_type: MediaType = Field(
+        default=MediaType.TEXT, description="切分媒介类型；未知值降级为 text"
+    )
+    images: list[ImageRef] = Field(default_factory=list, description="证据图片元数据（ADR-0004）")
 
 
 def _milvus_retryable(exc: BaseException) -> bool:
@@ -104,17 +108,18 @@ class MilvusStore:
     # 生命周期
     # ------------------------------------------------------------------
     async def ensure_collection(self) -> bool:
-        """确保集合存在并已加载（幂等）。
+        """确保集合存在且结构符合当前版本（幂等）。
 
         Returns:
             ``True`` 表示本次新建了集合，``False`` 表示已存在。
 
         Raises:
-            KnowledgeError: 集合存在但维度与配置不符，或建集合失败。
+            ConfigurationError: 集合已存在但缺少必需字段或维度不符，需要重建。
+            KnowledgeError: 建集合失败。
         """
         try:
             if await self._client.has_collection(self._collection):
-                await self._verify_dim()
+                await self._verify_schema()
                 return False
             await self._client.create_collection(
                 collection_name=self._collection,
@@ -132,23 +137,46 @@ class MilvusStore:
         )
         return True
 
-    async def _verify_dim(self) -> None:
-        """校验已存在集合的稠密维度与配置一致（不一致即 fail-fast）。"""
+    async def _verify_schema(self) -> None:
+        """校验已存在集合的维度与必需字段（不一致即 fail-fast）。
+
+        Milvus 不能给已有集合加列，旧版本建的集合（缺 ``media_type`` /
+        ``images``）只能新建集合并重入库。这里**不自动删集合**：删库不可逆，
+        必须由人决定；错误信息给出重建方式，让人一步到位。
+        """
         try:
             description = await self._client.describe_collection(self._collection)
         except MilvusException as exc:  # pragma: no cover - 需真实服务才触发
             raise KnowledgeError(f"读取集合描述失败: {self._collection}") from exc
         fields = description.get("fields", []) if isinstance(description, dict) else []
+        present: set[str] = set()
         for field in fields:
-            if not isinstance(field, dict) or field.get("name") != schema.FIELD_CONTENT_EMBEDDING:
+            if not isinstance(field, dict):
+                continue
+            name = field.get("name")
+            if isinstance(name, str):
+                present.add(name)
+            if name != schema.FIELD_CONTENT_EMBEDDING:
                 continue
             params = field.get("params") or {}
             actual = params.get("dim")
             if actual is not None and int(actual) != self._dim:
-                raise KnowledgeError(
+                raise ConfigurationError(
                     f"集合 {self._collection} 的向量维度为 {actual}，配置 MILVUS_DIM={self._dim}",
                     detail="向量库维度与嵌入模型不一致，需重建集合或修正 MILVUS_DIM。",
                 )
+        missing = [name for name in schema.REQUIRED_SCHEMA_FIELDS if name not in present]
+        if missing:
+            raise ConfigurationError(
+                f"集合 {self._collection} 缺少必需字段: {', '.join(missing)}"
+                f"（当前集合结构版本 v{schema.COLLECTION_SCHEMA_VERSION}）",
+                detail=(
+                    "这是引入图片证据（ADR-0004）之前建的旧集合，Milvus 不支持原地加列。"
+                    "请把 MILVUS_COLLECTION 指向一个新集合名后重新入库，例如："
+                    "MILVUS_COLLECTION=gov_policy_chunks_v2 uv run python scripts/ingest.py "
+                    "--source <语料目录>；旧集合保留用于回滚。"
+                ),
+            )
 
     # ------------------------------------------------------------------
     # 写入
@@ -358,9 +386,55 @@ def _to_hits(results: Any) -> list[MilvusHit]:
                 source_uri=str(entity.get(schema.FIELD_SOURCE_URI, "")),
                 positions=positions if isinstance(positions, list) else [],
                 updated_at=int(entity.get(schema.FIELD_UPDATED_AT, 0) or 0),
+                media_type=_parse_media_type(entity.get(schema.FIELD_MEDIA_TYPE)),
+                images=_parse_images(entity.get(schema.FIELD_IMAGES), chunk_id=chunk_id),
             )
         )
     return hits
+
+
+_MAX_IMAGES_PER_CHUNK = 8
+"""单条证据的图片上限，与 ``ChunkRecord.images`` 的约束保持一致。"""
+
+
+def _parse_media_type(raw: Any) -> MediaType:
+    """解析媒介类型；未知值降级为 ``text``。
+
+    将来 RAGFlow 若新增 ``video`` 之类取值，旧代码按文本处理仍能给出内容；
+    反过来，让未知枚举把整条证据弄丢才是真正的损失。
+    """
+    try:
+        return MediaType(str(raw))
+    except ValueError:
+        return MediaType.TEXT
+
+
+def _parse_images(raw: Any, *, chunk_id: str) -> list[ImageRef]:
+    """解析图片元数据列表；非法条目只跳过该条并记 WARNING。
+
+    一条损坏的图片记录不应带走整条文本证据——那会把"少一张图"放大成
+    "少一条证据"。超过上限的条目同样丢弃（上限与契约一致）。
+    """
+    if not isinstance(raw, list):
+        return []
+    images: list[ImageRef] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            images.append(ImageRef.model_validate(item))
+        except ValidationError:
+            logger.warning(
+                "证据图片元数据非法，已跳过该条",
+                extra={"event": "milvus.image_meta_invalid", "chunk_id": chunk_id},
+            )
+    if len(images) > _MAX_IMAGES_PER_CHUNK:
+        logger.warning(
+            "证据图片数超过上限，已截断",
+            extra={"event": "milvus.image_meta_truncated", "chunk_id": chunk_id},
+        )
+        images = images[:_MAX_IMAGES_PER_CHUNK]
+    return images
 
 
 @asynccontextmanager

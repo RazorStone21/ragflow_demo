@@ -1,16 +1,17 @@
-"""Milvus 封装：建集合幂等、维度校验、批量入库、混合检索与租户过滤。"""
+"""Milvus 封装：建集合幂等、结构校验、批量入库、混合检索与租户过滤。"""
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any, cast
 
 import pytest
 from pymilvus import AsyncMilvusClient
 
-from agent_platform.core.errors import KnowledgeError, RetrievalFailedError
+from agent_platform.core.errors import ConfigurationError, KnowledgeError, RetrievalFailedError
 from agent_platform.knowledge import milvus_schema as schema
 from agent_platform.knowledge.milvus_store import MilvusStore
-from agent_platform.knowledge.schemas import ChunkRecord
+from agent_platform.knowledge.schemas import ChunkRecord, ImageRef, MediaType, build_image_id
 
 _DIM = 4
 
@@ -25,11 +26,13 @@ class FakeMilvusClient:
         dim: int = _DIM,
         search_rows: list[dict[str, Any]] | None = None,
         query_rows: list[dict[str, Any]] | None = None,
+        missing_fields: set[str] | None = None,
     ) -> None:
         self.exists = exists
         self.dim = dim
         self.search_rows = search_rows if search_rows is not None else []
         self.query_rows = query_rows if query_rows is not None else []
+        self.missing_fields = missing_fields or set()
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.closed = False
 
@@ -46,7 +49,16 @@ class FakeMilvusClient:
 
     async def describe_collection(self, collection_name: str, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(("describe_collection", {"collection_name": collection_name}))
-        return {"fields": [{"name": schema.FIELD_CONTENT_EMBEDDING, "params": {"dim": self.dim}}]}
+        return {
+            "fields": [
+                {
+                    "name": name,
+                    "params": {"dim": self.dim} if name == schema.FIELD_CONTENT_EMBEDDING else {},
+                }
+                for name in schema.REQUIRED_SCHEMA_FIELDS
+                if name not in self.missing_fields
+            ]
+        }
 
     async def upsert(
         self, collection_name: str, data: list[dict[str, Any]], **kwargs: Any
@@ -126,8 +138,21 @@ async def test_ensure_collection_creates_then_is_idempotent() -> None:
 async def test_ensure_collection_fails_fast_on_dim_mismatch() -> None:
     """已存在集合的维度与配置不符时 fail-fast，避免写入错位向量。"""
     client = FakeMilvusClient(exists=True, dim=1024)
-    with pytest.raises(KnowledgeError, match="向量维度"):
+    with pytest.raises(ConfigurationError, match="向量维度"):
         await _store(client).ensure_collection()
+
+
+async def test_ensure_collection_fails_fast_on_missing_media_fields() -> None:
+    """旧集合缺 media_type/images 时 fail-fast，并给出重建方式（不自动删库）。"""
+    client = FakeMilvusClient(
+        exists=True, missing_fields={schema.FIELD_MEDIA_TYPE, schema.FIELD_IMAGES}
+    )
+    with pytest.raises(ConfigurationError, match="缺少必需字段") as excinfo:
+        await _store(client).ensure_collection()
+
+    assert schema.FIELD_MEDIA_TYPE in str(excinfo.value), "诊断信息必须点名缺了哪一列"
+    assert "gov_policy_chunks_v2" in excinfo.value.detail, "错误信息必须给出可直接执行的下一步"
+    assert client.method_calls("create_collection") == [], "不得自动删/建集合"
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +193,22 @@ async def test_upsert_empty_is_noop() -> None:
     assert client.method_calls("upsert") == []
 
 
+async def test_upsert_writes_media_type_and_image_refs() -> None:
+    """媒介类型与图片元数据随行进集合；图片序列化为 JSON 原生结构。"""
+    sha = hashlib.sha256(b"fig").hexdigest()
+    ref = ImageRef(
+        image_id=build_image_id(sha), sha256=sha, mime="image/png", caption="图 1", page=2
+    )
+    client = FakeMilvusClient()
+    record = _record(1, media_type=MediaType.IMAGE, images=[ref])
+
+    await _store(client).upsert_chunks([record], [_vector()])
+
+    row = client.method_calls("upsert")[0]["data"][0]
+    assert row[schema.FIELD_MEDIA_TYPE] == "image"
+    assert row[schema.FIELD_IMAGES] == [ref.model_dump(mode="json")]
+
+
 async def test_delete_by_document_scopes_to_tenant() -> None:
     """按文档删除必须同时限定租户（NO-19 隔离不得绕过）。"""
     client = FakeMilvusClient()
@@ -183,7 +224,28 @@ async def test_delete_by_document_scopes_to_tenant() -> None:
 # ---------------------------------------------------------------------------
 # 检索
 # ---------------------------------------------------------------------------
-def _search_row(chunk_id: str = "c1", score: float = 0.8, *, nested: bool = True) -> dict[str, Any]:
+def _image_payload(**overrides: Any) -> dict[str, Any]:
+    """构造一条存储态的图片元数据（JSON 原生 dict）。"""
+    sha = hashlib.sha256(b"fig").hexdigest()
+    payload: dict[str, Any] = {
+        "image_id": build_image_id(sha),
+        "sha256": sha,
+        "mime": "image/png",
+        "caption": "图 1",
+        "page": 2,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _search_row(
+    chunk_id: str = "c1",
+    score: float = 0.8,
+    *,
+    nested: bool = True,
+    media_type: str = "text",
+    images: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     """构造一条检索返回行（nested=True 用 entity 包裹形态）。"""
     entity = {
         schema.FIELD_CHUNK_ID: chunk_id,
@@ -194,6 +256,8 @@ def _search_row(chunk_id: str = "c1", score: float = 0.8, *, nested: bool = True
         schema.FIELD_SOURCE_URI: "gov_doc/政策.pdf",
         schema.FIELD_POSITIONS: [[2, 0, 10, 0, 10]],
         schema.FIELD_UPDATED_AT: 1700000000,
+        schema.FIELD_MEDIA_TYPE: media_type,
+        schema.FIELD_IMAGES: images if images is not None else [],
     }
     if nested:
         return {"id": chunk_id, "distance": score, "entity": entity}
@@ -256,6 +320,38 @@ async def test_hybrid_search_skips_unrecognized_rows() -> None:
         query_text="问题", query_vector=_vector(), expr="", candidates=8, vector_weight=0.5
     )
     assert [hit.chunk_id for hit in hits] == ["ok"]
+
+
+async def test_hybrid_search_maps_media_type_and_images() -> None:
+    """检索命中带出媒介类型与图片元数据（ADR-0004）。"""
+    payload = _image_payload()
+    client = FakeMilvusClient(search_rows=[_search_row("c1", media_type="table", images=[payload])])
+
+    hits = await _store(client).hybrid_search(
+        query_text="问题", query_vector=_vector(), expr="", candidates=8, vector_weight=0.5
+    )
+
+    assert hits[0].media_type is MediaType.TABLE
+    assert len(hits[0].images) == 1
+    assert hits[0].images[0].image_id == payload["image_id"]
+
+
+async def test_hybrid_search_degrades_unknown_media_and_skips_bad_images() -> None:
+    """未知媒介类型降级为 text；非法图片条目跳过但不丢整条证据。"""
+    client = FakeMilvusClient(
+        search_rows=[
+            _search_row(
+                "c1", media_type="video", images=[{"image_id": "不是合法 ID"}, _image_payload()]
+            )
+        ]
+    )
+
+    hits = await _store(client).hybrid_search(
+        query_text="问题", query_vector=_vector(), expr="", candidates=8, vector_weight=0.5
+    )
+
+    assert hits[0].media_type is MediaType.TEXT, "未知枚举不得让整条证据消失"
+    assert len(hits[0].images) == 1, "非法图片条目只跳过自身"
 
 
 async def test_hybrid_search_empty_returns_empty_list() -> None:
