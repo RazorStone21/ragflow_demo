@@ -130,7 +130,12 @@ async def create_thread(
     return thread_id
 
 
-def render_citations(citations: list[dict[str, Any]]) -> str:
+def render_citations(
+    citations: list[dict[str, Any]],
+    *,
+    base_url: str | None = None,
+    thread_id: str | None = None,
+) -> str:
     """把引用列表渲染为可读文本（CLAUDE.md 7.4：答案必须可溯源）。
 
     编号**必须沿用 ``Citation.index``**（= 提示词里给证据编的号），不能按列表位置重编：
@@ -139,6 +144,9 @@ def render_citations(citations: list[dict[str, Any]]) -> str:
     于是正文里的 ``[7]``/``[8]`` 在清单中找不到对应项，清单里的 ``[5]``/``[6]`` 又是错的
     编号，"引用清单"存在的意义（可溯源）在人类可读层面直接断掉。缺 ``index`` 字段时
     回退到位置编号（兼容手写的纯 dict 输入）。
+
+    同时给出 ``base_url`` 与 ``thread_id`` 时，为每条带图引用打印取图端点 URL，
+    方便人工验收时直接粘进浏览器；两者缺省则只打印 ``image_id``（单测与离线使用）。
     """
     if not citations:
         return "（本次回答未引用任何证据）"
@@ -151,7 +159,32 @@ def render_citations(citations: list[dict[str, Any]]) -> str:
         page_text = f" 第 {', '.join(str(p) for p in pages)} 页" if pages else ""
         source = item.get("source_uri") or ""
         lines.append(f"  [{label}] {name}{page_text}{f'  ({source})' if source else ''}")
+        lines.extend(_render_citation_images(item, base_url=base_url, thread_id=thread_id))
     return "\n".join(lines)
+
+
+def _render_citation_images(
+    citation: dict[str, Any], *, base_url: str | None, thread_id: str | None
+) -> list[str]:
+    """渲染一条引用附带的图片（地址可构造时给取图 URL，否则只给 ID）。"""
+    images = citation.get("images") or []
+    chunk_id = citation.get("chunk_id") or ""
+    lines = []
+    for image in images:
+        if not isinstance(image, dict):
+            continue
+        image_id = image.get("image_id")
+        if not isinstance(image_id, str) or not image_id:
+            continue
+        if base_url and thread_id and chunk_id:
+            url = (
+                f"{base_url.rstrip('/')}/api/v1/threads/{thread_id}"
+                f"/evidence/{chunk_id}/images/{image_id}"
+            )
+            lines.append(f"      图片：{url}")
+        else:
+            lines.append(f"      图片：{image_id}")
+    return lines
 
 
 async def run_stream(
@@ -207,7 +240,8 @@ async def run_stream(
     _emit_authoritative_answer(completed, streamed="".join(draft).strip())
     _out("\n")
     citations = completed.get("citations") or []
-    _out(f"引用来源（{len(citations)} 条）：\n{render_citations(citations)}\n")
+    rendered = render_citations(citations, base_url=base_url, thread_id=thread_id)
+    _out(f"引用来源（{len(citations)} 条）：\n{rendered}\n")
     _out(f"答案状态：{completed.get('answer_status')}\n")
     return EXIT_OK
 

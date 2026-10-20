@@ -198,6 +198,49 @@ def test_render_citations_keeps_citation_index_numbering() -> None:
     assert "[3] " not in text, "位置编号会把它印成 [3]——正文里根本没有这个引用"
 
 
+def test_render_citations_prints_image_endpoint_url() -> None:
+    """带图的引用要打印可直接打开的取图 URL，便于人工验收（ADR-0004）。"""
+    text = demo_chat.render_citations(
+        [
+            {
+                "index": 2,
+                "chunk_id": "c1",
+                "document_name": "扫描件.pdf",
+                "images": [{"image_id": "img_" + "a" * 32}, {"image_id": "img_" + "b" * 32}],
+            }
+        ],
+        base_url="http://127.0.0.1:8000/",
+        thread_id="t1:u1:s1",
+    )
+    assert (
+        "http://127.0.0.1:8000/api/v1/threads/t1:u1:s1/evidence/c1/images/img_" + "a" * 32
+    ) in text
+    assert "img_" + "b" * 32 in text
+
+
+def test_render_citations_without_base_url_prints_image_id_only() -> None:
+    """离线渲染（单测、无会话上下文）只给 ID，不拼半截 URL。"""
+    text = demo_chat.render_citations(
+        [{"index": 1, "chunk_id": "c1", "images": [{"image_id": "img_" + "c" * 32}]}]
+    )
+    assert "img_" + "c" * 32 in text
+    assert "/api/v1/threads/" not in text
+
+
+def test_render_citations_ignores_malformed_images() -> None:
+    """图片条目可能来自旧数据或手工构造，坏条目跳过而不是抛异常。"""
+    text = demo_chat.render_citations(
+        [
+            {
+                "index": 1,
+                "chunk_id": "c1",
+                "images": ["not-a-dict", {"image_id": ""}, {"no_id": 1}],
+            }
+        ]
+    )
+    assert "图片：" not in text
+
+
 # ---------------------------------------------------------------------------
 # 流消费（真实字节回放）
 # ---------------------------------------------------------------------------
