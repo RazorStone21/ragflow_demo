@@ -24,7 +24,7 @@ from agent_platform import __version__
 from agent_platform.api.container import DepsFactory, open_production_deps
 from agent_platform.api.middleware.errors import register_exception_handlers
 from agent_platform.api.middleware.request_context import RequestContextMiddleware
-from agent_platform.api.routes import health, runs, threads
+from agent_platform.api.routes import evidence_images, health, runs, threads
 from agent_platform.core.logging import configure_logging, get_logger
 from agent_platform.settings import Settings, get_settings
 
@@ -83,6 +83,7 @@ def create_app(
     api_v1.include_router(health.info_router)
     api_v1.include_router(threads.router)
     api_v1.include_router(runs.router)
+    api_v1.include_router(evidence_images.router)
     app.include_router(api_v1)
 
     return app

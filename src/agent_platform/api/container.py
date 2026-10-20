@@ -27,6 +27,7 @@ from agent_platform.core.models import ChatModel, build_chat_model
 from agent_platform.guardrails import Guardrail
 from agent_platform.knowledge.embedder import LiteLLMEmbedder
 from agent_platform.knowledge.gateway_client import GatewayHttpClient
+from agent_platform.knowledge.images import ImageStore, open_image_store
 from agent_platform.knowledge.milvus_store import MilvusStore, open_milvus_store
 from agent_platform.knowledge.reranker import LiteLLMReranker
 from agent_platform.knowledge.retriever import Retriever
@@ -79,6 +80,8 @@ class AppDeps:
     chat: ChatModel
     chat_logical_name: str
     guardrail: Guardrail | None
+    image_store: ImageStore
+    """证据图片存储（ADR-0004）。取图端点只经此读取，不拼路径、不访对象存储。"""
     readiness_checks: tuple[ReadinessCheck, ...]
 
 
@@ -95,6 +98,9 @@ async def open_production_deps(settings: Settings) -> AsyncIterator[AppDeps]:
     """
     async with AsyncExitStack() as stack:
         gateway = await stack.enter_async_context(GatewayHttpClient(settings))
+        # 图片目录在此一次性建好并验证可写：启动时就失败，好过第一次取图才发现。
+        image_store = open_image_store(settings)
+        await image_store.ensure_ready()
         milvus_store = await stack.enter_async_context(open_milvus_store(settings))
         retriever = Retriever(
             milvus_store,
@@ -142,6 +148,7 @@ async def open_production_deps(settings: Settings) -> AsyncIterator[AppDeps]:
             chat=chat,
             chat_logical_name=settings.primary_chat_model,
             guardrail=None,
+            image_store=image_store,
             readiness_checks=(
                 ReadinessCheck(name="postgres", probe=_check_postgres),
                 ReadinessCheck(name="milvus", probe=_check_milvus),

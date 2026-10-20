@@ -193,6 +193,53 @@ class FakeMilvusStore:
         return self.chunk_count
 
 
+class FakeImageStore:
+    """内存版证据图片存储。
+
+    ``AppDeps.image_store`` 在 API 层只被取图端点消费，且只有读路径——
+    因此这里只实现 ``get``。``put`` 的测试在入库侧（``test_ingest.py``）用
+    自己的 fake 覆盖，不在这里补一个无人调用的实现。
+
+    键里带 ``tenant_id`` 与 ``document_id`` 而不只是 ``image_id``：取图端点
+    若把租户传错或干脆没传，用 ``image_id`` 单独作键的 fake 会照样命中，
+    测试就失去了对租户隔离（NO-19）的发言权。
+    """
+
+    def __init__(self) -> None:
+        self.objects: dict[tuple[str, str, str, str, str], bytes] = {}
+        self.get_calls: list[tuple[str, str, str, str, str]] = []
+        self.raises: BaseException | None = None
+
+    def add(
+        self,
+        *,
+        tenant_id: str,
+        document_id: str,
+        chunk_id: str,
+        image_id: str,
+        mime: str,
+        data: bytes,
+    ) -> None:
+        """预置一张图片（测试夹具用，不经过校验）。"""
+        self.objects[(tenant_id, document_id, chunk_id, image_id, mime)] = data
+
+    async def get(
+        self,
+        *,
+        tenant_id: str,
+        document_id: str,
+        chunk_id: str,
+        image_id: str,
+        mime: str,
+    ) -> bytes | None:
+        """按完整定位键取图；记录了调用参数供隔离断言。"""
+        key = (tenant_id, document_id, chunk_id, image_id, mime)
+        self.get_calls.append(key)
+        if self.raises is not None:
+            raise self.raises
+        return self.objects.get(key)
+
+
 class FakeRetriever:
     """满足 ``Retriever`` 契约的确定性检索器。
 
@@ -299,6 +346,8 @@ class ApiStack:
     """注入的模型（fake）；同上。"""
     milvus_store: Any
     """注入的向量库（fake）；同上。单测用 ``FakeMilvusStore``，不含真实 Milvus。"""
+    image_store: Any
+    """注入的证据图片存储（fake）；同上。单测用 ``FakeImageStore``，不落盘。"""
     agent_name: str
     readiness_checks: tuple[ReadinessCheck, ...]
 
@@ -312,6 +361,7 @@ def build_api_stack(
     checkpointer: Any = None,
     store: Any = None,
     milvus_store: Any = None,
+    image_store: Any = None,
 ) -> ApiStack:
     """装配一套依赖：默认内存 checkpointer + 内存 store + fake 检索器/模型。
 
@@ -324,6 +374,7 @@ def build_api_stack(
     resolved_store = store if store is not None else InMemoryStore()
     resolved_saver = checkpointer if checkpointer is not None else InMemorySaver()
     resolved_milvus = milvus_store if milvus_store is not None else FakeMilvusStore()
+    resolved_images = image_store if image_store is not None else FakeImageStore()
     graph = build_graph(
         retriever=resolved_retriever,  # type: ignore[arg-type]  # 注入 fake（CLAUDE.md 9.3）
         chat=resolved_chat,
@@ -341,6 +392,7 @@ def build_api_stack(
         retriever=resolved_retriever,
         chat=resolved_chat,
         milvus_store=resolved_milvus,
+        image_store=resolved_images,
         agent_name=AGENT_NAME,
         readiness_checks=readiness_checks,
     )
@@ -368,6 +420,7 @@ def build_test_app(stack: ApiStack) -> FastAPI:
             chat=stack.chat,
             chat_logical_name=stack.settings.primary_chat_model,
             guardrail=None,
+            image_store=stack.image_store,
             readiness_checks=stack.readiness_checks,
         )
 
@@ -420,6 +473,7 @@ def api_factory(fake_settings: Settings) -> OpenApi:
         readiness_checks: tuple[ReadinessCheck, ...] | None = None,
         checkpointer: Any = None,
         store: Any = None,
+        image_store: Any = None,
     ) -> AsyncIterator[ApiHarness]:
         resolved = settings if settings is not None else fake_settings
         stack = build_api_stack(
@@ -429,6 +483,7 @@ def api_factory(fake_settings: Settings) -> OpenApi:
             readiness_checks=readiness_checks,
             checkpointer=checkpointer,
             store=store,
+            image_store=image_store,
         )
         app = build_test_app(stack)
         transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
