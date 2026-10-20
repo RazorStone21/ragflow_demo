@@ -16,6 +16,12 @@ RAGFlow 的可视化画布与内置检索不得承载核心流程（NO-01）。
 - 文档列表：``GET /datasets/{id}/documents`` → ``data.docs[]`` + ``data.total``；
   状态字段 ``run``，进度 ``progress``（0~1，取消为 -1）。
 - 切分列表：``GET /datasets/{id}/documents/{doc_id}/chunks`` → ``data.chunks[]`` + ``data.total``。
+- 数据集更新：``PUT /datasets/{id}``，``parser_config`` 由服务端 **deep_merge** 进已有配置
+  （``api/apps/services/dataset_api_service.py:update_dataset``）；上传接口则只白名单
+  ``table_column_mode`` / ``table_column_roles`` 两个键（``document_api.py``）。
+- 取切分图片：``GET /documents/images/{image_id}``，``image_id`` 形如
+  ``{dataset_id}-{chunk_id}``，**按首个连字符拆分**（对象名里还可能再出现连字符）。
+  响应是原始二进制；但错误走的是 HTTP 200 + JSON 业务包，只能靠正文内容分辨。
 
 相关限制（v0.27.2 FAQ）：单次上传总计 ≤1GB；本地文件名 ≤255 **字节**（中文名需按字节算）；
 HTTP API 不受 32 文件批次限制。
@@ -25,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Self
@@ -42,6 +49,7 @@ from agent_platform.core.errors import (
 )
 from agent_platform.core.logging import get_logger
 from agent_platform.core.retry import build_retry, is_retryable
+from agent_platform.knowledge.images import detect_image_mime
 from agent_platform.knowledge.ragflow_schemas import (
     ChunkPage,
     DatasetInfo,
@@ -58,6 +66,16 @@ FILE_NAME_MAX_BYTES = 255
 
 DEFAULT_PAGE_SIZE = 100
 """分页大小：列表接口默认 30，调大以减少往返（切分多时明显）。"""
+
+_UPLOAD_PARSER_CONFIG_KEYS = frozenset({"table_column_mode", "table_column_roles"})
+"""上传接口白名单（v0.27.2 ``document_api.py`` 只认这两个键，其余静默丢弃）。
+
+其余解析配置必须在数据集层设置（``ensure_dataset`` / ``update_parser_config``），
+所以这里显式拒绝未知键，而不是让它悄悄失效。
+"""
+
+_IMAGE_ID_PATTERN = re.compile(r"^[A-Za-z0-9]+-[A-Za-z0-9][A-Za-z0-9._-]*$")
+"""``{dataset_id}-{chunk_id}``：首段后必须还有内容，且整串不得含路径分隔符。"""
 
 # 业务错误码 → 处理方式（v0.27.2 common/constants.py RetCode）
 _CODE_AUTH_FAILED = 109  # AUTHENTICATION_ERROR
@@ -91,6 +109,7 @@ class RagFlowClient:
         """
         self._base_url = settings.ragflow_base_url.rstrip("/")
         self._parse_timeout_s = settings.ragflow_parse_timeout_s
+        self._image_timeout_s = settings.evidence_image_download_timeout_s
         # 鉴权头逐请求携带，而非只挂在自建客户端的默认头里：注入共享连接池是常见
         # 生产用法，若把凭据放在客户端默认头，注入时会静默丢失（已由单测锁定）。
         self._headers = {"Authorization": f"Bearer {settings.ragflow_api_key.get_secret_value()}"}
@@ -123,11 +142,15 @@ class RagFlowClient:
     # ------------------------------------------------------------------
     # 数据集
     # ------------------------------------------------------------------
-    async def ensure_dataset(self, name: str) -> str:
-        """按名称查找数据集，不存在则创建（幂等）。
+    async def ensure_dataset(
+        self, name: str, *, parser_config: dict[str, Any] | None = None
+    ) -> str:
+        """按名称查找数据集，不存在则创建；存在则收敛解析配置（幂等）。
 
         Args:
             name: 数据集名称。
+            parser_config: 数据集级解析配置（ADR-0004）。**必须**在这里设置：
+                v0.27.2 的上传接口不接收 ``layout_recognize`` 等键。
 
         Returns:
             数据集 ID。
@@ -135,8 +158,13 @@ class RagFlowClient:
         existing = await self.list_datasets(name=name)
         for dataset in existing:
             if dataset.name == name:
+                if parser_config:
+                    await self.update_parser_config(dataset.id, parser_config)
                 return dataset.id
-        body = await self._request("POST", "/api/v1/datasets", json={"name": name})
+        payload: dict[str, Any] = {"name": name}
+        if parser_config:
+            payload["parser_config"] = parser_config
+        body = await self._request("POST", "/api/v1/datasets", json=payload)
         data = body.get("data")
         if not isinstance(data, dict) or not isinstance(data.get("id"), str):
             raise KnowledgeError(
@@ -145,6 +173,28 @@ class RagFlowClient:
             )
         logger.info("ragflow.dataset_created", extra={"dataset": name, "dataset_id": data["id"]})
         return str(data["id"])
+
+    async def update_parser_config(self, dataset_id: str, parser_config: dict[str, Any]) -> None:
+        """更新数据集的解析配置。
+
+        服务端做的是 ``deep_merge(kb.parser_config, 请求)``，未出现的键保持原值；
+        但 v0.27.2 会顺手把 ``children_delimiter`` 清空、``enable_children`` 置 False
+        （``update_dataset`` 里 parent_child 分支的固定行为）。本仓不使用 parent-child
+        切分，故无影响；若将来启用，这条 PUT 必须同步带上 parent_child 设置。
+
+        Args:
+            dataset_id: 数据集 ID。
+            parser_config: 需要覆盖的配置项。
+        """
+        if not parser_config:
+            return
+        await self._request(
+            "PUT", f"/api/v1/datasets/{dataset_id}", json={"parser_config": parser_config}
+        )
+        logger.info(
+            "ragflow.dataset_config_updated",
+            extra={"dataset_id": dataset_id, "keys": sorted(parser_config)},
+        )
 
     async def list_datasets(
         self, *, name: str | None = None, page_size: int = DEFAULT_PAGE_SIZE
@@ -189,15 +239,27 @@ class RagFlowClient:
         Args:
             dataset_id: 数据集 ID。
             path: 本地文件路径（支持中文名，按 UTF-8 字节数校验长度）。
-            parser_config: 可选的解析配置覆盖。
+            parser_config: 只允许 ``table_column_mode`` / ``table_column_roles``；
+                其余键由上传接口静默丢弃，故这里显式拒绝，见 ``_UPLOAD_PARSER_CONFIG_KEYS``。
 
         Returns:
             上传后的文档信息（``run`` 初始为 ``UNSTART``）。
 
         Raises:
-            ValidationFailedError: 文件不存在或文件名超过 255 字节。
+            ValidationFailedError: 文件不存在、文件名超过 255 字节，或 ``parser_config``
+                含上传接口不支持的键。
             KnowledgeError: 上传失败。
         """
+        if parser_config:
+            unsupported = sorted(set(parser_config) - _UPLOAD_PARSER_CONFIG_KEYS)
+            if unsupported:
+                raise ValidationFailedError(
+                    f"上传接口不支持 parser_config 键: {', '.join(unsupported)}",
+                    detail=(
+                        "v0.27.2 的上传接口只认 table_column_mode / table_column_roles；"
+                        "其余解析配置请经 ensure_dataset 设在数据集上。"
+                    ),
+                )
         if not path.is_file():
             raise ValidationFailedError(
                 f"待上传文件不存在: {path}", detail="请检查入库源路径与文件名。"
@@ -375,9 +437,81 @@ class RagFlowClient:
                 break
             page_no += 1
 
+    async def download_document_image(self, image_id: str, *, max_bytes: int) -> bytes:
+        """下载切分关联的图片（ADR-0004）。
+
+        Args:
+            image_id: RAGFlow 的 ``img_id``，形如 ``{dataset_id}-{chunk_id}``。
+            max_bytes: 单张图片的字节上限，超限立即中止下载。
+
+        Returns:
+            通过魔数校验的图片原始字节。
+
+        Raises:
+            ValidationFailedError: ``image_id`` 非法、超出大小上限，或响应不是图片。
+            KnowledgeError: 传输失败或服务端业务错误（含"图片不存在"）。
+        """
+        if not _IMAGE_ID_PATTERN.match(image_id) or ".." in image_id:
+            raise ValidationFailedError(
+                f"非法图片 ID: {image_id!r}",
+                detail="图片 ID 由 RAGFlow 生成，格式为 {dataset_id}-{chunk_id}。",
+            )
+        path = f"/api/v1/documents/images/{image_id}"
+
+        async def _call() -> bytes:
+            return await self._stream_image(path, max_bytes)
+
+        try:
+            # tenacity 的装饰结果在类型上退化为 Callable[..., Any]，这里显式收窄
+            payload: bytes = await self._retry(_call)()
+        except httpx.TimeoutException as exc:
+            raise KnowledgeError(
+                f"下载切分图片超时: {image_id}", detail="文档服务响应超时，请稍后重试。"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            raise _map_http_status(exc.response, path) from exc
+        except httpx.TransportError as exc:
+            raise KnowledgeError(
+                f"下载切分图片连接失败: {image_id}（{type(exc).__name__}）",
+                detail="文档服务当前不可达，请确认 RAGFlow 容器已启动。",
+            ) from exc
+        mime = detect_image_mime(payload)
+        if mime is None:
+            raise _map_image_payload_error(payload, path)
+        return payload
+
     # ------------------------------------------------------------------
     # 传输层
     # ------------------------------------------------------------------
+    async def _stream_image(self, path: str, max_bytes: int) -> bytes:
+        """流式读取图片端点（带大小上限）。
+
+        **不能复用** ``_request``：该端点成功时返回原始二进制，而错误时沿用
+        RAGFlow 的"HTTP 200 + JSON 业务包"约定，两者只能靠正文区分（见模块文档）。
+        4xx/5xx 的映射与重试语义与 ``_request`` 保持一致。
+        """
+        async with self._client.stream(
+            "GET",
+            f"{self._base_url}{path}",
+            headers=self._headers,
+            timeout=self._image_timeout_s,
+        ) as response:
+            if response.status_code in {408, 425, 429} or response.status_code >= 500:
+                await response.aread()
+                response.raise_for_status()
+            if response.status_code >= 400:
+                await response.aread()
+                raise _map_http_status(response, path)
+            buffer = bytearray()
+            async for chunk in response.aiter_bytes():
+                buffer.extend(chunk)
+                if len(buffer) > max_bytes:
+                    raise ValidationFailedError(
+                        f"切分图片超过上限 {max_bytes} 字节",
+                        detail="请调整 EVIDENCE_IMAGE_MAX_BYTES，或把该文档移出多模态子集。",
+                    )
+        return bytes(buffer)
+
     async def _request(
         self,
         method: str,
@@ -480,6 +614,29 @@ def _map_business_code(code: Any, message: str, path: str) -> AgentPlatformError
     return KnowledgeError(
         f"RAGFlow 返回业务错误 code={code}: {path}（{message}）",
         detail="文档服务未能完成本次操作。",
+    )
+
+
+def _map_image_payload_error(payload: bytes, path: str) -> AgentPlatformError:
+    """图片端点返回的内容不是白名单内的图片。
+
+    v0.27.2 的图片端点在"图片不存在"时返回 **HTTP 200** 的 JSON 业务包
+    （``document_api.py:get_document_image`` → ``get_data_error_result``），
+    所以只能靠正文判定：先按业务包解一次，解不出来再当作内容损坏。
+    """
+    if not payload:
+        return ValidationFailedError(
+            f"RAGFlow 返回空图片: {path}", detail="图片内容为空，已中止入库。"
+        )
+    try:
+        body = json.loads(payload)
+    except ValueError:
+        body = None
+    if isinstance(body, dict) and "code" in body:
+        return _map_business_code(body.get("code"), str(body.get("message", "")), path)
+    return ValidationFailedError(
+        f"RAGFlow 返回的内容不是受支持的图片: {path}",
+        detail="仅接受 JPEG / PNG / WEBP / GIF / BMP / TIFF 的原始字节。",
     )
 
 

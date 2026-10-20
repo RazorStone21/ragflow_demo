@@ -21,6 +21,7 @@ from agent_platform.core.errors import (
     UnauthorizedError,
     ValidationFailedError,
 )
+from agent_platform.core.retry import build_retry
 from agent_platform.knowledge.ragflow_client import FILE_NAME_MAX_BYTES, RagFlowClient
 from agent_platform.knowledge.ragflow_schemas import ParseStatus
 from agent_platform.settings import Settings
@@ -174,6 +175,56 @@ async def test_ensure_dataset_rejects_response_without_id() -> None:
         await _client(handler).ensure_dataset("gov_policy")
 
 
+async def test_ensure_dataset_passes_parser_config_on_create() -> None:
+    """新建数据集时把解析配置带进 POST（上传接口不收这些键，见 ADR-0004）。"""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            captured.update(json.loads(request.content))
+            return _ok({"id": "ds_new", "name": "gov_policy"})
+        return _ok([])
+
+    config = {"layout_recognize": "DeepDOC", "chunk_token_num": 512}
+    dataset_id = await _client(handler).ensure_dataset("gov_policy", parser_config=config)
+
+    assert dataset_id == "ds_new"
+    assert captured["parser_config"] == config
+
+
+async def test_ensure_dataset_updates_parser_config_when_exists() -> None:
+    """已存在的数据集走 PUT 收敛解析配置，不重复创建。"""
+    seen: list[str] = []
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        if request.method == "PUT":
+            captured.update(json.loads(request.content))
+            return _ok(True)
+        return _ok([{"id": "ds1", "name": "gov_policy"}])
+
+    config = {"layout_recognize": "DeepDOC"}
+    dataset_id = await _client(handler).ensure_dataset("gov_policy", parser_config=config)
+
+    assert dataset_id == "ds1"
+    assert seen == ["GET /api/v1/datasets", "PUT /api/v1/datasets/ds1"]
+    assert captured == {"parser_config": config}
+
+
+async def test_ensure_dataset_without_parser_config_sends_no_update() -> None:
+    """未提供解析配置时不发 PUT：没有配置要收敛，就别去动数据集。"""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        return _ok([{"id": "ds1", "name": "gov_policy"}])
+
+    await _client(handler).ensure_dataset("gov_policy")
+
+    assert seen == ["GET /api/v1/datasets"]
+
+
 # ---------------------------------------------------------------------------
 # 上传与解析
 # ---------------------------------------------------------------------------
@@ -214,6 +265,40 @@ async def test_upload_document_rejects_long_filename_by_bytes(tmp_path: Path) ->
 
     with pytest.raises(ValidationFailedError, match="文件名超过"):
         await _client(lambda request: _ok([])).upload_document("ds1", source)
+
+
+@pytest.mark.parametrize("key", ["layout_recognize", "image_context_size", "chunk_token_num"])
+async def test_upload_document_rejects_unsupported_parser_config(tmp_path: Path, key: str) -> None:
+    """上传接口只白名单 table_column_*，其余键显式拒绝而不是静默丢弃。
+
+    v0.27.2 的 ``document_api.py`` 用 ``allowed_keys`` 过滤，传错位置不会有任何报错，
+    解析配置看起来"设了"实际没生效——所以必须在这里失败。
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("非法 parser_config 不应发出请求")
+
+    source = tmp_path / "政策.pdf"
+    source.write_bytes(b"%PDF-1.4 fake")
+    with pytest.raises(ValidationFailedError, match="不支持 parser_config 键"):
+        await _client(handler).upload_document("ds1", source, parser_config={key: "x"})
+
+
+async def test_upload_document_sends_whitelisted_parser_config(tmp_path: Path) -> None:
+    """白名单键照常发给上传接口。"""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = request.content
+        return _ok([_doc("d1", run="UNSTART")])
+
+    source = tmp_path / "表格.csv"
+    source.write_bytes(b"a,b\n1,2\n")
+    await _client(handler).upload_document(
+        "ds1", source, parser_config={"table_column_mode": "manual"}
+    )
+
+    assert b"table_column_mode" in captured["body"]
 
 
 async def test_start_parsing_posts_document_ids() -> None:
@@ -309,6 +394,108 @@ async def test_delete_documents_reports_deleted_count() -> None:
         return _ok({"deleted": 1})
 
     assert await _client(handler).delete_documents("ds1", ["d1"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# 切分图片下载（ADR-0004）
+# ---------------------------------------------------------------------------
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+"""最小 PNG 魔数样本：只需通过魔数识别，不是可解码图片。"""
+
+
+async def test_download_document_image_returns_raw_bytes() -> None:
+    """成功时返回原始二进制；Content-Type 不作为判据（靠魔数）。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/documents/images/ds1-k1"
+        return httpx.Response(
+            200, content=_PNG, headers={"content-type": "application/octet-stream"}
+        )
+
+    payload = await _client(handler).download_document_image("ds1-k1", max_bytes=1024)
+    assert payload == _PNG
+
+
+async def test_download_document_image_maps_json_error_body() -> None:
+    """ "图片不存在"是 HTTP 200 + JSON 业务包，必须按正文识别而不是当成图片。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": 102, "message": "Image not found."})
+
+    with pytest.raises(ValidationFailedError, match="参数非法"):
+        await _client(handler).download_document_image("ds1-k1", max_bytes=1024)
+
+
+async def test_download_document_image_rejects_non_image() -> None:
+    """200 且正文不是图片、也不是业务包时显式失败。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"<html>not an image</html>")
+
+    with pytest.raises(ValidationFailedError, match="不是受支持的图片"):
+        await _client(handler).download_document_image("ds1-k1", max_bytes=1024)
+
+
+async def test_download_document_image_rejects_empty_body() -> None:
+    """空正文是"图片损坏"而不是"空图片证据"。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"")
+
+    with pytest.raises(ValidationFailedError, match="空图片"):
+        await _client(handler).download_document_image("ds1-k1", max_bytes=1024)
+
+
+async def test_download_document_image_stops_at_size_cap() -> None:
+    """超过字节上限即中止，不把整张图收进来再判断。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_PNG + b"\x00" * 2048)
+
+    with pytest.raises(ValidationFailedError, match="超过上限"):
+        await _client(handler).download_document_image("ds1-k1", max_bytes=1024)
+
+
+@pytest.mark.parametrize("image_id", ["", "nohyphen", "-k1", "ds1-", "../ds1-k1", "ds1-k/1"])
+async def test_download_document_image_rejects_bad_id(image_id: str) -> None:
+    """非法图片 ID 在发请求前失败（ID 来自外部响应，默认不可信）。"""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("非法图片 ID 不应发出请求")
+
+    with pytest.raises(ValidationFailedError, match="非法图片 ID"):
+        await _client(handler).download_document_image(image_id, max_bytes=1024)
+
+
+async def test_download_document_image_404_is_not_retried() -> None:
+    """4xx 不重试：图片不存在重试也只是再查一遍。"""
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        return httpx.Response(404, json={"code": 404})
+
+    with pytest.raises(NotFoundError):
+        await _client(handler).download_document_image("ds1-k1", max_bytes=1024)
+    assert attempts["n"] == 1
+
+
+async def test_download_document_image_retries_transient_status() -> None:
+    """5xx 在有重试预算时重试并最终成功（与 ``_request`` 同一套策略）。"""
+    attempts = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return httpx.Response(503, json={"code": 100, "message": "busy"})
+        return httpx.Response(200, content=_PNG)
+
+    client = _client(handler)
+    # 测试里把退避压到毫秒级：重试策略本身由 test_retry 覆盖，这里只验证接线。
+    client._retry = build_retry(max_attempts=3, initial_wait_s=0.001, max_wait_s=0.01)
+
+    assert await client.download_document_image("ds1-k1", max_bytes=1024) == _PNG
+    assert attempts["n"] == 2
 
 
 # ---------------------------------------------------------------------------

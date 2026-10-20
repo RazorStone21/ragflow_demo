@@ -71,6 +71,11 @@ class ChunkInfo(BaseModel):
 
     ``positions`` 为 ``[页号(1 起), left, right, top, bottom]`` 的 5 元组列表，
     由 RAGFlow ``add_positions()`` 生成；纯文本切分可能为空列表。
+
+    ``image_id`` 与 ``doc_type_kwd`` 的取值规律见 ADR-0004：前者形如
+    ``{dataset_id}-{chunk_id}``，任一位置都可能出现连字符，只能按**首个**
+    连字符拆分；后者经典 ``naive`` 解析器只会写 ``table`` / ``image``，
+    其余回落为 ``text``。
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -81,6 +86,12 @@ class ChunkInfo(BaseModel):
     docnm_kwd: str = Field(default="", description="所属文档名（RAGFlow 字段名）")
     positions: list[list[int]] = Field(default_factory=list, description="位置信息")
     available: bool = Field(default=True, description="是否可用（未被人为禁用）")
+    image_id: str = Field(
+        default="", max_length=256, description="切分关联图片 ID（空串表示无图，ADR-0004）"
+    )
+    doc_type_kwd: str = Field(
+        default="", max_length=32, description="切分媒介类型：table / image / text（ADR-0004）"
+    )
 
 
 class DocumentPage(BaseModel):
