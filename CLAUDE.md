@@ -6,8 +6,8 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | **v1.4.0** |
-| 生效日期 | 2026-10-17 |
+| 文档版本 | **v1.5.0** |
+| 生效日期 | 2026-10-20 |
 | 状态 | Active（强制执行） |
 | 适用范围 | 企业级智能体平台后端、智能体应用、MCP 工具服务、RAG/知识服务、部署与评估流水线 |
 | 编排主干（已锁定） | **LangGraph 1.x**（详见 [第 1 章](#1-技术栈锁定)、[ADR-0001](docs/adr/0001-langgraph-as-orchestration-backbone.md)） |
@@ -54,6 +54,8 @@
 | 向量库 | **Milvus**（生产） / **pgvector**（轻量单机） | Milvus 2.6（本仓落地 **v2.6.24** standalone） | Qdrant / Weaviate（需 ADR） | Apache-2.0 / PostgreSQL |
 | RAG 平台 | **RAGFlow**（知识后端，经 REST/MCP 调用） | v0.27+（本仓实测 **v0.27.2**，`DOC_ENGINE=infinity`、CPU） | 自研 LlamaIndex 管线；**不得用其画布替代 LangGraph 编排** | Apache-2.0（注意其附加条款） |
 | 嵌入/重排 | **Qwen3-Embedding / Qwen3-Reranker**（**生产须私有化**） | 最新稳定（**本仓演示期经网关指向云端 API，语料出域，仅限公开演示语料**——边界见 [第 7 章](#7-知识与-rag-规范)第 8 条） | bge-m3 / bge-reranker | Apache（各模型权重 License 单独确认） |
+| 解析期视觉模型 | **网关逻辑名 `vision-chat`**（RAGFlow 注册为 `vision` 类型模型并设为默认，解析时把图片转成文字描述） | 演示期经网关指向云端 Qwen3-VL；**生产必须切换为私有化 VLM**（[ADR-0004](docs/adr/0004-multimodal-document-evidence.md)） | 本地 Qwen3-VL / bge-vl（需显存与精度压测） | 模型权重 License 单独确认 |
+| 证据图片存储 | **本地文件存储**（`knowledge/images.py` 的 `ImageStore` 协议隔离） | 演示期 `local_data/evidence_images/`，按租户/文档/切分分目录 | MinIO / S3 对象存储（生产，需 ADR） | 本仓自研；对象存储按其自身许可 |
 | 知识图谱/本体 | **owlready2** + Protégé（OWL/SWRL 编辑）；GraphRAG/LightRAG 按需 | — | — | MIT/Apache |
 | 长期记忆 | **LangGraph `PostgresStore`**（默认同栈）；按需 **Mem0 / Graphiti** | — | Letta | MIT/Apache（Mem0 部分能力受限，需核实） |
 | 可观测性 | **Langfuse（自托管）** + **OpenTelemetry** | Langfuse 稳定自托管版 | LangSmith（SaaS，涉数据出域禁止）/ Arize Phoenix | Langfuse 核心 MIT |
@@ -153,9 +155,9 @@
 └── scripts/                      # 运维/数据/评测脚本（必须可重复执行、带 --help）
 ```
 
-> **落地现状（2026-10-16 核对：规范声明必须与仓库现实一致，不得据上表假设某目录已存在）**
+> **落地现状（2026-10-20 核对：规范声明必须与仓库现实一致，不得据上表假设某目录已存在）**
 >
-> **已落地**：`src/agent_platform/` 下的 `core/`、`knowledge/`、`agents/`、`api/`、`tenants/`、`guardrails/`（`sanitize.py` 不可信内容中和）、`evaluation/`、`utils/`；`tests/` 下 `unit/`、`integration/`、`evals/`（含黄金集 28 条、阈值 `config/thresholds.toml`、入库基线 `baselines/`、评审协议 `README.md`）；`scripts/`（含 `eval_run.py`、`eval_ragas.py`）、`deploy/docker/`、`deploy/k8s/`、`docs/adr/`、`docs/runbooks/`、`langgraph.json`、`docker-compose.yml`、`.claude/settings.json`。
+> **已落地**：`src/agent_platform/` 下的 `core/`、`knowledge/`（含证据图片本地存储 `images.py`，ADR-0004）、`agents/`、`api/`、`tenants/`、`guardrails/`（`sanitize.py` 不可信内容中和）、`evaluation/`、`utils/`；`tests/` 下 `unit/`、`integration/`、`evals/`（含黄金集 28 条、阈值 `config/thresholds.toml`、入库基线 `baselines/`、评审协议 `README.md`）；`scripts/`（含 `eval_run.py`、`eval_ragas.py`）、`deploy/docker/`、`deploy/k8s/`、`docs/adr/`、`docs/runbooks/`、`langgraph.json`、`docker-compose.yml`、`.claude/settings.json`。
 >
 > **`evaluation/` 的落地范围（2026-10-16 起，此前列为空壳）**：已具备**确定性判分器**（引用完整性、状态、拒答、租户隔离、提示词卫生、检索命中；零 I/O 零网络）、**裁判层**（版本化提示词资产 + 判分缓存 + 原始输出留痕）、**门禁判定与基线对比**（含配置漂移检测与 `--promote-baseline`）、**黄金集装载与签署分流**。**尚未具备**：HITL 样例（图中无 `interrupt()`，schema 预留取值但**不编造**样例）、分路检索分数（`vector_score` / `bm25_score` 结构性未采集）、间接注入的端到端对抗夹具（需写 Milvus，默认不做）。完整清单与逐条证据见 `tests/evals/README.md` 第五节。
 >
@@ -343,6 +345,8 @@
 7. 知识库变更（切分策略、模型、Top-K、阈值、rerank）属于**检索质量变更**，必须跑评估集回归（[9.2](#92-评估门禁)）后方可上线。
 8. **双后端分工的落地形态（[ADR-0002](docs/adr/0002-ragflow-milvus-division-of-labor.md)，2026-10-16 实测跑通）**：RAGFlow 只承担**文档工程**（解析 / OCR / 版面与表格识别 / 切分 / 文档生命周期），**检索主链路自建在 Milvus**（稠密 + BM25 混合检索 → 阈值 → 重排 → 证据与引用），两者由 `knowledge/` 衔接，职责**不得互相越界**。同步的幂等键为**源文件路径 + 内容 sha256**，Milvus 主键直接沿用 RAGFlow 的 `chunk_id`（`auto_id=False`），故重复同步是 **upsert 覆盖而非新增**；**解析失败（`FAIL` / `CANCEL` / 零切分）必须显式失败并做补偿删除**，不得记成"成功但零切分"——实测发生过，其后果是这批文件被永久跳过且不留痕迹。租户过滤表达式由本平台代码构造（`knowledge/milvus_schema`），**调用方无法绕过**（NO-19）；**引用编号必须与答案正文中的编号一致**，且无证据不得给出事实性结论（NO-12）。**演示期偏离（已封边界）**：嵌入与重排经 LiteLLM 网关指向**云端 API**，语料因此出域——**仅限公开演示语料，不得用于客户数据与生产环境**；生产必须切私有化 Qwen3，切换只改网关映射、业务代码零改动（[10.1](#101-密钥与数据保护)）。
 
+9. **图片证据（[ADR-0004](docs/adr/0004-multimodal-document-evidence.md)，2026-10-20 起）**：多模态**只做在解析期**——RAGFlow 用 `vision-chat`（[第 1 章](#1-技术栈锁定)）把图片转成文字描述写进切分正文，后续嵌入、检索、答案生成全部沿用文本链路，生成模型不看像素。切分的 `media_type` 按 RAGFlow 的 `doc_type_kwd` 映射（`table` / `image`，其余为 `text`）；**`image_id` 非空就下载并附图片引用，与媒体类型无关**（PDF 正文块合并内嵌图时也带图）。图片二进制经 `ImageStore` 协议落本地文件，路径按 `{tenant_id}/{document_id}/{chunk_id}/{image_id}.{ext}` 隔离，**类型按魔数判定**、单张有字节上限、写入原子化；生产换对象存储走新 ADR。平台图片 ID 由内容 sha256 生成（`img_` + 摘要前 32 位），**RAGFlow 的 `image_id`、存储路径与对象 key 一律不得进入证据、Milvus 或 API 响应**。图片切分（`doc_type_kwd=image`）下载或落盘失败时**整份文件判失败**并走补偿删除，不得降级成"有切分无图片"的假成功；表格与正文附图允许降级为 `images=[]`，但必须记 WARNING 并计数。重入库会使旧图片 ID 失效，会话回看旧引用时按 404 处理（保留期策略见 ADR-0004 未决项）。
+
 ---
 
 ## 8. 接口（API）风格
@@ -381,6 +385,13 @@
 - 接口用途、鉴权、错误码、示例必须在 OpenAPI 中完整；DTO 即契约，**不得**出现"文档写一套、代码做一套"。
 - 破坏性接口变更必须在 PR 中说明影响面、迁移方式，并更新前端/集成方与评估用例。
 
+### 8.6 证据图片端点
+
+- 路径固定为 `GET /api/v1/threads/{thread_id}/evidence/{chunk_id}/images/{image_id}`，**只服务于会话内已出现的证据**：鉴权后校验会话归属，再从该会话检查点的 `evidence` 中精确匹配 `chunk_id` 与 `image_id`，匹配不到一律 404——包括路径非法、会话不存在、跨租户、块不在证据里、图片不属于该块、文件缺失。只有未认证返回 401。
+- **不得**提供"按知识库/文档直接取图"的端点，也不得返回对象存储签名 URL：那等于开放知识库遍历，绕开会话级租户隔离（NO-19）。
+- 成功响应必须带 `Content-Type`（白名单 MIME）、`Cache-Control: private, no-store`、`X-Content-Type-Options: nosniff` 与 `Content-Disposition: inline`。
+- 图片元数据（`ImageRef`）只随 `retrieval.evidence`、`run.completed.citations` 等既有事件带出，**不新增 SSE 事件类型**；生成证据的提示词中不得出现图片二进制、`image_id` 或 `data:` 内联内容。
+
 ---
 
 ## 9. 可观测性、评估与测试
@@ -399,6 +410,7 @@
 - **以下变更必须跑评估回归并达标方可合入/上线**：Prompt 改动、模型/温度、检索策略（切分/Top-K/阈值/rerank/embedding）、工具描述、图结构、护栏策略。结果留痕（分数、样例、对比）。
 - 评估集与代码同库、随缺陷持续补充（每修复一个真实坏例，沉淀为回归用例）；不得用训练/评估同源数据"自评自满"。
 - **本仓落地形态（2026-10-16，[ADR-0003](docs/adr/0003-evaluation-framework-and-judge.md)）**：判分分两层——**确定性判分器**（引用完整性、状态、拒答、租户隔离、提示词卫生、检索命中；零 I/O 零网络、可离线单测）为主干，**模型裁判**只用于确定性判分覆盖不到的语义项（`faithfulness` / `answer_relevancy`）。**RAGAS 经授权使用但以隔离环境离线判分器的形态落地**（它无条件依赖已归档的 `langchain-community`，违反 NO-14，见第 1 章脚注）；**交付物不得引入 `langchain-community`**。裁判与生成同源时必须在产物与报告中显著标注偏置，**不得当中性分数**使用。阈值放 `tests/evals/config/thresholds.toml`，**刻意不进 `settings.py`**——环境变量意味着可以一行 `export` 把门禁调松而产物里看不出区别；文件则必经一次提交、一次评审。**评估不得进入 pre-commit**（慢、要密钥、要基础设施，放进去只会训练人加 `--no-verify`）。**门禁语义不得放宽**：指标未被采集（样本量不足或该指标本轮缺席）一律**不判通过**——"没采够就是没证据"，与 NO-12 同一条道理。**"没测出来"必须与"考砸了"分开建模**：测量本身失败（裁判输出无法解析、超时等）的指标**不得带分数**，必须在契约里与 `fail`/`not_applicable` 并列成第三种取值；把它记成 `0.0` 等于凭空造一个数据点，一次测量故障会被读成一次质量回归——首份基线对比时真实发生过（`faithfulness` 被压低 1/23，报告显示"跌破"、样例进"新失败样例"，而模型什么都没做错）。**未采集仍不判通过**（可见性一分不减），但不得污染聚合分。
+- **图片证据的两项确定性指标（ADR-0004）**：`image_evidence_hit`（按文档名 + 页码核对证据里是否出现应命中的图片，**不要求** `media_type=image`——RAGFlow 会把 VLM 描述过的图标成 `table`）与 `image_citation_integrity`（引用的图片必须与对应证据逐张一致，缺图、多图、错图均判失败）。两者都走三态语义：无此类样例时为 `not_applicable`，测量本身失败时不得带分数。没有 `must_hit` 的样例不参与命中率分母。
 - **评估层的依赖方向**：`evaluation → agents/core/knowledge/settings`，**任何运行时模块不得 import 评估层**（否则生产镜像多背一份评估资产，且"生产路径依赖评估代码"会让评估的独立性消失）。
 
 ### 9.3 测试分层与门禁
@@ -422,7 +434,7 @@
 
 ### 10.2 多租户与权限
 
-- 全链路租户上下文：`thread_id`、记忆 namespace、向量检索过滤、对象存储路径、审计日志都按 `tenant_id/user_id` 隔离；数据库层启用 **Postgres 行级安全（RLS）** 作为纵深防线，不仅靠应用层 where。
+- 全链路租户上下文：`thread_id`、记忆 namespace、向量检索过滤、对象存储路径、**证据图片目录**（`{tenant_id}/{document_id}/…`，路径组件校验后 `resolve` 越界检查）、审计日志都按 `tenant_id/user_id` 隔离；数据库层启用 **Postgres 行级安全（RLS）** 作为纵深防线，不仅靠应用层 where。
 - 工具与知识按最小权限授权；高危动作须角色校验 + HITL；越权访问必须拒绝并记录安全事件。
 - 不得信任前端传入的租户/用户标识，一律以认证令牌解析结果为准。
 
