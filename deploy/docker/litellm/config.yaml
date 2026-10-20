@@ -115,6 +115,43 @@ model_list:
       temperature: 0.0
       max_tokens: 1024
 
+  # ---------------------------------------------------------------------------
+  # vision-chat：多模态解析期的图片理解（ADR-0004）
+  #
+  # 【调用方是 RAGFlow，不是本仓业务代码】RAGFlow 的 `layout_recognize` 在解析
+  # 扫描件/内嵌图/表格时，把整页或图片交给视觉模型生成描述，描述进入 chunk 的
+  # `content`，后续检索与答案生成仍是纯文本链路。RAGFlow 侧以 OpenAI-API-
+  # Compatible 模型接入本网关（见 docs/runbooks/ragflow_setup.md），模型名填
+  # `vision-chat`，因此换型同样只改本文件。
+  #
+  # 【provider 选择理由同 embedding】LiteLLM 没有 SiliconFlow 原生 provider，
+  # 其 /v1/chat/completions 是标准 OpenAI 形状，故走 openai/ 前缀 + 自定义
+  # api_base；图片以 OpenAI 的 image_url + base64 data URL 传递。
+  #
+  # 【已运行时验证（2026-10-20）】在网关容器内向 localhost:4000 发一张 160×80 的
+  # 测试 PNG（白底黑色矩形），`model=vision-chat`，上游返回
+  # `一个黑色的长方形。`，HTTP 200，响应 model 字段为 vision-chat。这一条同时
+  # 证明了：模型 ID 在售、网关透传 data URL、上游按 OpenAI 形状解析图片。
+  #
+  # 【温度 0 的理由】图片描述是检索证据的一部分，同一张图两次解析得到不同描述
+  # 会让证据不可复现；且评估基线按解析产物冻结。
+  #
+  # 【演示期边界】该路由指向云端 API，图片内容因此出域。仅限公开演示语料
+  # （与 embedding/rerank 同一约束），不得用于客户数据；生产切私有化 VLM 时
+  # 只改本文件（CLAUDE.md 10.1，ADR-0004）。
+  # ---------------------------------------------------------------------------
+  - model_name: vision-chat
+    litellm_params:
+      model: openai/Qwen/Qwen3-VL-30B-A3B-Instruct
+      api_base: https://api.siliconflow.cn/v1
+      api_key: os.environ/SILICONFLOW_API_KEY
+      temperature: 0.0
+      max_tokens: 1024
+    model_info:
+      # 供网关的模型能力查询与路由使用；LiteLLM 对 openai/ 自定义端点不会自动
+      # 推断图像能力，显式声明避免调用方据此过滤掉该模型。
+      supports_vision: true
+
 # -----------------------------------------------------------------------------
 # 刻意不配置的项，以及原因（留白比配错更需要说明）：
 #
