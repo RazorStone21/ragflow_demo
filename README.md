@@ -45,8 +45,7 @@ uv run python scripts/ingest.py --source "e:\BaiduNetdiskDownload\gov_doc" --sub
 uv run python scripts/ingest.py --source "e:\BaiduNetdiskDownload\gov_doc" --subset scripts/multimodal_subset.txt
 
 # 5) 起 API。main.py 没有模块级 app，所以用工厂形态
-uv run uvicorn --factory agent_platform.main:create_app \
-    --loop asyncio:SelectorEventLoop --host 127.0.0.1 --port 8000
+uv run uvicorn --factory agent_platform.main:create_app --loop asyncio:SelectorEventLoop --host 127.0.0.1 --port 8000
 #    Windows 必须带 --loop asyncio:SelectorEventLoop，否则 psycopg 异步连接会抛
 #    InterfaceError；Linux 默认就是 Selector。
 
