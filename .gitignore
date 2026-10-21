@@ -53,6 +53,6 @@ desktop.ini
 # --- 日志 ---
 *.log
 logs/
-草稿纸.txt
+草稿纸.md
 # 演示稿二进制；文字版见 docs/introduce.md
 ragflow-demo-intro.pptx
