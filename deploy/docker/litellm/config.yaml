@@ -115,6 +115,9 @@ model_list:
   #
   # 【max_tokens=4096】与 evaluation/judge.py 的默认值一致：faithfulness 要为
   # 答案里的每条断言输出一条判定，长答案会被截断。改这里要同步改应用侧。
+  # 注意这只是**路由默认**：调用方自带 max_tokens 时会被覆盖。RAGAS 的
+  # llm_factory 默认 1024，故 evaluation/ragas_backend.py 显式传 4096——
+  # 只改本文件抬不高它的上限（实测：1024 截断导致 IncompleteOutputException）。
   #
   # 【必须关闭思考模式（2026-10-21 实测）】Qwen3.5 默认开思考：一句
   # `{"ok": true}` 也要 204 个输出 token（其中 198 个是思考 token）。RAGAS 的
