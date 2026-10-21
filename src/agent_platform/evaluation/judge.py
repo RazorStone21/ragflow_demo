@@ -311,6 +311,7 @@ class CitationJudge:
         upstream_model: str = "",
         max_tokens: int = 8192,
         cache_enabled: bool = True,
+        response_format: str = "",
     ) -> None:
         """
         Args:
@@ -325,14 +326,20 @@ class CitationJudge:
                 这样 ``JudgeSnapshot.max_tokens`` 能如实代表两套裁判。
             cache_enabled: ``False`` 时完全绕过缓存（``--no-judge-cache``），
                 用于核对缓存是否污染了本轮分数。
+            response_format: 上游输出约束（如 ``json_object``）；空串表示不约束。
+                它改变模型输出方式，故必须进快照与缓存键——否则同一模型、同一
+                提示词的旧判定会在换了约束后继续被当作本轮结果。
         """
         self._model = model
         self._logical_name = logical_name
         self._upstream_model = upstream_model
         self._model_key = f"{logical_name}@{upstream_model}"
+        if response_format:
+            self._model_key += f"|response_format={response_format}"
         self._cache = JudgeCache(cache_dir)
         self._cache_enabled = cache_enabled
         self._max_tokens = max_tokens
+        self._response_format = response_format
 
     @property
     def logical_name(self) -> str:
@@ -348,6 +355,7 @@ class CitationJudge:
             max_tokens=self._max_tokens,
             prompt_version=CITATION_JUDGE_PROMPT,
             upstream_model=self._upstream_model,
+            response_format=self._response_format,
             caveat=CLOUD_JUDGE_CAVEAT,
         )
 

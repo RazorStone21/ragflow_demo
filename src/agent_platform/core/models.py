@@ -81,10 +81,14 @@ def _make_chat_openai(
     temperature: float,
     max_tokens: int | None,
     http_async_client: httpx.AsyncClient,
+    model_kwargs: dict[str, Any] | None = None,
 ) -> ChatOpenAI:
     """构造指向 LiteLLM 网关的 ``ChatOpenAI``（内部复用）。"""
     # 参数名与 langchain-openai 的字段 alias 对齐（base_url=openai_api_base 的 alias、
     # timeout=request_timeout 的 alias、max_completion_tokens=max_tokens 的 alias，已实测）。
+    extra: dict[str, Any] = {}
+    if model_kwargs:
+        extra["model_kwargs"] = model_kwargs
     return ChatOpenAI(
         model=logical_name,
         base_url=settings.litellm_base_url,
@@ -96,6 +100,7 @@ def _make_chat_openai(
         # 必须显式注入：不传就会走宿主系统代理（见 build_http_async_client 的实测说明）。
         # 节点一律走 async（ainvoke/astream），因此只需异步客户端。
         http_async_client=http_async_client,
+        **extra,
     )
 
 
@@ -106,6 +111,7 @@ def build_chat_model(
     temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int | None = None,
     use_fallback: bool = True,
+    model_kwargs: dict[str, Any] | None = None,
 ) -> ChatModel:
     """构造聊天模型（可选挂载应用层 fallback 链）。
 
@@ -118,6 +124,9 @@ def build_chat_model(
             生成侧用默认 ``True``；**裁判必须传 ``False``**——换裁判型号等于换
             测量工具，不能由一次网关抖动悄悄换成另一个模型来判分
             （CLAUDE.md 9.2"裁判模型固定并记录版本"）。
+        model_kwargs: 透传给上游请求的附加参数（如裁判用的
+            ``{"response_format": {"type": "json_object"}}``）。只放**输出约束**
+            这类与逻辑名无关的参数；型号差异仍应收敛在网关配置。
 
     Returns:
         满足 ``ChatModel`` 协议的模型对象；配置了 ``FALLBACK_CHAT_MODEL`` 且
@@ -132,6 +141,7 @@ def build_chat_model(
         temperature=temperature,
         max_tokens=max_tokens,
         http_async_client=http_async_client,
+        model_kwargs=model_kwargs,
     )
     if not use_fallback:
         return primary
@@ -144,6 +154,7 @@ def build_chat_model(
         temperature=temperature,
         max_tokens=max_tokens,
         http_async_client=http_async_client,
+        model_kwargs=model_kwargs,
     )
     chain: Runnable[Any, Any] = primary.with_fallbacks([fallback])
     return _RunnableChatModelAdapter(chain)

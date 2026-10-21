@@ -8,6 +8,7 @@ from typing import Any, cast
 import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk
 from langchain_core.runnables import Runnable, RunnableConfig
+from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
 from agent_platform.core.errors import ModelGatewayError, ModelTimeoutError
@@ -254,3 +255,18 @@ def test_build_chat_model_ignores_fallback_equal_to_primary() -> None:
 
     assert isinstance(model, ChatModel)
     assert not isinstance(model, _RunnableChatModelAdapter)
+
+
+def test_build_chat_model_passes_output_constraints_to_upstream() -> None:
+    """JSON 模式等输出约束必须进 ``model_kwargs``，否则请求不会带上它。
+
+    引用裁判用它把"模型偶发写出未转义引号"挡在传输层（2026-10-21）。
+    """
+    model = build_chat_model(
+        _settings(),
+        use_fallback=False,
+        model_kwargs={"response_format": {"type": "json_object"}},
+    )
+
+    assert isinstance(model, ChatOpenAI)
+    assert model.model_kwargs == {"response_format": {"type": "json_object"}}

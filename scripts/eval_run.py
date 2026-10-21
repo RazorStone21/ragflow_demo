@@ -349,13 +349,24 @@ def _build_judges(settings: Settings, *, cache_enabled: bool) -> tuple[RagasJudg
         cache_dir=settings.eval_judge_cache_dir,
         cache_enabled=cache_enabled,
     )
-    chat = build_chat_model(settings, logical_name=settings.judge_model, use_fallback=False)
+    chat = build_chat_model(
+        settings,
+        logical_name=settings.judge_model,
+        use_fallback=False,
+        # 引用裁判返回的是 JSON 对象。模型有时在 reason 里写中文引号配对的原文，
+        # 却把收尾打成 ASCII 双引号，字符串被提前终止、括号不配平——这不是截断，
+        # 重试也修不好（2026-10-21 全量评估实测两次同样失败）。JSON 模式由上游
+        # 保证转义，从传输层消除这类解析失败；RAGAS 走 instructor 的结构化输出，
+        # 不需要这层。
+        model_kwargs={"response_format": {"type": "json_object"}},
+    )
     citation = CitationJudge(
         chat,
         logical_name=settings.judge_model,
         upstream_model=settings.judge_upstream_model,
         cache_dir=settings.eval_judge_cache_dir,
         cache_enabled=cache_enabled,
+        response_format="json_object",
     )
     return ragas, citation
 

@@ -123,6 +123,7 @@ def _judge(
     max_tokens: int | None = None,
     cache_enabled: bool = True,
     upstream_model: str = "",
+    response_format: str = "",
 ) -> CitationJudge:
     """构造裁判。``max_tokens`` 不传即用生产默认值——不在这里另写一份默认数字，
     否则改了 ``CitationJudge`` 的默认，测试仍会照旧通过。"""
@@ -131,6 +132,7 @@ def _judge(
         "cache_dir": tmp_path / "cache",
         "cache_enabled": cache_enabled,
         "upstream_model": upstream_model,
+        "response_format": response_format,
     }
     if max_tokens is not None:
         kwargs["max_tokens"] = max_tokens
@@ -186,6 +188,14 @@ def test_snapshot_records_upstream_model_and_cloud_caveat(tmp_path: Path) -> Non
     assert "出域" in snapshot.caveat
     assert "不同家族" in snapshot.caveat
     assert "SiliconFlow" in snapshot.caveat
+
+
+def test_snapshot_records_the_citation_output_constraint(tmp_path: Path) -> None:
+    """JSON 模式改变输出方式，必须进快照；未约束时记空串，不编造默认值。"""
+    judge = _judge(tmp_path, _ScriptedModel(_OK), response_format="json_object")
+
+    assert judge.snapshot().response_format == "json_object"
+    assert JudgeSnapshot().response_format == "", "旧产物未记录，不得当作已约束"
 
 
 def test_cache_key_changes_with_the_judge_model() -> None:
@@ -379,6 +389,26 @@ async def test_cache_disabled_bypasses_and_does_not_write(tmp_path: Path) -> Non
 
     assert len(model.calls) == 2, "缓存关闭后第二次必须重新调用"
     assert not (tmp_path / "cache").exists(), "绕过缓存时不得顺手写一份"
+
+
+async def test_cache_key_changes_with_the_output_constraint(tmp_path: Path) -> None:
+    """同一提示词换输出约束必须换缓存键：JSON 模式与纯文本模式的判定不可混用。
+
+    2026-10-21 全量评估里，引用裁判两次都在 reason 中写出未转义的 ASCII 引号，
+    JSON 因此括号不配平。修复是在网关请求上加 ``response_format=json_object``；
+    这改变了模型输出方式，旧缓存判定不能继续冒充新约束下的结果。
+    """
+    first_model = _ScriptedModel(_OK)
+    await _judge(tmp_path, first_model, response_format="json_object").score(_case(), _result())
+    assert len(first_model.calls) == 1
+
+    cached_model = _ScriptedModel(_OK)
+    await _judge(tmp_path, cached_model, response_format="json_object").score(_case(), _result())
+    assert cached_model.calls == [], "同约束应命中缓存"
+
+    plain_model = _ScriptedModel(_OK)
+    await _judge(tmp_path, plain_model, response_format="").score(_case(), _result())
+    assert len(plain_model.calls) == 1, "换了约束不得复用旧判定"
 
 
 @pytest.mark.parametrize(

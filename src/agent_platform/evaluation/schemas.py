@@ -506,6 +506,14 @@ class JudgeSnapshot(BaseModel):
             "对比时才会显形"
         ),
     )
+    response_format: str = Field(
+        default="",
+        description=(
+            "引用裁判的输出约束（如 ``json_object``，空串 = 未约束）。"
+            "它决定模型能否输出合法 JSON，属判分配置；换约束必须换缓存键并在"
+            "对比里可见。RAGAS 由 instructor 约束结构，不记在这里"
+        ),
+    )
     caveat: str = Field(
         default="",
         description="已知偏置的如实登记（如裁判与生成同源）；报告须显式展示，不得当中性分数",
