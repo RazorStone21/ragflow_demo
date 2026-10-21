@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -42,6 +43,22 @@ _RAGAS_METRICS: tuple[MetricName, ...] = (
 _SCORE_TOLERANCE = 1e-6
 """浮点余弦相似度的容差：归一化向量的点积可能出现 1+1e-16，按越界处理会误伤。"""
 
+_JUDGE_SYSTEM_PROMPT = (
+    "You are a strict evaluation judge producing machine-readable verdicts. "
+    "Follow the provided instructions and JSON schema exactly. For any reason or "
+    "explanation field, write at most one short sentence (<= 30 words) stating why "
+    "the verdict holds. Do not think step by step, do not restate the context or "
+    "the answer, do not speculate, and do not add extra fields or prose outside "
+    "the JSON object."
+)
+"""RAGAS 判分的系统提示（只约束表达，不改判定标准）。
+
+**为什么需要**：Qwen3.5 即使关掉思考（``reasoning_tokens=0``）也常把推演写进
+NLI 的 ``reason`` 字段，输出长度随上限一起膨胀——8192 时实测仍写到 3.6 万字符
+才被截断。提高上限是追不上的；必须在系统提示里明确"reason 只写一句结论"。
+这段不改变指标定义与提示词模板，只约束输出格式，故不构成判分方法变更。
+"""
+
 _JUDGE_MAX_TOKENS = 8192
 """RAGAS 单次判分的输出上限，必须显式传给 ``llm_factory``。
 
@@ -52,8 +69,9 @@ RAGAS 0.4.3 的 ``InstructorModelArgs`` 默认 ``max_tokens=1024``，而**请求
 
 4096 仍不够：Qwen3.5 即使关掉思考（诊断里 ``reasoning_tokens=0``），也常把
 推演写进 NLI 的 ``reason`` 字段（实测一份答案的判定输出涨到约 1.6 万字符才被
-截断），输出长度是重尾的。8192 给这类跑题留出余量；路由的 4096 只是默认值，
-这里必须显式覆盖。
+截断），输出长度是重尾的——8192 时甚至有写到 3.6 万字符的。真正的约束是
+``_JUDGE_SYSTEM_PROMPT``（reason 只写一句）；8192 是在此之上的余量，路由的
+4096 只是默认值，这里必须显式覆盖。
 """
 
 
@@ -220,6 +238,7 @@ class RagasScorer:
             client=self._client,
             temperature=0.0,
             max_tokens=_JUDGE_MAX_TOKENS,
+            system_prompt=_JUDGE_SYSTEM_PROMPT,
         )
         self._embeddings = embedding_factory(
             provider="openai",
@@ -264,13 +283,19 @@ class RagasScorer:
         return tuple(metric.value for metric in _RAGAS_METRICS)
 
     def cache_identity(self, metric: MetricName) -> str:
-        """缓存身份：版本 + 裁判 + 嵌入 + 指标配置（换任一即失效）。"""
+        """缓存身份：版本 + 裁判 + 嵌入 + 指标配置 + 系统约束（换任一即失效）。
+
+        系统提示会改变判分输出（进而影响分数），必须纳入缓存键；否则改了提示
+        仍命中旧分数，缓存就成了"结果是哪套标准算的"说不清的黑盒。
+        """
+        system = hashlib.sha256(_JUDGE_SYSTEM_PROMPT.encode("utf-8")).hexdigest()[:12]
         return "|".join(
             (
                 f"ragas={self.library_version}",
                 f"judge={self._judge_model}@{self._upstream_model}",
                 f"embedding={self._embedding_model}",
                 self._metric_configs[metric],
+                f"system={system}",
             )
         )
 
