@@ -674,6 +674,38 @@ async def _delete_document_best_effort(
         )
 
 
+def _drop_duplicate_chunk_ids(
+    chunks: list[ChunkInfo], *, rel_path: str
+) -> tuple[list[ChunkInfo], int]:
+    """按 ``chunk_id`` 去重，返回（唯一切分, 被丢弃条数）。
+
+    RAGFlow 的切分 ID 由内容生成：同一份表格里出现两行完全相同的空行时，
+    会产出两条**同 ID** 的切分。Milvus 的 upsert 不接受同批重复主键
+    （实测 code=1100），整份文件会因此失败；但这两条切分的内容本来就一样，
+    去重不会丢信息。保留首条并把数量记进日志，便于发现上游重复切分。
+    """
+    seen: set[str] = set()
+    unique: list[ChunkInfo] = []
+    duplicate_ids: list[str] = []
+    for chunk in chunks:
+        if chunk.id in seen:
+            duplicate_ids.append(chunk.id)
+            continue
+        seen.add(chunk.id)
+        unique.append(chunk)
+    if duplicate_ids:
+        logger.warning(
+            "切分存在重复 chunk_id，已按首条去重",
+            extra={
+                "event": "ingest.duplicate_chunk_ids",
+                "source": rel_path,
+                "duplicate_count": len(duplicate_ids),
+                "chunk_ids": duplicate_ids[:20],
+            },
+        )
+    return unique, len(duplicate_ids)
+
+
 async def collect_and_index(
     *,
     doc: DocumentInfo,
@@ -711,6 +743,20 @@ async def collect_and_index(
     async for _page_index, page in ragflow.iter_chunks(dataset_id, doc.id):
         # 被人工禁用的切分不入索引：它不应作为回答依据出现。
         available_chunks.extend(chunk for chunk in page.chunks if chunk.available)
+
+    available_chunks, duplicate_chunk_count = _drop_duplicate_chunk_ids(
+        available_chunks, rel_path=rel_path
+    )
+    if duplicate_chunk_count:
+        logger.info(
+            "切分去重后继续入库",
+            extra={
+                "event": "ingest.chunks_deduped",
+                "source": rel_path,
+                "document_id": doc.id,
+                "duplicate_chunk_ids": duplicate_chunk_count,
+            },
+        )
 
     available_chunks = await _enrich_doc_types(
         available_chunks,

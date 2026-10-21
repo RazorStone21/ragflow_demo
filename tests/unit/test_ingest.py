@@ -748,6 +748,28 @@ async def test_unavailable_and_blank_chunks_never_reach_index(
     assert set(stack["store"].rows) == {"doc-1-c0", "doc-1-c1"}
 
 
+async def test_duplicate_chunk_ids_are_dropped_before_upsert(
+    tmp_path: Path, stack: dict[str, Any], settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """同 ID 切分去重后入库：RAGFlow 对内容相同的行会给出同一 chunk_id。
+
+    实测 0190（重点流域水环境 xls）因一行全空行生成了两条同 ID 切分，
+    Milvus upsert 报 code=1100 duplicate primary keys，整份文件失败；
+    去重保留首条即可，内容相同，不丢信息，但必须留痕。
+    """
+    stack["ragflow"].extra_chunks = [make_chunk("doc-1-c0")]
+    corpus = write_corpus(tmp_path, {"a.pdf": "甲"})
+    with caplog.at_level(logging.INFO):
+        code = await ingest.run(make_args(corpus), settings)
+
+    assert code == ingest.EXIT_OK
+    assert set(stack["store"].rows) == {"doc-1-c0", "doc-1-c1"}
+    events = {log_extras(record).get("event", ""): record for record in caplog.records}
+    dedupe = log_extras(events["ingest.duplicate_chunk_ids"])
+    assert dedupe["duplicate_count"] == 1
+    assert dedupe["chunk_ids"] == ["doc-1-c0"]
+
+
 async def test_parse_failure_is_never_recorded_as_success(
     tmp_path: Path, stack: dict[str, Any], settings: Settings, caplog: pytest.LogCaptureFixture
 ) -> None:
