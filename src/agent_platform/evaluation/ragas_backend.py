@@ -42,15 +42,18 @@ _RAGAS_METRICS: tuple[MetricName, ...] = (
 _SCORE_TOLERANCE = 1e-6
 """浮点余弦相似度的容差：归一化向量的点积可能出现 1+1e-16，按越界处理会误伤。"""
 
-_JUDGE_MAX_TOKENS = 4096
+_JUDGE_MAX_TOKENS = 8192
 """RAGAS 单次判分的输出上限，必须显式传给 ``llm_factory``。
 
 RAGAS 0.4.3 的 ``InstructorModelArgs`` 默认 ``max_tokens=1024``，而**请求级**
 参数会覆盖网关路由的默认值：``judge`` 路由上写的 4096 只在不带该参数时生效。
-长结构化输出（faithfulness 逐条断言的判定、answer_correctness 的断言与裁决）
-在 1024 处被截断，instructor 见到 ``finish_reason=length`` 便抛
-``IncompleteOutputException``——测量失败、不带分数。引用裁判早已为此从 1024
-提到 4096（``judge.py`` 的 D8），RAGAS 这条路径同样不能再依赖路由默认。
+1024 会让长结构化输出直接截断，instructor 见到 ``finish_reason=length`` 就抛
+``IncompleteOutputException``——测量失败、不带分数。
+
+4096 仍不够：Qwen3.5 即使关掉思考（诊断里 ``reasoning_tokens=0``），也常把
+推演写进 NLI 的 ``reason`` 字段（实测一份答案的判定输出涨到约 1.6 万字符才被
+截断），输出长度是重尾的。8192 给这类跑题留出余量；路由的 4096 只是默认值，
+这里必须显式覆盖。
 """
 
 

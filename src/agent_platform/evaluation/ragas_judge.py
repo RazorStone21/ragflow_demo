@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from agent_platform.agents.gov_policy_qa.state import AnswerStatus
 from agent_platform.core.logging import get_logger
@@ -222,6 +223,7 @@ class RagasJudge:
                     "event": "eval.ragas_backend_failed",
                     "metric": metric.value,
                     "error": type(exc).__name__,
+                    "diagnostics": _exception_diagnostics(exc),
                 },
             )
             raws.append(_raw_section(metric, {"error": f"{type(exc).__name__}: {exc}"}))
@@ -254,6 +256,38 @@ def _graded(name: MetricName, value: float, *, cache_hit: bool) -> MetricResult:
         detail += "（缓存命中）"
     verdict = MetricVerdict.PASS if value > 0 else MetricVerdict.FAIL
     return MetricResult(name=name, verdict=verdict, score=value, detail=detail)
+
+
+def _exception_diagnostics(exc: BaseException) -> dict[str, Any]:
+    """从第三方异常里抽取计数，区分"输出预算不够"与"模型跑飞"。
+
+    ``IncompleteOutputException`` 带着 ``last_completion``；只记 token 计数与
+    结束原因，不记正文——日志不该带出问题、证据或答案原文（CLAUDE.md 3.7）。
+    非此类异常返回空字典，调用方按普通失败处理。
+    """
+    completion = getattr(exc, "last_completion", None)
+    if completion is None:
+        return {}
+    diagnostics: dict[str, Any] = {}
+    usage = getattr(completion, "usage", None)
+    if usage is not None:
+        for field in ("prompt_tokens", "completion_tokens"):
+            value = getattr(usage, field, None)
+            if value is not None:
+                diagnostics[field] = value
+        details = getattr(usage, "completion_tokens_details", None)
+        reasoning = getattr(details, "reasoning_tokens", None) if details else None
+        if reasoning is not None:
+            diagnostics["reasoning_tokens"] = reasoning
+    choices = getattr(completion, "choices", None) or []
+    if choices:
+        choice = choices[0]
+        diagnostics["finish_reason"] = getattr(choice, "finish_reason", None)
+        message = getattr(choice, "message", None)
+        content = getattr(message, "content", None) if message else None
+        if isinstance(content, str):
+            diagnostics["content_chars"] = len(content)
+    return diagnostics
 
 
 def _measurement_error(name: MetricName, reason: str) -> MetricResult:

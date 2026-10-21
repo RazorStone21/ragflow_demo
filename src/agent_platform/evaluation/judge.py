@@ -309,7 +309,7 @@ class CitationJudge:
         logical_name: str,
         cache_dir: Path,
         upstream_model: str = "",
-        max_tokens: int = 4096,
+        max_tokens: int = 8192,
         cache_enabled: bool = True,
     ) -> None:
         """
@@ -321,6 +321,8 @@ class CitationJudge:
                 不参与路由）。型号只来自配置 ``JUDGE_UPSTREAM_MODEL``。
             max_tokens: 单次裁判输出上限。引用裁判按"每条引用一句理由"输出，
                 上限给宽不增加正常开销，只把截断风险推远（D8 的教训）。
+                与 RAGAS 路径取同一个值（``evaluation/ragas_backend.py``），
+                这样 ``JudgeSnapshot.max_tokens`` 能如实代表两套裁判。
             cache_enabled: ``False`` 时完全绕过缓存（``--no-judge-cache``），
                 用于核对缓存是否污染了本轮分数。
         """

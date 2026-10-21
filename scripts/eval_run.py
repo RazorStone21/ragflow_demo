@@ -364,7 +364,7 @@ def _combined_snapshot(citation: JudgeSnapshot, ragas: RagasJudge) -> JudgeSnaps
     """把 RAGAS 的测量工具信息并进引用裁判的快照。
 
     一份产物只有一个 ``JudgeSnapshot``：两套裁判共用同一个网关 ``judge`` 路由，
-    拆成两份只会让"谁判的"这个问题出现两个答案。``max_tokens`` 记 4096：两套
+    拆成两份只会让"谁判的"这个问题出现两个答案。``max_tokens`` 记 8192：两套
     裁判都**显式**传该值（RAGAS 的 ``llm_factory`` 默认只有 1024，请求级参数
     会覆盖网关路由默认，故不能依赖路由）。它是"测量失败"发生频率的诱因，
     必须与分数一并留痕。

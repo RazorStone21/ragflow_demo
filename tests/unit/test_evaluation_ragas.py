@@ -18,6 +18,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -34,7 +35,7 @@ from agent_platform.evaluation.ragas_backend import (
     _strict_correctness_class,
     canonical_request,
 )
-from agent_platform.evaluation.ragas_judge import RagasJudge
+from agent_platform.evaluation.ragas_judge import RagasJudge, _exception_diagnostics
 from agent_platform.evaluation.schemas import (
     CaseCategory,
     CaseResult,
@@ -542,3 +543,42 @@ def test_telemetry_is_forced_off_before_import(initial: str | None) -> None:
 
     assert completed.returncode == 0, completed.stderr
     assert completed.stdout.strip().splitlines()[-1] == "true"
+
+
+def _incomplete_exception(*, reasoning_tokens: int | None) -> Exception:
+    """构造一个带 ``last_completion`` 的截断异常（形状对齐 instructor）。"""
+    details = (
+        SimpleNamespace(reasoning_tokens=reasoning_tokens) if reasoning_tokens is not None else None
+    )
+    usage = SimpleNamespace(
+        prompt_tokens=2277,
+        completion_tokens=4096,
+        completion_tokens_details=details,
+    )
+    message = SimpleNamespace(content="x" * 120)
+    choice = SimpleNamespace(finish_reason="length", message=message)
+    completion = SimpleNamespace(usage=usage, choices=[choice])
+
+    class _IncompleteError(Exception):
+        def __init__(self) -> None:
+            super().__init__("truncated")
+            self.last_completion = completion
+
+    return _IncompleteError()
+
+
+def test_exception_diagnostics_records_counts_but_not_content() -> None:
+    """截断诊断只带计数与结束原因，正文不得进日志（CLAUDE.md 3.7）。"""
+    diagnostics = _exception_diagnostics(_incomplete_exception(reasoning_tokens=0))
+    assert diagnostics == {
+        "prompt_tokens": 2277,
+        "completion_tokens": 4096,
+        "reasoning_tokens": 0,
+        "finish_reason": "length",
+        "content_chars": 120,
+    }
+
+
+def test_exception_diagnostics_empty_for_unrelated_errors() -> None:
+    """无 ``last_completion`` 的异常不产出诊断字段，避免伪造计数。"""
+    assert _exception_diagnostics(ValueError("boom")) == {}
