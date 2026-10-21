@@ -105,6 +105,7 @@ def build_chat_model(
     logical_name: str | None = None,
     temperature: float = DEFAULT_TEMPERATURE,
     max_tokens: int | None = None,
+    use_fallback: bool = True,
 ) -> ChatModel:
     """构造聊天模型（可选挂载应用层 fallback 链）。
 
@@ -113,10 +114,14 @@ def build_chat_model(
         logical_name: 模型逻辑名；默认取 ``PRIMARY_CHAT_MODEL``。
         temperature: 采样温度；评测与事实问答应保持 0。
         max_tokens: 输出上限；``None`` 交由网关默认。
+        use_fallback: 是否在主模型失败时切到 ``FALLBACK_CHAT_MODEL``。
+            生成侧用默认 ``True``；**裁判必须传 ``False``**——换裁判型号等于换
+            测量工具，不能由一次网关抖动悄悄换成另一个模型来判分
+            （CLAUDE.md 9.2"裁判模型固定并记录版本"）。
 
     Returns:
-        满足 ``ChatModel`` 协议的模型对象；配置了 ``FALLBACK_CHAT_MODEL`` 时
-        返回主备链（主失败自动切备）。
+        满足 ``ChatModel`` 协议的模型对象；配置了 ``FALLBACK_CHAT_MODEL`` 且
+        ``use_fallback=True`` 时返回主备链（主失败自动切备）。
     """
     primary_name = logical_name or settings.primary_chat_model
     # 主备链共用同一个 HTTP 客户端：省一个连接池，且两者本就指向同一个网关。
@@ -128,6 +133,8 @@ def build_chat_model(
         max_tokens=max_tokens,
         http_async_client=http_async_client,
     )
+    if not use_fallback:
+        return primary
     fallback_name = settings.fallback_chat_model
     if not fallback_name or fallback_name == primary_name:
         return primary

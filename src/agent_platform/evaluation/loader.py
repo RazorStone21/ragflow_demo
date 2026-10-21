@@ -36,6 +36,8 @@ class CoverageReport:
     by_category: dict[CaseCategory, int]
     by_status: dict[str, int]
     missing_categories: tuple[CaseCategory, ...]
+    answerable: int = 0
+    relevance_labeled: int = 0
 
     def render(self) -> str:
         """渲染为终端可读的多行文本（脚本与测试共用同一份格式）。"""
@@ -47,9 +49,12 @@ class CoverageReport:
             ),
             "按期望状态："
             + "，".join(f"{status}={count}" for status, count in sorted(self.by_status.items())),
+            f"相关性标签：可答题 {self.answerable} 条，已签署 {self.relevance_labeled} 条",
         ]
         if self.missing_categories:
             lines.append("⚠ 类别空缺：" + "，".join(c.value for c in self.missing_categories))
+        if self.relevance_labeled < self.answerable:
+            lines.append("⚠ 仍有可答题缺少相关文档全集：检索三项不会采集，门禁判样本不足")
         return "\n".join(lines)
 
 
@@ -141,6 +146,7 @@ def coverage_report(golden: GoldenSet) -> CoverageReport:
         by_category[case.category] = by_category.get(case.category, 0) + 1
         by_status[case.expected_status.value] = by_status.get(case.expected_status.value, 0) + 1
     missing = tuple(c for c in CaseCategory if c not in by_category)
+    answerable = tuple(case for case in golden.cases if case.is_answerable)
     return CoverageReport(
         total=len(golden.cases),
         reviewed=len(golden.reviewed),
@@ -148,6 +154,8 @@ def coverage_report(golden: GoldenSet) -> CoverageReport:
         by_category=by_category,
         by_status=by_status,
         missing_categories=missing,
+        answerable=len(answerable),
+        relevance_labeled=sum(1 for case in answerable if case.has_relevance_labels),
     )
 
 

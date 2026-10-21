@@ -2,19 +2,19 @@
 
 命名沿用全仓约定 ``<用途>.<角色>.v<主版本>.jinja``：
 
-- ``faithfulness.judge.v1``：逐条核对答案的事实性断言能否由证据支撑；
-- ``relevancy.judge.v2``：答案是否直接回答了问题。v2 给"拒答是否正当"补了第三档
-  ——索要系统提示词、凭训练记忆的数据、他人隐私、其他租户的数据、无法核实的
-  条款，即使答得出也必须拒答，不得判成不当拒答。
+- ``citation.judge.v1``：逐条判定被引用证据是否支持答案中对应位置的断言。
+  faithfulness / relevancy / correctness 已由 RAGAS 承担（ADR-0006），本层只留
+  引用准确率——RAGAS 不提供这项，且它依赖本仓"引用编号 → 证据块"的产物结构。
 
 **为什么不复用 ``agents/gov_policy_qa/prompts`` 的 ``render_prompt``**：那个函数的
 模板目录由 ``files(__package__)`` 绑死在智能体自己的包里，是刻意为之（智能体的
 提示词不该被别处加载）。评估层有自己的一份加载器，两边的资产互不可见——
 裁判提示词与产品提示词的演进节奏本来就不同，共享加载器只会制造耦合。
 
-不可信内容（证据正文、模型答案）一律先经 ``guardrails.sanitize.neutralize_untrusted``
-中和再作为**数据**传入（CLAUDE.md 10.3）：裁判本身也是会被注入的目标，
-"让裁判去判断证据里有没有注入"不能成为"裁判可以被注入"的理由。
+不可信内容（证据正文、模型答案、文档名）一律先经
+``guardrails.sanitize.neutralize_untrusted`` 中和再作为**数据**传入
+（CLAUDE.md 10.3）：裁判本身也是会被注入的目标，"让裁判去判断证据里有没有注入"
+不能成为"裁判可以被注入"的理由。
 """
 
 from __future__ import annotations
@@ -26,9 +26,8 @@ from jinja2 import Environment, StrictUndefined, Template, TemplateError
 
 from agent_platform.core.errors import AgentPlatformError
 
-FAITHFULNESS_JUDGE_PROMPT = "faithfulness.judge.v1"
-RELEVANCY_JUDGE_PROMPT = "relevancy.judge.v2"
-JUDGE_PROMPT_NAMES = (FAITHFULNESS_JUDGE_PROMPT, RELEVANCY_JUDGE_PROMPT)
+CITATION_JUDGE_PROMPT = "citation.judge.v1"
+JUDGE_PROMPT_NAMES = (CITATION_JUDGE_PROMPT,)
 """本层全部裁判提示词名；``JudgeSnapshot.prompt_version`` 由它们拼出。"""
 
 
@@ -55,7 +54,7 @@ def render_prompt(name: str, /, **variables: object) -> str:
     """渲染裁判模板。
 
     Args:
-        name: 模板名（不含 ``.jinja``），如 ``FAITHFULNESS_JUDGE_PROMPT``。
+        name: 模板名（不含 ``.jinja``），如 ``CITATION_JUDGE_PROMPT``。
         **variables: 模板变量。
 
     Returns:
@@ -79,8 +78,7 @@ def render_prompt(name: str, /, **variables: object) -> str:
 
 
 __all__: list[str] = [
-    "FAITHFULNESS_JUDGE_PROMPT",
+    "CITATION_JUDGE_PROMPT",
     "JUDGE_PROMPT_NAMES",
-    "RELEVANCY_JUDGE_PROMPT",
     "render_prompt",
 ]

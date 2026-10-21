@@ -42,12 +42,30 @@ from agent_platform.evaluation.schemas import (
 )
 from agent_platform.knowledge.schemas import ImageRef
 
+_MONITOR_ONLY: frozenset[MetricName] = frozenset(
+    {MetricName.HALLUCINATION_RATE, MetricName.DOCUMENT_PRECISION_AT_K}
+)
+"""只监控、不设门禁的指标（ADR-0006）。
+
+它们在聚合分与对比报告里可见，但**不得**出现在 ``thresholds.toml`` 的
+``[thresholds]`` / ``[min_samples]`` 里——一个只用于观察的指标一旦有了下限，
+就会被读成"质量要求"，而它的定义（例如幻觉率 = 1 − Faithfulness）与门禁指标的
+语义并不等价。加载器会显式拒绝，不做静默忽略。
+"""
+
+MONITOR_ONLY_METRICS: frozenset[str] = frozenset(metric.value for metric in _MONITOR_ONLY)
+"""``_MONITOR_ONLY`` 的字符串形式；报告与脚本按指标名判断时用这个。"""
+
 
 class Thresholds(BaseModel):
     """门禁阈值与最小样本量（``tests/evals/config/thresholds.toml`` 的契约）。"""
 
     model_config = ConfigDict(frozen=True)
 
+    schema_version: int = Field(
+        default=SCHEMA_VERSION,
+        description="阈值文件结构版本；必须与产物 schema 一致，防止旧阈值被新代码静默沿用",
+    )
     thresholds: dict[MetricName, float] = Field(
         description="指标名 → 下限；未列出的指标不参与门禁（但仍在报告中展示）"
     )
@@ -190,7 +208,13 @@ def aggregate(results: Sequence[CaseResult]) -> dict[str, float]:
             if metric.verdict is MetricVerdict.NOT_APPLICABLE or metric.score is None:
                 continue
             totals.setdefault(metric.name.value, []).append(metric.score)
-    return {name: round(sum(scores) / len(scores), 4) for name, scores in sorted(totals.items())}
+    scores = {name: round(sum(values) / len(values), 4) for name, values in sorted(totals.items())}
+    # 幻觉率是派生量，不是第七个判分器。没有 faithfulness 样本时**省略**而不是记 0：
+    # 0 幻觉率读起来是"完美"，而事实是"这一轮没有可核的证据"。
+    faithfulness = scores.get(MetricName.FAITHFULNESS.value)
+    if faithfulness is not None:
+        scores[MetricName.HALLUCINATION_RATE.value] = round(1.0 - faithfulness, 4)
+    return dict(sorted(scores.items()))
 
 
 def metric_samples(results: Sequence[CaseResult]) -> dict[str, int]:
@@ -224,7 +248,17 @@ def evaluate_gate(results: Sequence[CaseResult], thresholds: Thresholds) -> Gate
     )
 
 
-_JUDGE_METRICS = frozenset({MetricName.FAITHFULNESS, MetricName.ANSWER_RELEVANCY})
+_JUDGE_METRICS = frozenset(
+    {
+        MetricName.FAITHFULNESS,
+        MetricName.ANSWER_RELEVANCY,
+        MetricName.ANSWER_CORRECTNESS,
+        MetricName.CITATION_ACCURACY,
+    }
+)
+_RAGAS_METRICS = frozenset(
+    {MetricName.FAITHFULNESS, MetricName.ANSWER_RELEVANCY, MetricName.ANSWER_CORRECTNESS}
+)
 
 
 def detect_judge_traceability_gap(artifact: EvalArtifact) -> str:
@@ -252,12 +286,24 @@ def detect_judge_traceability_gap(artifact: EvalArtifact) -> str:
         for case in artifact.cases
         for metric in case.metrics
     )
-    if not has_judge_score or artifact.run.models.judge:
-        return ""
-    return (
-        "样例里有裁判指标（faithfulness / answer_relevancy），但 run.models.judge 为空："
-        "这份产物说不清是谁判的分，不能作为基线"
+    if has_judge_score and not artifact.run.models.judge:
+        return (
+            "样例里有裁判指标（faithfulness / answer_relevancy / answer_correctness / "
+            "citation_accuracy），但 run.models.judge 为空："
+            "这份产物说不清是谁判的分，不能作为基线"
+        )
+    has_ragas_score = any(
+        metric.name in _RAGAS_METRICS
+        and metric.verdict not in (MetricVerdict.NOT_APPLICABLE, MetricVerdict.ERROR)
+        for case in artifact.cases
+        for metric in case.metrics
     )
+    if has_ragas_score and not artifact.run.judge.ragas_version:
+        return (
+            "样例里有 RAGAS 指标，但 run.judge.ragas_version 为空："
+            "RAGAS 的分数会随版本漂移，说不清版本就无法复现，不能作为基线"
+        )
+    return ""
 
 
 def render_gate(gate: Gate) -> str:
@@ -274,6 +320,12 @@ def render_gate(gate: Gate) -> str:
         if name in unmeasured:
             verdict = "未测全"
         lines.append(f"{name:<22}{_fmt(after):>9}{_fmt(floor):>9}{samples:>7}   {verdict}")
+
+    monitor = {name: gate.scores[name] for name in MONITOR_ONLY_METRICS if name in gate.scores}
+    if monitor:
+        lines.append("")
+        lines.append("监控指标（不设门禁）：")
+        lines.extend(f"  · {name}: {value:.4f}" for name, value in sorted(monitor.items()))
 
     if gate.breaches:
         lines.append("")
@@ -334,16 +386,53 @@ def load_thresholds(path: Path) -> Thresholds:
             f"阈值文件不可读或 TOML 非法: {path}（{type(exc).__name__}）", detail=str(exc)
         ) from exc
 
+    version = raw.get("schema_version")
+    if version != SCHEMA_VERSION:
+        # 旧文件缺 schema_version 时这里也会拦下：新指标表与旧门禁不是同一套语义，
+        # 静默沿用会让"没列出的指标就不设门禁"这条规则悄悄放掉新指标。
+        raise ConfigurationError(
+            f"阈值文件结构版本不匹配: {path}（文件 {version!r}，本代码要求 {SCHEMA_VERSION}）",
+            detail="按新指标表重写阈值文件后再跑评估；旧阈值不得被新代码静默沿用。",
+        )
+
     thresholds_raw = raw.get("thresholds")
     if not isinstance(thresholds_raw, dict) or not thresholds_raw:
         raise ConfigurationError(
             f"阈值文件缺少 [thresholds] 段或为空: {path}",
             detail="没有阈值等于没有门禁，必须显式给出。",
         )
+    min_samples_raw = raw.get("min_samples") or {}
+    _reject_monitor_only(thresholds_raw, path, section="thresholds")
+    _reject_monitor_only(min_samples_raw, path, section="min_samples")
     return Thresholds(
+        schema_version=version,
         thresholds=_parse_metric_map(thresholds_raw, path, cast=float),
-        min_samples=_parse_min_samples(raw.get("min_samples") or {}, path),
+        min_samples=_parse_min_samples(min_samples_raw, path),
     )
+
+
+def _reject_monitor_only(raw: Any, path: Path, *, section: str) -> None:
+    """拒绝把仅监控指标写进门禁配置。
+
+    静默忽略是不够的：写文件的人显然认为它该被考核，而门禁不会执行——
+    要么他以为有门禁（实际没有），要么下次有人"修好"它并把它变成真门禁。
+    两种结果都比一条报错差。
+
+    Raises:
+        ConfigurationError: ``section`` 里出现 ``_MONITOR_ONLY`` 中的指标。
+    """
+    if not isinstance(raw, dict):
+        return
+    monitor_names = {metric.value for metric in _MONITOR_ONLY}
+    rejected = sorted(key for key in raw if key in monitor_names)
+    if rejected:
+        raise ConfigurationError(
+            f"阈值文件 [{section}] 段包含仅监控指标: {'、'.join(rejected)}（{path}）",
+            detail=(
+                "幻觉率与文档级精确率只用于观察，不设门禁。"
+                "给它们设下限会让监控指标被读成质量要求；请从 [thresholds] / [min_samples] 中删除。"
+            ),
+        )
 
 
 def _parse_metric_map(
@@ -649,10 +738,14 @@ def render_comparison(comparison: Comparison) -> str:
     lines.append(f"{'指标':<22}{'基线':>9}{'本次':>9}{'Δ':>10}{'阈值':>9}{'样本':>7}   判定")
     for name, (before, after) in comparison.metrics.items():
         delta = "—" if before is None or after is None else f"{after - before:+.4f}"
-        floor = comparison.thresholds.get(name)
-        samples = comparison.samples.get(name, 0)
-        verdict = "—"
-        if floor is not None and after is not None:
+        monitor_only = name in MONITOR_ONLY_METRICS
+        floor = None if monitor_only else comparison.thresholds.get(name)
+        count = comparison.samples.get(name)
+        # 监控指标没有"适用样例数"这回事（幻觉率由 faithfulness 派生），
+        # 显示 0 会让人以为一条都没测。
+        samples = "—" if monitor_only and count is None else str(count or 0)
+        verdict = "监控" if monitor_only else "—"
+        if not monitor_only and floor is not None and after is not None:
             verdict = "达标" if after >= floor else "跌破"
         if any(item.metric.value == name for item in comparison.measurement_failures):
             # 分数列是**部分样例**的均分（失败样例已排除），单看它读不出"这轮没测全"。
@@ -811,6 +904,7 @@ def read_artifact(path: Path, *, allow_schema_mismatch: bool = False) -> EvalArt
 
 
 __all__: list[str] = [
+    "MONITOR_ONLY_METRICS",
     "Comparison",
     "ConfigDrift",
     "Gate",

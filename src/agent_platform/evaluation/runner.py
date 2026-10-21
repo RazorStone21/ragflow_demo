@@ -339,6 +339,10 @@ async def build_run_meta(
             sha256=golden.sha256,
             case_count=len(golden.cases),
             reviewed_count=len(golden.reviewed),
+            answerable_count=sum(1 for case in golden.cases if case.is_answerable),
+            relevance_labeled_count=sum(
+                1 for case in golden.cases if case.is_answerable and case.has_relevance_labels
+            ),
         ),
     )
 
@@ -395,6 +399,7 @@ async def run_case(
         scored = score_case(
             case,
             result,
+            k=deps.settings.evidence_top_k,
             foreign_evidence=foreign,
             rendered_prompt=render_evidence_message(case.question, result.evidence),
         )

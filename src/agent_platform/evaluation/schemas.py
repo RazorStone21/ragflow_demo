@@ -34,8 +34,14 @@ from agent_platform.agents.gov_policy_qa.schemas import Citation
 from agent_platform.agents.gov_policy_qa.state import AnswerStatus
 from agent_platform.knowledge.schemas import EvidenceItem, ImageRef, RetrievalMeta
 
-SCHEMA_VERSION = 1
-"""产物结构版本。对比时版本不符即判"基线不兼容"（退出码 4），不做跨版本推断。"""
+SCHEMA_VERSION = 2
+"""产物结构版本。对比时版本不符即判"基线不兼容"（退出码 4），不做跨版本推断。
+
+v2（2026-10-21，ADR-0006）：评估方案更换——检索三项与 RAGAS 三项取代
+``retrieval_hit`` / ``status_accuracy`` 与自研 faithfulness / relevancy；
+黄金集新增 ``relevant_documents`` 与独立签署字段，结果新增 ``citation_audits``。
+v1 产物（含已入库的两份基线）**不迁移**，新代码读入即报不可读，只作历史。
+"""
 
 STRIPPED_EVIDENCE_CONTENT = "[基线副本已剥离正文]"
 """入仓基线里 ``evidence[].content`` 的占位标记（见 ``compact_for_baseline``）。
@@ -68,16 +74,38 @@ class EvalLayer(StrEnum):
 
 
 class MetricName(StrEnum):
-    """指标名（稳定枚举；聚合、阈值、报告的键统一取自此，禁止散落字面量）。"""
+    """指标名（稳定枚举；聚合、阈值、报告的键统一取自此，禁止散落字面量）。
 
-    RETRIEVAL_HIT = "retrieval_hit"
+    2026-10-21 起（ADR-0006）：``RETRIEVAL_HIT`` 与 ``STATUS_ACCURACY`` 退役；
+    检索质量由 ``RECALL_AT_K`` / ``PRECISION_AT_K`` / ``MRR`` 承担，状态兜底并入
+    ``ANSWER_CORRECTNESS``（期望 answered 而实际未答 → 直接 FAIL 0.0）。
+    """
+
+    RECALL_AT_K = "recall_at_k"
+    """相关文档被 top-K 证据覆盖的比例（文档按 basename + casefold 去重）。"""
+
+    PRECISION_AT_K = "precision_at_k"
+    """top-K 证据块中来自相关文档的块数 ÷ **实际返回块数**（≤K）。"""
+
+    DOCUMENT_PRECISION_AT_K = "document_precision_at_k"
+    """文档级诊断：相关文档 ÷ 证据涉及的文档；**仅监控，不设阈值**。"""
+
+    MRR = "mrr"
+    """首个来自相关文档的证据位次的倒数；无命中为 0。"""
+
     CITATION_INTEGRITY = "citation_integrity"
-    STATUS_ACCURACY = "status_accuracy"
+    CITATION_ACCURACY = "citation_accuracy"
+    """被引用证据是否支持对应断言（自研裁判逐条判定，ADR-0006）。"""
+
     REFUSAL_CORRECTNESS = "refusal_correctness"
     TENANT_ISOLATION = "tenant_isolation"
     PROMPT_HYGIENE = "prompt_hygiene"
     FAITHFULNESS = "faithfulness"
     ANSWER_RELEVANCY = "answer_relevancy"
+    ANSWER_CORRECTNESS = "answer_correctness"
+    HALLUCINATION_RATE = "hallucination_rate"
+    """``1 − aggregate(faithfulness)``；**仅监控，不得写入阈值文件**。"""
+
     IMAGE_EVIDENCE_HIT = "image_evidence_hit"
     """期望的图片（按文档名 + 页码）是否随证据被检索到（ADR-0004）。"""
 
@@ -158,6 +186,43 @@ class ExpectedImage(BaseModel):
     must_hit: bool = Field(default=True, description="未命中是否判失败；False 为弱期望")
 
 
+class RelevantDocument(BaseModel):
+    """一道可答题的**相关文档全集**中的一份（检索三项的分母来源）。
+
+    定义：任何能**实质支撑**该题正确答案（或可接受答案）的文件。只提关键词、
+    只能作背景、不能支撑结论的不算；多文档综合题要列全。这份集合必须由人
+    逐条回原文核对后签署——**不得**从某次检索结果里挑，否则 Recall 恒为满分，
+    指标就失去了分辨力（ADR-0006 §三）。
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    file_name: str = Field(min_length=1, max_length=512, description="语料文件名（不含目录）")
+    pages: list[int] = Field(
+        default_factory=list, description="支撑该题答案的页码；非 PDF 或不确定时可为空"
+    )
+    basis: str = Field(default="", max_length=500, description="核对依据（一句人话，便于评审复核）")
+
+    @model_validator(mode="after")
+    def _check_file_name(self) -> RelevantDocument:
+        """文件名必须是 basename：带目录的名字永远匹配不上证据里的 ``document_name``。"""
+        if self.file_name != self.file_name.replace("\\", "/").rsplit("/", 1)[-1]:
+            raise ValueError(
+                f"relevant_documents.file_name 必须是文件名（不含目录）: {self.file_name}"
+            )
+        return self
+
+
+class CitationAudit(BaseModel):
+    """引用人工抽检的一条记录（脚本导出、人工回填，结论只落 ``local_data/``）。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    index: int = Field(ge=1, description="对应 ``CaseResult.citations[].index``")
+    supported: bool = Field(description="人工判定：该引用是否支持对应断言")
+    reason: str = Field(default="", max_length=1000, description="人工理由或备注")
+
+
 class GoldenCase(BaseModel):
     """一条黄金集样例。
 
@@ -188,6 +253,13 @@ class GoldenCase(BaseModel):
     reference_answer_source: ReferenceSource | None = Field(
         default=None, description="参考答案出处；有参考答案时必须给出"
     )
+    relevant_documents: list[RelevantDocument] = Field(
+        default_factory=list,
+        description=(
+            "本题的**相关文档全集**（检索三项的分母）。只有可答题（expected_status=answered）"
+            "才允许非空，且必须由 relevance_reviewed_by / at 签署；拒答/安全样例必须为空"
+        ),
+    )
     notes: str = Field(default="", description="备注：为何这样出题、边界在哪里")
 
     # --- 评审留痕（CLAUDE.md 9.2"不得自评自满"的可执行形态）---
@@ -197,19 +269,69 @@ class GoldenCase(BaseModel):
     reviewed_by: str = Field(default="", max_length=64, description="评审人；留空即未评审")
     reviewed_at: str = Field(default="", description="评审日期（ISO 8601 UTC 日期）")
 
+    # --- 相关性标签的独立签署（2026-10-21，ADR-0006）---
+    # 不复用题目本身的 reviewed_by/at：题目评审与"相关文档全集"核对是两次不同的
+    # 审阅，合并成一个字段会让"题审过了、标签没核"看起来像"都审过了"。
+    relevance_reviewed_by: str = Field(
+        default="", max_length=64, description="相关性标签的核对人；留空即未核对"
+    )
+    relevance_reviewed_at: str = Field(
+        default="", description="相关性标签核对日期（ISO 8601 UTC 日期）"
+    )
+
     @model_validator(mode="after")
     def _check_review_consistency(self) -> GoldenCase:
-        """强制 ``draft`` 与已签署状态一致，并阻断"有答案却没出处"的样例。"""
+        """强制签署字段与内容一致，并阻断几类会让指标失真的组合。"""
         if self.draft and self.reviewed_by:
             raise ValueError("draft=True 与已签署（reviewed_by 非空）不能并存：请择一")
         if self.reference_answer and self.reference_answer_source is None:
             raise ValueError("给出 reference_answer 时必须给出 reference_answer_source（出处）")
+
+        if bool(self.relevance_reviewed_by) != bool(self.relevance_reviewed_at):
+            raise ValueError(
+                "relevance_reviewed_by 与 relevance_reviewed_at 必须同时给出或同时留空"
+            )
+        if self.relevant_documents and not self.relevance_reviewed_by:
+            raise ValueError(
+                "给出 relevant_documents 时必须同时给出 relevance_reviewed_by / at："
+                "未签署的标签不得进入门禁"
+            )
+        if self.expected_status is not AnswerStatus.ANSWERED and self.relevant_documents:
+            raise ValueError(
+                "非可答题（expected_status != answered）不得有 relevant_documents："
+                "拒答/安全样例由 refusal_correctness 判分，检索指标不适用"
+            )
+        if self.expected_status is not AnswerStatus.ANSWERED and self.relevance_reviewed_by:
+            raise ValueError("非可答题不得有相关性标签的签署字段")
+        names = [document.file_name.casefold() for document in self.relevant_documents]
+        if len(names) != len(set(names)):
+            raise ValueError("relevant_documents 中的文件名不得重复")
+        # 标签整题缺席是允许的（草稿阶段尚未核对，检索三项判不适用）；一旦开始
+        # 标，must_hit 就必须被覆盖——否则 Recall 的分母自己就漏了必中项。
+        if names:
+            must_hit = {doc.name.casefold() for doc in self.expected_documents if doc.must_hit}
+            missing = sorted(must_hit - set(names))
+            if missing:
+                raise ValueError(
+                    "expected_documents 中 must_hit=True 的文件必须同时出现在 "
+                    "relevant_documents：" + "、".join(missing)
+                )
         return self
 
     @property
     def is_reviewed(self) -> bool:
         """是否已签署（非草稿且有评审人）。门禁只统计已签署样例。"""
         return not self.draft and bool(self.reviewed_by)
+
+    @property
+    def is_answerable(self) -> bool:
+        """是否可答题（检索三项的适用前提）。"""
+        return self.expected_status is AnswerStatus.ANSWERED
+
+    @property
+    def has_relevance_labels(self) -> bool:
+        """是否已具备签署过的相关文档全集（检索三项的采集前提）。"""
+        return bool(self.relevant_documents) and bool(self.relevance_reviewed_by)
 
 
 class MetricResult(BaseModel):
@@ -265,6 +387,13 @@ class CaseResult(BaseModel):
     retrieval_meta: RetrievalMeta | None = Field(default=None, description="检索判定元数据")
     node_trace: list[str] = Field(default_factory=list, description="节点进入序列（轨迹评估用）")
     metrics: list[MetricResult] = Field(default_factory=list, description="本层产出的指标")
+    citation_audits: list[CitationAudit] = Field(
+        default_factory=list,
+        description=(
+            "引用人工抽检结论（脚本导出、人回填）。只在原始产物里存在；"
+            "基线副本剥离——理由同 judge_raw：避免把证据原文带进入库文件"
+        ),
+    )
     judge_raw: str = Field(default="", description="裁判模型的原始输出（供人判“样例错还是模型错”）")
     latency_ms: int = Field(default=0, ge=0, description="本样例执行耗时（毫秒）")
     error: str = Field(default="", description="执行失败原因；非空表示本样例未产出有效结果")
@@ -347,7 +476,36 @@ class JudgeSnapshot(BaseModel):
             "None = 未记录（本字段引入前落盘的旧产物），**不得**当作 0 使用"
         ),
     )
-    prompt_version: str = Field(default="", description="裁判提示词文件名（版本化资产，§5.5）")
+    prompt_version: str = Field(
+        default="",
+        description="裁判提示词文件名（版本化资产，§5.5）；RAGAS 指标记 ``ragas:<metric>``",
+    )
+    ragas_version: str = Field(
+        default="", description="RAGAS 库版本（实现依赖其私有方法，必须精确留痕）"
+    )
+    ragas_metrics: list[str] = Field(
+        default_factory=list, description="本轮启用的 RAGAS 指标名（顺序稳定，便于逐项比对）"
+    )
+    embedding_model: str = Field(
+        default="",
+        description=(
+            "RAGAS Answer Relevancy / Correctness 使用的嵌入逻辑名。"
+            "嵌入型号变了，分数就不可比——与裁判型号同属测量工具"
+        ),
+    )
+    telemetry_disabled: bool = Field(
+        default=False,
+        description="RAGAS 遥测是否已强制关闭（RAGAS_DO_NOT_TRACK=true）；为假即数据出域风险",
+    )
+    upstream_model: str = Field(
+        default="",
+        description=(
+            "网关 judge 路由背后的上游型号（只作留痕，不参与路由）。"
+            "空串 = 未记录：本字段引入前落盘的旧产物，**不得**当作某个默认型号。"
+            "它随 ``JUDGE_UPSTREAM_MODEL`` 配置写入；逻辑名相同而型号换了，"
+            "对比时才会显形"
+        ),
+    )
     caveat: str = Field(
         default="",
         description="已知偏置的如实登记（如裁判与生成同源）；报告须显式展示，不得当中性分数",
@@ -362,6 +520,14 @@ class GoldenSnapshot(BaseModel):
     sha256: str = Field(min_length=1, description="全部黄金集文件内容的联合指纹")
     case_count: int = Field(ge=0)
     reviewed_count: int = Field(ge=0, description="已签署样例数；小于 case_count 即含草稿")
+    answerable_count: int = Field(
+        default=0, ge=0, description="可答题数（expected_status=answered）；检索三项的分母上限"
+    )
+    relevance_labeled_count: int = Field(
+        default=0,
+        ge=0,
+        description="已签署相关文档全集的可答题数；小于 answerable_count 即标签未齐",
+    )
 
 
 class RunMeta(BaseModel):
@@ -436,6 +602,7 @@ class EvalArtifact(BaseModel):
                         citation.model_copy(update={"images": _strip_captions(citation.images)})
                         for citation in case.citations
                     ],
+                    "citation_audits": [],
                     "judge_raw": "",
                 }
             )
@@ -449,6 +616,7 @@ __all__: list[str] = [
     "STRIPPED_EVIDENCE_CONTENT",
     "CaseCategory",
     "CaseResult",
+    "CitationAudit",
     "CorpusSnapshot",
     "EvalArtifact",
     "EvalLayer",
@@ -462,6 +630,7 @@ __all__: list[str] = [
     "MetricVerdict",
     "ModelSnapshot",
     "ReferenceSource",
+    "RelevantDocument",
     "RetrievalSnapshot",
     "RunMeta",
     "RunVerdict",

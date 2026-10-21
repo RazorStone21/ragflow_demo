@@ -30,7 +30,7 @@
 
 **旁挂产物不写进门禁**：本脚本输出的是**另一份**文件（``local_data/evals/ragas/``），
 不修改评测产物、不参与 ``--baseline`` 对比。同一指标名由两个后端产出时必须是两个
-位置，否则"裁判同源偏置有多大"这件事就再也看不出来了（ADR-0003 第三节）。
+位置，否则"两套判分法是否一致"这件事就再也看不出来了（ADR-0003 第三节）。
 """
 
 from __future__ import annotations
@@ -50,14 +50,16 @@ EXIT_INFRA = 2
 
 _TELEMETRY_ENV = "RAGAS_DO_NOT_TRACK"
 
-SAME_SOURCE_CAVEAT = (
-    "本旁挂判分器与在线生成共用同一上游模型（网关 judge 与 primary-chat 指向同一型号），"
-    "存在自偏好（self-preference）偏置。它与 evaluation/judge.py 的独立性只体现在"
-    "**判分方法**（不同的提示词与分解方式），**不体现在模型家族**——因此两份分数互相"
-    "印证只能说明“换一套判分法结论不变”，不能说明分数本身中立。"
-    "生产须换独立家族的私有化裁判模型（CLAUDE.md 5.8，登记于 ADR-0003）。"
+CLOUD_JUDGE_CAVEAT = (
+    "本旁挂判分器使用网关 judge 路由（自 2026-10-21 起指向硅基流动的 Qwen），"
+    "与在线生成模型 primary-chat（DeepSeek）**不同家族**，不再有同源自偏好偏置。"
+    "它与 evaluation/judge.py 的独立性只体现在**判分方法**（不同的提示词与分解方式），"
+    "**不体现在模型**——两者共用同一 Qwen，两份分数互相印证只能说明"
+    "“换一套判分法结论不变”，不能说明分数本身中立。"
+    "另：评估数据（问题、证据、答案）会出域到 SiliconFlow，仅限公开演示语料，"
+    "生产须换私有化裁判（CLAUDE.md 5.8 / 10.1，ADR-0005）。"
 )
-"""与 ``evaluation/judge.py`` 的 ``SAME_SOURCE_CAVEAT`` 同义。
+"""与 ``evaluation/judge.py`` 的 ``CLOUD_JUDGE_CAVEAT`` 同义。
 
 刻意各写一份而不是共享常量：本脚本不能 import 本仓模块（见模块 docstring），
 共享就得引入项目依赖，那正是形态 2 要避免的事。
@@ -316,9 +318,11 @@ async def _main_async(args: argparse.Namespace) -> int:
     if unknown:
         raise _UsageError(f"不支持的指标：{sorted(unknown)}")
 
-    # 判分器与在线生成同源（gateway 的 judge 与 primary-chat 指向同一型号）。优先用
-    # 产物里记的逻辑名，使旁挂结果的出处与被判的那一轮对齐，而不是跟着当前 .env 漂。
+    # 判分器与在线生成不同家族（judge=云端 Qwen，primary-chat=DeepSeek），但仍共用
+    # 同一 Qwen 作为测量工具。优先用产物里记的逻辑名，使旁挂结果的出处与被判的那一轮
+    # 对齐，而不是跟着当前 .env 漂；上游型号只作留痕（型号由网关映射决定）。
     judge_model = args.judge_model or os.environ.get("JUDGE_MODEL") or "judge"
+    judge_upstream_model = os.environ.get("JUDGE_UPSTREAM_MODEL") or ""
     artifact_judge = str((run_meta.get("models") or {}).get("judge") or "")
     embedding_model = (
         args.embedding_model
@@ -396,6 +400,7 @@ async def _main_async(args: argparse.Namespace) -> int:
             "library_version": ragas.__version__,
             "integration_form": "isolated-env: uv run --no-project --with ragas",
             "llm_logical_name": judge_model,
+            "llm_upstream_model": judge_upstream_model,
             "artifact_judge_logical_name": artifact_judge,
             "embedding_logical_name": embedding_model if relevancy_metric is not None else "",
             "temperature": 0.0,
@@ -405,7 +410,7 @@ async def _main_async(args: argparse.Namespace) -> int:
             "telemetry_env_previous": telemetry_previous,
             "dependencies": _dependency_versions(),
         },
-        "caveats": [SAME_SOURCE_CAVEAT, _TELEMETRY_CAVEAT],
+        "caveats": [CLOUD_JUDGE_CAVEAT, _TELEMETRY_CAVEAT],
         "aggregate": scores,
         "samples": samples,
         "cases": records,

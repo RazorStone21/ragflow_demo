@@ -5,6 +5,9 @@
 
 判分器全部是纯函数，所以这里不需要任何 fixture、mock 或异步——
 如果一个判分函数需要外部依赖才能测，那它就不该在这一层。
+
+2026-10-21（ADR-0006）：``retrieval_hit`` 与 ``status_accuracy`` 退役，改为
+Recall@K / Precision@K / MRR 与文档级诊断；本文件同步改写检索段。
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from agent_platform.evaluation.schemas import (
     ExpectedImage,
     GoldenCase,
     MetricName,
+    MetricResult,
     MetricVerdict,
 )
 from agent_platform.evaluation.scoring import (
@@ -34,8 +38,7 @@ from agent_platform.evaluation.scoring import (
     score_image_evidence_hit,
     score_prompt_hygiene,
     score_refusal,
-    score_retrieval_hit,
-    score_status,
+    score_retrieval_metrics,
     score_tenant_isolation,
 )
 from agent_platform.knowledge.schemas import (
@@ -48,6 +51,9 @@ from agent_platform.knowledge.schemas import (
 
 SPOT_MARKET = "0116.china-power-spot-market-construction-guideline-2025-cn.pdf"
 CAPACITY = "0095.china-power-generation-side-capacity-price-mechanism-notice-2026-cn.pdf"
+OTHER = "0001.unrelated-background-paper.pdf"
+
+_K = 8
 
 
 def make_evidence(
@@ -79,8 +85,23 @@ def make_image_ref(seed: bytes = b"figure", *, page: int | None = 3) -> ImageRef
     return ImageRef(image_id=build_image_id(sha), sha256=sha, mime="image/png", page=page)
 
 
+def _doc_name(document: ExpectedDocument | dict[str, Any]) -> str:
+    return document.name if isinstance(document, ExpectedDocument) else str(document["name"])
+
+
+def _is_must_hit(document: ExpectedDocument | dict[str, Any]) -> bool:
+    if isinstance(document, ExpectedDocument):
+        return document.must_hit
+    return bool(document.get("must_hit", True))
+
+
 def make_case(case_id: str = "typical-01", **overrides: object) -> GoldenCase:
-    """构造一条黄金集样例。"""
+    """构造一条黄金集样例。
+
+    可答题默认按 ``must_hit`` 文档自动生成**已签署**的 ``relevant_documents``
+    （全集恰好就是期望命中的那些文档）——绝大多数用例关心的是别的指标，不该
+    每处都手抄一份标签。要测"未标注"或"多份相关文档"时显式覆盖即可。
+    """
     payload: dict[str, Any] = {
         "id": case_id,
         "category": CaseCategory.TYPICAL,
@@ -92,6 +113,13 @@ def make_case(case_id: str = "typical-01", **overrides: object) -> GoldenCase:
         "reviewed_by": "reviewer",
     }
     payload.update(overrides)
+    if payload["expected_status"] == "answered" and "relevant_documents" not in overrides:
+        documents = payload.get("expected_documents") or []
+        payload["relevant_documents"] = [
+            {"file_name": _doc_name(document)} for document in documents if _is_must_hit(document)
+        ]
+        payload["relevance_reviewed_by"] = "label-reviewer"
+        payload["relevance_reviewed_at"] = "2026-10-21"
     return GoldenCase.model_validate(payload)
 
 
@@ -121,11 +149,17 @@ def make_result(**overrides: object) -> CaseResult:
     return CaseResult(**payload)
 
 
+def _retrieval(
+    case: GoldenCase, result: CaseResult, *, k: int = _K
+) -> dict[MetricName, MetricResult]:
+    return {metric.name: metric for metric in score_retrieval_metrics(case, result, k=k)}
+
+
 # ---------------------------------------------------------------------------
-# 检索命中
+# 检索三项：Recall@K / Precision@K / MRR（ADR-0006）
 # ---------------------------------------------------------------------------
-def test_retrieval_hit_passes_when_all_required_documents_found() -> None:
-    """must_hit 文档全部出现在证据里即通过。"""
+def test_perfect_retrieval_scores_one_on_everything() -> None:
+    """相关文档全部覆盖、证据全部相关、首条即命中：四项都是 1.0。"""
     case = make_case(
         expected_documents=[ExpectedDocument(name=SPOT_MARKET), ExpectedDocument(name=CAPACITY)]
     )
@@ -133,82 +167,180 @@ def test_retrieval_hit_passes_when_all_required_documents_found() -> None:
         evidence=[make_evidence("c1"), make_evidence("c2", document_name=CAPACITY)]
     )
 
-    metric = score_retrieval_hit(case, result)
+    metrics = _retrieval(case, result)
 
-    assert metric.verdict is MetricVerdict.PASS
-    assert metric.score == 1.0
+    assert [metrics[name].score for name in _RETRIEVAL_NAMES] == [1.0, 1.0, 1.0, 1.0]
+    assert all(metrics[name].verdict is MetricVerdict.PASS for name in _RETRIEVAL_NAMES)
 
 
-def test_retrieval_hit_fails_and_names_the_missing_document() -> None:
-    """漏掉一份就必须失败，并在 detail 里点名是哪一份。"""
+def test_partial_recall_fails_and_names_the_missing_document() -> None:
+    """漏掉一份相关文档：Recall 按比例给分，并在 detail 里点名是哪一份。"""
     case = make_case(
         expected_documents=[ExpectedDocument(name=SPOT_MARKET), ExpectedDocument(name=CAPACITY)]
     )
 
-    metric = score_retrieval_hit(case, make_result())
+    metrics = _retrieval(case, make_result())
 
-    assert metric.verdict is MetricVerdict.FAIL
-    assert metric.score == 0.5
-    assert CAPACITY in metric.detail
+    recall = metrics[MetricName.RECALL_AT_K]
+    assert recall.score == 0.5
+    assert recall.verdict is MetricVerdict.PASS, "逐例只把 0 记 FAIL，整体质量由聚合阈值负责"
+    assert CAPACITY in recall.detail
 
 
-def test_retrieval_hit_matches_on_source_uri_when_document_name_is_empty() -> None:
-    """``document_name`` 缺失时退回用 ``source_uri`` 的 basename 比对（同一事实的另一载体）。"""
+def test_recall_deduplicates_documents_but_precision_counts_chunks() -> None:
+    """Recall / MRR 按文档去重，Precision 按证据块计数。
+
+    同一份相关文档切了三块：Recall 只算一份（分母是文档全集），Precision 三块
+    全算相关——块级分母衡量的正是"返回的证据里混进多少无关文档"。
+    """
+    case = make_case(
+        expected_documents=[ExpectedDocument(name=SPOT_MARKET), ExpectedDocument(name=CAPACITY)]
+    )
+    result = make_result(
+        evidence=[
+            make_evidence("c1"),
+            make_evidence("c2"),
+            make_evidence("c3", document_name=CAPACITY),
+        ]
+    )
+
+    metrics = _retrieval(case, result)
+
+    assert metrics[MetricName.RECALL_AT_K].score == 1.0
+    assert metrics[MetricName.PRECISION_AT_K].score == 1.0
+    assert "3/3 块证据来自相关文档" in metrics[MetricName.PRECISION_AT_K].detail
+
+
+def test_precision_counts_irrelevant_chunks_in_the_denominator() -> None:
+    """4 块证据里 2 块来自相关文档：块级 Precision 0.5、文档级诊断 1/2。"""
+    case = make_case()
+    result = make_result(
+        evidence=[
+            make_evidence("c1"),
+            make_evidence("c2"),
+            make_evidence("c3", document_name=OTHER),
+            make_evidence("c4", document_name=OTHER),
+        ]
+    )
+
+    metrics = _retrieval(case, result)
+
+    assert metrics[MetricName.RECALL_AT_K].score == 1.0
+    assert metrics[MetricName.PRECISION_AT_K].score == 0.5
+    assert "2/4 块证据来自相关文档" in metrics[MetricName.PRECISION_AT_K].detail
+    assert metrics[MetricName.DOCUMENT_PRECISION_AT_K].score == 0.5
+    assert "仅监控" in metrics[MetricName.DOCUMENT_PRECISION_AT_K].detail
+
+
+def test_mrr_uses_the_rank_of_the_first_relevant_chunk() -> None:
+    """首条相关证据排在第二位：MRR = 1/2，而不是"命中即 1"。"""
+    case = make_case()
+    result = make_result(evidence=[make_evidence("c1", document_name=OTHER), make_evidence("c2")])
+
+    mrr = _retrieval(case, result)[MetricName.MRR]
+
+    assert mrr.score == 0.5
+    assert "位次 2（1/2）" in mrr.detail
+
+
+def test_no_relevant_hit_scores_zero_on_recall_precision_and_mrr() -> None:
+    """证据全来自无关文档：三项都是 0（FAIL），文档级诊断同样 0。"""
+    case = make_case()
+    result = make_result(evidence=[make_evidence("c1", document_name=OTHER)])
+
+    metrics = _retrieval(case, result)
+
+    for name in (MetricName.RECALL_AT_K, MetricName.PRECISION_AT_K, MetricName.MRR):
+        assert metrics[name].verdict is MetricVerdict.FAIL
+        assert metrics[name].score == 0.0
+    assert "均不来自相关文档" in metrics[MetricName.MRR].detail
+    assert metrics[MetricName.DOCUMENT_PRECISION_AT_K].score == 0.0
+
+
+def test_empty_evidence_fails_recall_and_mrr_but_precision_is_not_applicable() -> None:
+    """空证据没有 Precision 的分母（不是 0 分）；Recall 与 MRR 是真实测出的 0。"""
+    metrics = _retrieval(make_case(), make_result(evidence=[]))
+
+    assert metrics[MetricName.RECALL_AT_K].verdict is MetricVerdict.FAIL
+    assert metrics[MetricName.RECALL_AT_K].score == 0.0
+    assert metrics[MetricName.MRR].verdict is MetricVerdict.FAIL
+    assert metrics[MetricName.MRR].score == 0.0
+    assert metrics[MetricName.PRECISION_AT_K].verdict is MetricVerdict.NOT_APPLICABLE
+    assert metrics[MetricName.PRECISION_AT_K].score is None
+    assert metrics[MetricName.DOCUMENT_PRECISION_AT_K].verdict is MetricVerdict.NOT_APPLICABLE
+
+
+def test_k_truncates_the_evidence_before_scoring() -> None:
+    """只对进入上下文的前 K 条评分：第 9 条里的相关文档救不了 Recall。"""
+    case = make_case()
+    evidence = [make_evidence(f"c{i}", document_name=OTHER) for i in range(8)]
+    evidence.append(make_evidence("c9"))  # 相关，但排在第 9 位
+
+    within_k = _retrieval(case, make_result(evidence=evidence), k=8)
+    beyond_k = _retrieval(case, make_result(evidence=evidence), k=9)
+
+    assert within_k[MetricName.RECALL_AT_K].score == 0.0
+    assert within_k[MetricName.MRR].score == 0.0
+    assert beyond_k[MetricName.RECALL_AT_K].score == 1.0
+    assert beyond_k[MetricName.MRR].score == pytest.approx(1 / 9)
+
+
+def test_unlabeled_cases_make_all_four_not_applicable() -> None:
+    """未签署相关文档全集：缺样本不得判通过，四项一律 N/A。"""
+    case = make_case(relevant_documents=[])
+
+    metrics = _retrieval(case, make_result())
+
+    assert all(metrics[name].verdict is MetricVerdict.NOT_APPLICABLE for name in _RETRIEVAL_NAMES)
+    assert "未签署相关文档全集" in metrics[MetricName.RECALL_AT_K].detail
+
+
+def test_non_answerable_cases_make_all_four_not_applicable() -> None:
+    """拒答题不考检索三项——"没考"不是"考砸"。"""
+    case = make_case(category=CaseCategory.REFUSAL, expected_status="insufficient_evidence")
+
+    metrics = _retrieval(case, make_result())
+
+    assert all(metrics[name].verdict is MetricVerdict.NOT_APPLICABLE for name in _RETRIEVAL_NAMES)
+    assert "不是可答题" in metrics[MetricName.RECALL_AT_K].detail
+
+
+def test_document_matching_ignores_directory_and_case() -> None:
+    """文件名的归一化只做 basename + casefold，不做模糊匹配。"""
+    case = make_case(expected_documents=[ExpectedDocument(name=SPOT_MARKET.upper())])
+    result = make_result(evidence=[make_evidence("c1", document_name=f"/corpus/{SPOT_MARKET}")])
+
+    assert _retrieval(case, result)[MetricName.RECALL_AT_K].score == 1.0
+
+
+def test_document_name_falls_back_to_source_uri() -> None:
+    """``document_name`` 缺失时退回 ``source_uri`` 的 basename（同一事实的另一载体）。"""
     case = make_case()
     result = make_result(
         evidence=[make_evidence("c1", document_name="", source_uri=f"/corpus/{SPOT_MARKET}")]
     )
 
-    assert score_retrieval_hit(case, result).verdict is MetricVerdict.PASS
+    assert _retrieval(case, result)[MetricName.RECALL_AT_K].score == 1.0
 
 
-def test_retrieval_hit_is_case_insensitive_and_ignores_directory() -> None:
-    """归一化只做到 basename + 大小写；不做模糊匹配。"""
-    case = make_case(expected_documents=[ExpectedDocument(name=SPOT_MARKET.upper())])
-
-    assert score_retrieval_hit(case, make_result()).verdict is MetricVerdict.PASS
-
-
-def test_retrieval_hit_ignores_weak_expectations() -> None:
-    """``must_hit=False`` 的文档不参与判定（弱期望只是给人看的备注）。"""
-    case = make_case(
-        expected_documents=[ExpectedDocument(name=CAPACITY, must_hit=False)],
-    )
-
-    metric = score_retrieval_hit(case, make_result())
-
-    assert metric.verdict is MetricVerdict.NOT_APPLICABLE
-    assert metric.score is None
-
-
-def test_retrieval_hit_is_not_applicable_without_expectations() -> None:
-    """拒答题没有期望文档——这是"没考"，不是"考砸了"。"""
-    case = make_case(expected_documents=[])
-
-    metric = score_retrieval_hit(case, make_result())
-
-    assert metric.verdict is MetricVerdict.NOT_APPLICABLE
-
-
-# ---------------------------------------------------------------------------
-# 状态
-# ---------------------------------------------------------------------------
-def test_status_accuracy_pass_and_fail() -> None:
-    """状态比对是严格相等。"""
+def test_document_precision_is_not_applicable_when_no_document_name_is_known() -> None:
+    """证据既无文档名也无来源路径：文档级诊断没有分母，记 N/A。"""
     case = make_case()
+    result = make_result(evidence=[make_evidence("c1", document_name="", source_uri="")])
 
-    assert score_status(case, make_result()).verdict is MetricVerdict.PASS
-    failed = score_status(case, make_result(answer_status="insufficient_evidence"))
-    assert failed.verdict is MetricVerdict.FAIL
-    assert "insufficient_evidence" in failed.detail
+    metrics = _retrieval(case, result)
+
+    assert metrics[MetricName.RECALL_AT_K].score == 0.0
+    assert metrics[MetricName.DOCUMENT_PRECISION_AT_K].verdict is MetricVerdict.NOT_APPLICABLE
+    assert "无法做文档级诊断" in metrics[MetricName.DOCUMENT_PRECISION_AT_K].detail
 
 
-def test_status_accuracy_reports_empty_status_explicitly() -> None:
-    """状态为空串时 detail 要写成 ``<空>``，而不是留一段看不懂的空白。"""
-    metric = score_status(make_case(), make_result(answer_status=""))
-
-    assert metric.verdict is MetricVerdict.FAIL
-    assert "<空>" in metric.detail
+_RETRIEVAL_NAMES = (
+    MetricName.RECALL_AT_K,
+    MetricName.PRECISION_AT_K,
+    MetricName.MRR,
+    MetricName.DOCUMENT_PRECISION_AT_K,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -398,12 +530,13 @@ def test_refusal_fails_when_meta_contradicts_status() -> None:
     assert "自相矛盾" in metric.detail or "is_sufficient" in metric.detail
 
 
-def test_model_declared_no_evidence_refusal_passes_all_three_scorers() -> None:
-    """D1 修复后的完整形态：非空证据 + 降级元数据 + 固定拒答文案，三个判分器全通过。
+def test_model_declared_no_evidence_refusal_passes_refusal_and_citations() -> None:
+    """D1 修复后的完整形态：非空证据 + 降级元数据 + 固定拒答文案，两个判分器全通过。
 
     这条用例锁的是**契约之间的接缝**：生成节点把 ``is_sufficient`` 改写成 False，
     ``score_refusal`` 才会认这份拒答；只改状态不降级，这里就会复现
-    "状态与元数据自相矛盾"的失败。
+    "状态与元数据自相矛盾"的失败。（``status_accuracy`` 已于 ADR-0006 退役，
+    状态一致性由本用例与拒答判分共同覆盖。）
     """
     case = make_case(category=CaseCategory.REFUSAL, expected_status="insufficient_evidence")
     result = make_result(
@@ -421,7 +554,6 @@ def test_model_declared_no_evidence_refusal_passes_all_three_scorers() -> None:
         ),
     )
 
-    assert score_status(case, result).verdict is MetricVerdict.PASS
     assert score_refusal(case, result).verdict is MetricVerdict.PASS
     assert score_citations(case, result).verdict is MetricVerdict.PASS
 
@@ -659,45 +791,48 @@ def test_score_case_attaches_metrics_without_mutating_input() -> None:
     case = make_case()
     original = make_result()
 
-    scored = score_case(case, original)
+    scored = score_case(case, original, k=_K)
 
     assert original.metrics == []
     assert {m.name for m in scored.metrics} >= {
-        MetricName.RETRIEVAL_HIT,
-        MetricName.STATUS_ACCURACY,
+        MetricName.RECALL_AT_K,
+        MetricName.PRECISION_AT_K,
+        MetricName.MRR,
+        MetricName.DOCUMENT_PRECISION_AT_K,
         MetricName.CITATION_INTEGRITY,
         MetricName.REFUSAL_CORRECTNESS,
     }
 
 
 def test_score_case_retrieval_layer_skips_answer_metrics() -> None:
-    """检索层只判命中——不产出"没考"的假失败。"""
+    """检索层只判检索三项与图片命中——不产出"没考"的假失败。"""
     scored = score_case(
-        make_case(), make_result(layer=EvalLayer.RETRIEVAL, answer="", answer_status="")
+        make_case(), make_result(layer=EvalLayer.RETRIEVAL, answer="", answer_status=""), k=_K
     )
 
     assert {m.name for m in scored.metrics} == {
-        MetricName.RETRIEVAL_HIT,
+        MetricName.RECALL_AT_K,
+        MetricName.PRECISION_AT_K,
+        MetricName.MRR,
+        MetricName.DOCUMENT_PRECISION_AT_K,
         MetricName.IMAGE_EVIDENCE_HIT,
     }
 
 
 def test_score_case_preserves_judge_metrics_already_present() -> None:
     """裁判层已算出的指标不能在这一步被覆盖掉。"""
-    from agent_platform.evaluation.schemas import MetricResult
-
     judged = make_result(
         metrics=[MetricResult(name=MetricName.FAITHFULNESS, verdict=MetricVerdict.PASS, score=0.9)]
     )
 
-    scored = score_case(make_case(), judged)
+    scored = score_case(make_case(), judged, k=_K)
 
     assert MetricName.FAITHFULNESS in {m.name for m in scored.metrics}
 
 
 def test_case_passed_property_ignores_not_applicable() -> None:
     """``passed`` 只看适用的指标：一堆 N/A 不该让样例变成"未通过"。"""
-    scored = score_case(make_case(), make_result())
+    scored = score_case(make_case(), make_result(), k=_K)
 
     assert scored.passed is True
 
@@ -707,7 +842,7 @@ def test_score_case_runs_tenant_probe_for_security_category() -> None:
     case = make_case(category=CaseCategory.SECURITY, expected_status="insufficient_evidence")
     result = make_result(category=CaseCategory.SECURITY, answer_status="insufficient_evidence")
 
-    scored = score_case(case, result, foreign_evidence=[make_evidence("leak")])
+    scored = score_case(case, result, k=_K, foreign_evidence=[make_evidence("leak")])
 
     isolation = next(m for m in scored.metrics if m.name is MetricName.TENANT_ISOLATION)
     assert isolation.verdict is MetricVerdict.FAIL
@@ -715,7 +850,7 @@ def test_score_case_runs_tenant_probe_for_security_category() -> None:
 
 def test_score_case_skips_hygiene_when_prompt_not_rendered() -> None:
     """未渲染提示词时不产出卫生指标——而不是产出一个假的通过。"""
-    scored = score_case(make_case(), make_result())
+    scored = score_case(make_case(), make_result(), k=_K)
 
     assert MetricName.PROMPT_HYGIENE not in {m.name for m in scored.metrics}
 
@@ -723,7 +858,7 @@ def test_score_case_skips_hygiene_when_prompt_not_rendered() -> None:
 def test_score_case_includes_hygiene_when_prompt_rendered() -> None:
     """渲染了提示词就一定要判卫生。"""
     scored = score_case(
-        make_case(), make_result(), rendered_prompt="<<<EVIDENCE\nx\nEND_EVIDENCE>>>"
+        make_case(), make_result(), k=_K, rendered_prompt="<<<EVIDENCE\nx\nEND_EVIDENCE>>>"
     )
 
     assert MetricName.PROMPT_HYGIENE in {m.name for m in scored.metrics}

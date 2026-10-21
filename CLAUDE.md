@@ -6,8 +6,8 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | **v1.5.1** |
-| 生效日期 | 2026-10-20 |
+| 文档版本 | **v1.6.0** |
+| 生效日期 | 2026-10-21 |
 | 状态 | Active（强制执行） |
 | 适用范围 | 企业级智能体平台后端、智能体应用、MCP 工具服务、RAG/知识服务、部署与评估流水线 |
 | 编排主干（已锁定） | **LangGraph 1.x**（详见 [第 1 章](#1-技术栈锁定)、[ADR-0001](docs/adr/0001-langgraph-as-orchestration-backbone.md)） |
@@ -59,7 +59,7 @@
 | 知识图谱/本体 | **owlready2** + Protégé（OWL/SWRL 编辑）；GraphRAG/LightRAG 按需 | — | — | MIT/Apache |
 | 长期记忆 | **LangGraph `PostgresStore`**（默认同栈）；按需 **Mem0 / Graphiti** | — | Letta | MIT/Apache（Mem0 部分能力受限，需核实） |
 | 可观测性 | **Langfuse（自托管）** + **OpenTelemetry** | Langfuse 稳定自托管版 | LangSmith（SaaS，涉数据出域禁止）/ Arize Phoenix | Langfuse 核心 MIT |
-| 评估 | **RAGAS / DeepEval / Promptfoo** + 自研黄金集 | RAGAS 最新稳定（本仓隔离环境实测 **0.4.3**）；确定性判分器自研，**无版本依赖** | LangSmith eval（离线合规前禁用） | MIT/Apache（**RAGAS 见下注**） |
+| 评估 | **RAGAS + 自研确定性判分器**（同一仓库、同一进程） | RAGAS **0.4.3**（`eval` 依赖组，进程内判分）；确定性检索/引用/安全判分器自研，**无版本依赖** | DeepEval / Promptfoo；LangSmith eval（离线合规前禁用） | MIT/Apache（**RAGAS 见下注**） |
 | 安全护栏 | **NeMo Guardrails** + Llama Guard/Prompt Guard（本地权重）+ **Presidio**（PII 脱敏） | 最新稳定 | 自研规则中间件 | Apache/MIT（**权重 License 须法务确认**） |
 | 推理运行时 | **vLLM / SGLang**（OpenAI 兼容端点） | vLLM 0.11+ | TGI / 厂商 MindIE 等 | Apache |
 | 国产算力适配 | 昇腾（vLLM-Ascend + MindIE）、摩尔线程（SGLang 主线）为官方级；其余需 30 天压测 | — | 寒武纪/海光/沐曦/昆仑芯（多为厂商 Day-0 宣称） | 以厂商 BOM 为准 |
@@ -69,9 +69,9 @@
 
 > 基线版本以仓库 `pyproject.toml` / `uv.lock` / 镜像 tag 为**权威落地值**；本表用于说明意图，升级流程见 [第 14 章](#14-规范演进与维护)。
 >
-> **评估行注（2026-10-16，经授权偏离，逐条登记于 [ADR-0003](docs/adr/0003-evaluation-framework-and-judge.md)）**：本仓经用户明确授权使用 **RAGAS**，而 RAGAS 0.4.3 的 `requires_dist` **无条件**依赖已归档的 `langchain-community`——这**违反 [NO-14](#13-禁止事项hard-no强制)** 与下表上方的 SDK 行（"`langchain-community` 已归档，**禁止新增引用**"）。缓解形态已落地：RAGAS **只作隔离环境的离线判分器**（`uv run --no-project --with …`，吃录制产物），项目 `pyproject.toml` 与 `uv.lock` **零改动**，**交付物不含 `langchain-community`**。此外 §3.8 的"维护活跃度"存疑（ragas 最近一次发布距今约 9 个月无更新），故 ADR-0003 同时设定**重新评估触发条件**。**该行不得被援引为先例去放宽 NO-14**：确定性判分器（引用完整性、状态、拒答、租户隔离、提示词卫生、检索命中）全部自研，**零第三方依赖**才是本仓的默认形态。
+> **评估行注（2026-10-21 起，经授权偏离，逐条登记于 [ADR-0006](docs/adr/0006-ragas-in-process-evaluation.md)，取代 [ADR-0003](docs/adr/0003-evaluation-framework-and-judge.md) 的隔离形态）**：本仓经用户明确授权把 **RAGAS 接入主流程**，而 RAGAS 0.4.3 的 `requires_dist` **无条件**依赖已归档的 `langchain-community`——这**违反 [NO-14](#13-禁止事项hard-no强制)**。偏离范围被关进 **`eval` 依赖组**：`langchain-community` 作为 ragas 的传递依赖进入 `uv.lock`，但 **`uv sync` 默认不安装、运行时模块不得 import、生产镜像不得包含**；评估命令一律 `uv run --group eval`。`ragas==0.4.3` 精确锁定（判分实现依赖其私有方法），`langchain-community` 钉 `<0.4`（0.4.x 删除了 ragas import 的模块）。§3.8 的"维护活跃度"存疑（ragas 最近一次发布距今约 9 个月无更新），升级前必须重跑评估并更新 ADR。**该行不得被援引为先例去放宽 NO-14**：确定性判分器（检索三项、引用完整性、拒答、租户隔离、提示词卫生、图片指标）仍全部自研，**零第三方依赖**是本仓的默认形态；引用准确率走自研裁判提示词，不经 RAGAS；除 ragas 的传递依赖外，任何新增对归档库的引用仍不予合入。
 >
-> **评估行注之二（裁判模型）**：裁判复用 `primary-chat` 的上游模型，存在自偏好偏置，`faithfulness` / `answer_relevancy` **偏乐观、不得当中性分数**；§5.8 要求生产使用本地裁判模型，本仓演示期属**偏离**，已随每份产物落 `run.judge.caveat` 并在报告中显著展示。
+> **评估行注之二（裁判模型，2026-10-21 起，[ADR-0005](docs/adr/0005-cloud-qwen-judge.md)）**：裁判经网关 `judge` 指向 **SiliconFlow 云端 Qwen**（当前 `Qwen/Qwen3.5-122B-A10B`），与生成模型 `primary-chat`（DeepSeek）**不同家族**，ADR-0003 登记的自偏好偏置在该路径上消除；但**评估数据（问题、证据、答案）会出域**，仅限公开演示语料，**客户数据与生产环境不得使用**。§5.8 要求生产使用本地裁判模型，本仓演示期属**偏离**，已随每份产物落 `run.judge.caveat` 并在报告中显著展示。裁判的上游型号必须随产物留痕（`JUDGE_UPSTREAM_MODEL` → `JudgeSnapshot.upstream_model`），**不得只记逻辑名**；判分缓存键必须包含裁判身份，换型号必须换缓存。
 
 ---
 
@@ -157,9 +157,9 @@
 
 > **落地现状（2026-10-20 核对：规范声明必须与仓库现实一致，不得据上表假设某目录已存在）**
 >
-> **已落地**：`src/agent_platform/` 下的 `core/`、`knowledge/`（含证据图片本地存储 `images.py`，ADR-0004）、`agents/`、`api/`、`tenants/`、`guardrails/`（`sanitize.py` 不可信内容中和）、`evaluation/`、`utils/`；`tests/` 下 `unit/`、`integration/`、`evals/`（含黄金集 28 条、阈值 `config/thresholds.toml`、入库基线 `baselines/`、评审协议 `README.md`）；`scripts/`（含 `eval_run.py`、`eval_ragas.py`）、`deploy/docker/`、`deploy/k8s/`、`docs/adr/`、`docs/runbooks/`、`langgraph.json`、`docker-compose.yml`、`.claude/settings.json`。
+> **已落地**：`src/agent_platform/` 下的 `core/`、`knowledge/`（含证据图片本地存储 `images.py`，ADR-0004）、`agents/`、`api/`、`tenants/`、`guardrails/`（`sanitize.py` 不可信内容中和）、`evaluation/`、`utils/`；`tests/` 下 `unit/`、`integration/`、`evals/`（含黄金集 32 条、阈值 `config/thresholds.toml`、入库基线 `baselines/`、评审协议 `README.md`）；`scripts/`（含 `eval_run.py`、`eval_label_worksheet.py`、`eval_audit_citations.py`）、`deploy/docker/`、`deploy/k8s/`、`docs/adr/`、`docs/runbooks/`、`langgraph.json`、`docker-compose.yml`、`.claude/settings.json`。
 >
-> **`evaluation/` 的落地范围（2026-10-16 起，此前列为空壳）**：已具备**确定性判分器**（引用完整性、状态、拒答、租户隔离、提示词卫生、检索命中；零 I/O 零网络）、**裁判层**（版本化提示词资产 + 判分缓存 + 原始输出留痕）、**门禁判定与基线对比**（含配置漂移检测与 `--promote-baseline`）、**黄金集装载与签署分流**。**尚未具备**：HITL 样例（图中无 `interrupt()`，schema 预留取值但**不编造**样例）、分路检索分数（`vector_score` / `bm25_score` 结构性未采集）、间接注入的端到端对抗夹具（需写 Milvus，默认不做）。完整清单与逐条证据见 `tests/evals/README.md` 第五节。
+> **`evaluation/` 的落地范围（2026-10-21 起，评估方案更换，[ADR-0006](docs/adr/0006-ragas-in-process-evaluation.md)）**：已具备**确定性判分器**（检索三项 `recall_at_k` / `precision_at_k` / `mrr` 与监控项 `document_precision_at_k`、引用完整性、拒答、租户隔离、提示词卫生、两项图片指标；零 I/O 零网络）、**RAGAS 进程内判分**（`ragas_backend.py` 懒导入 + `ragas_judge.py` 适用性/缓存/错误隔离，`eval` 依赖组）、**引用裁判**（`citation.judge.v1` 提示词 + 严格索引集合校验）、**门禁判定与基线对比**（幻觉率仅监控、监控指标不得设阈值）、**黄金集装载、人工相关性标签与签署分流**（21 条可答题标签由 AI 起草共 31 条，`ks` 于 2026-10-21 签署）、**引用人工抽检脚本**。已退役：`retrieval_hit`、`status_accuracy`。**尚未具备**：HITL 样例（图中无 `interrupt()`，schema 预留取值但**不编造**样例）、分路检索分数（`vector_score` / `bm25_score` 结构性未采集）、间接注入的端到端对抗夹具（需写 Milvus，默认不做）。完整清单与逐条证据见 `tests/evals/README.md`。
 >
 > **仅有空壳（目录在、能力未实现）**：`guardrails/` 中除 `sanitize.py` 外的护栏（NeMo Guardrails / Presidio 未接入）。引用时按"接口占位"对待，不得当作已有能力。
 >
@@ -318,7 +318,7 @@
 5. **Prompt 一律资产化**：放 `agents/<name>/prompts/`，模板与代码分离、命名版本化（如 `review.system.v3.jinja`）；变量经模板渲染并做注入/转义；**不得**在节点里内联拼接大段提示词。
 6. 结构化输出必须用模型的 function/JSON 模式 + Pydantic 校验，解析失败进入重试/纠偏/兜底分支，不得信任未校验的模型文本。
 7. 必须记录每次调用的模型逻辑名、token 用量、耗时、成本归属（租户/场景）到 Langfuse，用于成本核算与容量规划。
-8. 评估/裁判（judge）模型在私有化场景应使用**本地模型**，数据不得出域。
+8. 评估/裁判（judge）模型在私有化场景应使用**本地模型**，数据不得出域。**演示期偏离（ADR-0005 / ADR-0006）**：RAGAS 判分与 Answer Relevancy / Correctness 的嵌入会把问题、检索证据、答案、**参考答案**发往云端 Qwen 与云端嵌入；引用裁判同理。仅限公开演示语料，客户数据与生产环境不得使用。
 
 ---
 
@@ -409,7 +409,13 @@
 - 评估框架用 RAGAS/DeepEval/Promptfoo，LLM-as-judge 的裁判模型与标准固定并记录版本；指标与阈值在配置中声明。
 - **以下变更必须跑评估回归并达标方可合入/上线**：Prompt 改动、模型/温度、检索策略（切分/Top-K/阈值/rerank/embedding）、工具描述、图结构、护栏策略。结果留痕（分数、样例、对比）。
 - 评估集与代码同库、随缺陷持续补充（每修复一个真实坏例，沉淀为回归用例）；不得用训练/评估同源数据"自评自满"。
-- **本仓落地形态（2026-10-16，[ADR-0003](docs/adr/0003-evaluation-framework-and-judge.md)）**：判分分两层——**确定性判分器**（引用完整性、状态、拒答、租户隔离、提示词卫生、检索命中；零 I/O 零网络、可离线单测）为主干，**模型裁判**只用于确定性判分覆盖不到的语义项（`faithfulness` / `answer_relevancy`）。**RAGAS 经授权使用但以隔离环境离线判分器的形态落地**（它无条件依赖已归档的 `langchain-community`，违反 NO-14，见第 1 章脚注）；**交付物不得引入 `langchain-community`**。裁判与生成同源时必须在产物与报告中显著标注偏置，**不得当中性分数**使用。阈值放 `tests/evals/config/thresholds.toml`，**刻意不进 `settings.py`**——环境变量意味着可以一行 `export` 把门禁调松而产物里看不出区别；文件则必经一次提交、一次评审。**评估不得进入 pre-commit**（慢、要密钥、要基础设施，放进去只会训练人加 `--no-verify`）。**门禁语义不得放宽**：指标未被采集（样本量不足或该指标本轮缺席）一律**不判通过**——"没采够就是没证据"，与 NO-12 同一条道理。**"没测出来"必须与"考砸了"分开建模**：测量本身失败（裁判输出无法解析、超时等）的指标**不得带分数**，必须在契约里与 `fail`/`not_applicable` 并列成第三种取值；把它记成 `0.0` 等于凭空造一个数据点，一次测量故障会被读成一次质量回归——首份基线对比时真实发生过（`faithfulness` 被压低 1/23，报告显示"跌破"、样例进"新失败样例"，而模型什么都没做错）。**未采集仍不判通过**（可见性一分不减），但不得污染聚合分。
+- **本仓落地形态（2026-10-21，评估方案更换，[ADR-0006](docs/adr/0006-ragas-in-process-evaluation.md)）**：`K = EVIDENCE_TOP_K = 8`，检索指标只对有**人工签署的相关文档全集**（`relevant_documents`）的可答题采集。
+  - **检索侧（确定性，自研）**：`recall_at_k`（相关文档∩证据文档 ÷ 相关文档，文档按 basename + casefold 去重，阈值 0.90）、`precision_at_k`（相关证据块 ÷ **实际返回块数**，阈值 0.60）、`mrr`（首个相关证据位次的倒数，阈值 0.75）；`document_precision_at_k` 为文档级诊断，**仅监控**。Precision 用块级分母，因为可答题多数只有 1–2 份相关文档，固定分母 8 在数学上够不到 0.60。
+  - **生成侧（RAGAS 0.4.3，进程内）**：`faithfulness`（0.90）、`answer_relevancy`（0.85）、`answer_correctness`（0.85，需参考答案）；`hallucination_rate = 1 − aggregate(faithfulness)`，**仅监控、不设阈值**。期望 `answered` 而实际拒答/空答案时 `answer_correctness` 直接记 `FAIL 0.0`，不调 RAGAS；拒答题三项生成指标全部 `NOT_APPLICABLE`，由 `refusal_correctness` 兜底。RAGAS 的空断言陷阱必须以 `StrictAnswerCorrectness` 拦住并记 `ERROR`——0.4.3 在断言抽取为空时会给事实性分 `1.0`，那是"抽取失败"不是"答案正确"。
+  - **引用准确率（自研裁判）**：`citation_accuracy`（阈值 0.95）逐条判定被引用证据是否支持对应断言；输出索引集合必须与 `result.citations` 完全一致，结构对不上记 `FAIL 0.0`，解析失败记 `ERROR`。每轮另有**人工抽检**（确定性随机至多 20 条引用，结论只落 `local_data/`,不入库）：人工与脚本一致率低于 0.90 时，该轮 `citation_accuracy` 不得作为门禁依据。
+  - **保留红线**：`citation_integrity`、`tenant_isolation`、`prompt_hygiene`、`image_citation_integrity` 均 1.00，`image_evidence_hit` 0.90。**已退役**：`retrieval_hit`、`status_accuracy`。
+  - **裁判身份必须完整留痕**：逻辑名之外还要记录上游型号（`JUDGE_UPSTREAM_MODEL` → `JudgeSnapshot.upstream_model`），RAGAS 版本、嵌入型号、遥测关闭状态一并入快照；判分缓存键必须包含裁判身份与 RAGAS 指标配置，换型号/换版本必然换缓存；裁判**不得**走应用层 fallback。云端裁判与云端 RAGAS（[ADR-0005](docs/adr/0005-cloud-qwen-judge.md)）属演示期偏离：评估数据（含参考答案）会出域，仅限公开演示语料。RAGAS 与引用裁判共用同一 Qwen，**独立性只在判分方法**，产物 caveat 必须写明。旧产物（schema v1）新代码读入即报不可读，只作历史，不得与新产品并排比较。
+  - 阈值放 `tests/evals/config/thresholds.toml`（`schema_version=2`），**刻意不进 `settings.py`**；监控指标（`hallucination_rate`、`document_precision_at_k`）**不得**写进阈值文件，读入时直接拒绝。**评估不得进入 pre-commit**（慢、要密钥、要基础设施）。**门禁语义不得放宽**：指标未被采集（样本量不足或本轮缺席）一律**不判通过**——"没采够就是没证据"，与 NO-12 同一条道理。**"没测出来"必须与"考砸了"分开建模**：测量失败的指标**不得带分数**，必须与 `fail`/`not_applicable` 并列成第三种取值；记成 `0.0` 等于凭空造数据点，会把一次测量故障读成一次质量回归。
 - **图片证据的两项确定性指标（ADR-0004）**：`image_evidence_hit`（按文档名 + 页码核对证据里是否出现应命中的图片，**不要求** `media_type=image`——RAGFlow 会把 VLM 描述过的图标成 `table`）与 `image_citation_integrity`（引用的图片必须与对应证据逐张一致，缺图、多图、错图均判失败）。两者都走三态语义：无此类样例时为 `not_applicable`，测量本身失败时不得带分数。没有 `must_hit` 的样例不参与命中率分母。
 - **评估层的依赖方向**：`evaluation → agents/core/knowledge/settings`，**任何运行时模块不得 import 评估层**（否则生产镜像多背一份评估资产，且"生产路径依赖评估代码"会让评估的独立性消失）。
 
@@ -420,7 +426,7 @@
 - **关键必测**：State reducer 并发不覆盖；节点不 mutate 入参；HITL 中断后 resume 正确；副作用幂等（重放不重复执行）；越权工具被拒；无证据时不编造；历史 checkpoint 在版本升级后可恢复。
 - 覆盖率门槛：`core/`、`agents/`、`tools/`、`api/` 行覆盖率 ≥ 80%（关键分支必须覆盖）；测试必须可重复、相互独立，不得依赖外网与真实密钥。
 - pre-commit/CI 必须依次通过：ruff format --check → ruff check → mypy → 单元测试 →（CI）集成测试 → 评估门禁；任一不过不得合入。
-- **评估门禁的落地形态（2026-10-16，观察期）**：评估层已落地（`scripts/eval_run.py`，退出码 0/1/2/3/4），命令链为 `pytest(unit) → pytest -m integration → pytest -m eval（RUN_EVAL_TESTS=true）`。**当前处于观察期**：评估照常产出报告、判定与留痕，`--baseline` 照常检出回归，但**退出码暂不接入 pre-commit**（待黄金集经人工逐条核对签署后再议转阻断）。**观察期只豁免"阻断"这一步，不豁免判定本身**：产物里的结论不得放宽，未采集的指标一律不判通过。`evaluation/` 行覆盖率门槛与 `core/` 等同（关键分支必须覆盖；确定性判分器要求 100%）。**不得以"这个模块要连外部服务"为由整体豁免它的覆盖率**：`evaluation/judge.py` 曾因此豁免，代价是它的失败路径一条都没被跑过，上述"测量故障记成 0 分"的缺陷活了整整一轮才在真实对比中暴露。要连外部服务的模块用 fake 依赖拉回离线单测（该模块现为 95%），只有**真正只能**在真实基础设施上执行的部分才可豁免，且须逐条写明理由。
+- **评估门禁的落地形态（2026-10-16，观察期）**：评估层已落地（`scripts/eval_run.py`，退出码 0/1/2/3/4），命令链为 `pytest(unit) → pytest -m integration → pytest -m eval（RUN_EVAL_TESTS=true）`。**当前处于观察期**：评估照常产出报告、判定与留痕，`--baseline` 照常检出回归，但**退出码暂不接入 pre-commit**（待黄金集经人工逐条核对签署后再议转阻断）。**观察期只豁免"阻断"这一步，不豁免判定本身**：产物里的结论不得放宽，未采集的指标一律不判通过。`evaluation/` 行覆盖率门槛与 `core/` 等同（关键分支必须覆盖；确定性判分器要求 100%）。**不得以"这个模块要连外部服务"为由整体豁免它的覆盖率**：`evaluation/judge.py` 曾因此豁免，代价是它的失败路径一条都没被跑过，上述"测量故障记成 0 分"的缺陷活了整整一轮才在真实对比中暴露。要连外部服务的模块用 fake 依赖拉回离线单测（该模块现为 95%），只有**真正只能**在真实基础设施上执行的部分才可豁免，且须逐条写明理由。**RAGAS 适配器同样按此办理**：`ragas_judge.py` 的适用性、错误隔离、缓存与三态语义全部用 fake backend 离线覆盖；`ragas_backend.py` 只豁免真正要连 ragas 与网关的构造与调用部分。遥测关闭用子进程断言，不得只在注释里声称。
 
 ---
 
@@ -429,7 +435,7 @@
 ### 10.1 密钥与数据保护
 
 - 密钥仅来自 Secret/环境变量注入，**禁止**入库、入日志、入异常、入前端、进 Prompt 与 checkpoint；定期轮转。
-- 客户数据、文档、对话默认**不出域**；私有化部署全部组件（模型、嵌入、rerank、judge、Langfuse、向量库）内网可运行。
+- 客户数据、文档、对话默认**不出域**；私有化部署全部组件（模型、嵌入、rerank、judge、Langfuse、向量库）内网可运行。**评估链路的演示期偏离**：嵌入 / rerank / 视觉模型 / 裁判（含 RAGAS 的判分与嵌入）经网关指向云端，评估数据——含黄金集参考答案——会出域；仅限公开演示语料，客户数据与生产环境不得使用（ADR-0002 / 0005 / 0006）。
 - PII/敏感字段经 **Presidio** 识别与脱敏后再进日志/向第三方（含模型）传递；数据保留与删除策略明确并可执行（含向量库与 checkpoint 的删除）。
 
 ### 10.2 多租户与权限
@@ -527,7 +533,7 @@
 - **NO-11** 不得给智能体挂载超出最小权限的工具集，或让工具接受模型自由文本参数。
 - **NO-12** 不得在无检索证据/无引用时让模型给出事实性结论；不得忽略"无结果/低置信"分支。
 - **NO-13** 不得引入 AGPL / source-available / 商用受限组件（New-API、Dify、FastGPT、受限模型权重等）进入对外生产而未经法务书面确认。
-- **NO-14** 不得新增对已归档的 `langchain-community` 的依赖（迁移至 `langchain-classic` 或独立集成包）。**注（2026-10-16）**：RAGAS 经用户授权采用，而它**无条件**依赖 `langchain-community`——这一处偏离已逐条登记于 [ADR-0003](docs/adr/0003-evaluation-framework-and-judge.md)，其缓解形态是"RAGAS 只作**隔离环境**离线判分器，**交付物与锁文件零污染**"。**本注只说明该条被违在哪里、如何缓解，不改变 NO-14 的效力**：除该授权项外，任何新增对该归档库的引用仍不予合入；也不得援引此注为其它库开同类口子。
+- **NO-14** 不得新增对已归档的 `langchain-community` 的依赖（迁移至 `langchain-classic` 或独立集成包）。**注（2026-10-21 起，[ADR-0006](docs/adr/0006-ragas-in-process-evaluation.md)）**：RAGAS 经用户授权接入主流程，而它**无条件**依赖 `langchain-community`——这一处偏离的缓解形态是 **`eval` 依赖组**：`langchain-community` 作为 ragas 的传递依赖进入 `uv.lock`，但 `uv sync` 默认不安装、运行时模块不得 import、生产镜像不得包含；评估命令一律 `uv run --group eval`。**本注只说明该条被违在哪里、如何缓解，不改变 NO-14 的效力**：除 ragas 的传递依赖外，任何新增对该归档库的引用仍不予合入；也不得援引此注为其它库开同类口子。
 - **NO-15** 不得让数据出域到 SaaS 可观测/评估平台（LangSmith 等）而未通过离线合规评估；默认自托管 Langfuse。
 - **NO-16** 不得在未跑评估回归并达标的情况下，改动 Prompt/模型/检索策略/图结构/护栏后直接上线。
 - **NO-17** 不得提交 `.env`、真实密钥、模型权重、大体积二进制、客户数据到仓库。

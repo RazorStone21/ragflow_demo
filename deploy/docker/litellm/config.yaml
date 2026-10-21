@@ -1,7 +1,7 @@
 # =============================================================================
 # LiteLLM Proxy 模型映射（CLAUDE.md 5.1 / 5.2 / NO-02）
 #
-# 业务代码只认左侧的逻辑名（primary-chat / embedding / rerank，见 .env.example），
+# 业务代码只认左侧的逻辑名（primary-chat / embedding / rerank / judge / vision-chat），
 # 具体型号只在本文件出现。换型号或切私有化端点，改这里，不改任何业务代码。
 #
 # 密钥一律 os.environ/... 注入，本文件不得出现真实密钥（NO-03 / 10.1）。
@@ -102,18 +102,27 @@ model_list:
   # 【temperature=0 是硬要求】CLAUDE.md 5.3：评测用固定随机种子或 temperature=0。
   # 裁判分数若带随机性，"这次比基线低 2 分"就分不清是模型退化还是采样抖动。
   #
-  # 【已知偏置——必须原样保留这段注释】上游与 primary-chat 同为 deepseek-chat，
-  # 即**裁判与被评者是同一个模型**，存在自偏好（self-preference）偏置：
-  # faithfulness / answer_relevancy 一类分数会偏乐观，不得当中性分数使用。
-  # 这是演示期的授权偏离（用户决策），已在 docs/adr/0003 登记，产物里也会
-  # 逐条标记 caveat。生产应换**独立家族**的私有化模型（CLAUDE.md 5.8）。
+  # 【2026-10-21 换型：DeepSeek → 硅基流动 Qwen】上游改为
+  # `openai/Qwen/Qwen3.5-122B-A10B`（OpenAI 兼容通道 + api_base，理由同 embedding），
+  # 与生成模型 primary-chat（DeepSeek）**不同家族**，原先"裁判与被评者同源"的
+  # 自偏好偏置不再成立。型号先在网关容器内用 /v1/models 与一次 50 token 的 JSON
+  # 探测验证过（纯 JSON 返回，约 3.7 秒）。
+  #
+  # 【边界——必须原样保留这段注释】裁判在云端，**问题、检索证据与答案会出域到
+  # SiliconFlow**。仅限公开演示语料，客户数据与生产环境不得使用；生产须换
+  # 私有化裁判（CLAUDE.md 5.8 / 10.1）。该偏离登记于 docs/adr/0005，产物里
+  # 逐条写入 run.judge.caveat。
+  #
+  # 【max_tokens=4096】与 evaluation/judge.py 的默认值一致：faithfulness 要为
+  # 答案里的每条断言输出一条判定，长答案会被截断。改这里要同步改应用侧。
   # ---------------------------------------------------------------------------
   - model_name: judge
     litellm_params:
-      model: deepseek/deepseek-chat
-      api_key: os.environ/DEEPSEEK_API_KEY
+      model: openai/Qwen/Qwen3.5-122B-A10B
+      api_base: https://api.siliconflow.cn/v1
+      api_key: os.environ/SILICONFLOW_API_KEY
       temperature: 0.0
-      max_tokens: 1024
+      max_tokens: 4096
 
   # ---------------------------------------------------------------------------
   # vision-chat：多模态解析期的图片理解（ADR-0004）

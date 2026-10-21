@@ -92,6 +92,14 @@ class Settings(BaseSettings):
         min_length=1,
         description="评估裁判模型的网关逻辑名（CLAUDE.md 5.2 / 9.2）；仅评估层使用",
     )
+    judge_upstream_model: str = Field(
+        default="",
+        description=(
+            "网关 judge 路由背后的上游型号（如 Qwen/Qwen3.5-122B-A10B），"
+            "仅用于产物留痕与判分缓存键，不参与路由；必须与网关映射保持一致。"
+            "留空表示未记录。型号属配置，不得写死在代码里（NO-03）"
+        ),
+    )
     model_timeout_s: float = Field(default=120.0, gt=0, le=600)
     model_max_retries: int = Field(default=2, ge=0, le=5)
 
@@ -170,8 +178,6 @@ class Settings(BaseSettings):
     """
     eval_runs_dir: Path = Path("local_data/evals/runs")
     eval_judge_cache_dir: Path = Path("local_data/evals/cache")
-    eval_ragas_dir: Path = Path("local_data/evals/ragas")
-    """RAGAS 旁挂产物的落盘目录（隔离环境跑出来，见 ADR-0003）。"""
 
     # --- 测试 ---
     run_integration_tests: bool = False

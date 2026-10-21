@@ -16,7 +16,9 @@ import pytest
 
 from agent_platform.agents.gov_policy_qa.state import AnswerStatus
 from agent_platform.core.models import build_chat_model
-from agent_platform.evaluation.judge import Judge
+from agent_platform.evaluation.judge import CitationJudge
+from agent_platform.evaluation.ragas_backend import build_ragas_backend
+from agent_platform.evaluation.ragas_judge import RagasJudge
 from agent_platform.evaluation.runner import (
     EVAL_FOREIGN_TENANT_ID,
     RunnerDeps,
@@ -114,28 +116,68 @@ async def test_graph_produces_answer_and_trace(graph_result: CaseResult) -> None
     assert graph_result.answer.strip(), "图产出了空答案"
 
 
-async def test_judge_route_returns_parsed_verdict(
+async def test_ragas_route_returns_parsed_metrics(
     eval_deps: RunnerDeps, smoke_case: GoldenCase, graph_result: CaseResult
 ) -> None:
-    """裁判路由存在，且输出能被解析成裁决（ADR-0003 的裁判接线）。
+    """RAGAS 路由存在，且三项都返回可解析的分数（ADR-0006 的裁判接线）。
 
-    这条用例专门拦"网关没加载 ``judge`` 路由"这一类故障：那种情况下裁判调用会
-    整体失败，指标记成 FAIL 而**不是**跳过，于是门禁看起来只是"分数低"。
+    这条用例专门拦"网关没加载 ``judge`` / ``embedding`` 路由"这一类故障：那种
+    情况下 RAGAS 调用会整体失败、指标记成 ``ERROR``，门禁看起来只是"没测出来"。
+    缓存刻意关掉：命中缓存能绕过网关，冒烟要验的恰恰是网关这条路。
+
+    只断言 faithfulness 与 answer_relevancy：``answer_correctness`` 需要参考
+    答案，而冒烟样例未必带——按"缺失即 N/A"的适用性规则跳过它不算接线故障。
     """
-    judge = Judge(
-        build_chat_model(eval_deps.settings, logical_name=eval_deps.settings.judge_model),
-        logical_name=eval_deps.settings.judge_model,
+    judge = RagasJudge(
+        build_ragas_backend(eval_deps.settings),
         cache_dir=eval_deps.settings.eval_judge_cache_dir,
+        cache_enabled=False,
     )
-    scored = await judge.score(smoke_case, graph_result)
+    try:
+        scored = await judge.score(smoke_case, graph_result)
+    finally:
+        await judge.aclose()
     by_name = {metric.name: metric for metric in scored.metrics}
 
     for name in (MetricName.FAITHFULNESS, MetricName.ANSWER_RELEVANCY):
-        assert name in by_name, f"裁判未产出 {name.value}"
+        assert name in by_name, f"RAGAS 未产出 {name.value}"
         metric = by_name[name]
         # 这条样例检索得到证据、也出得来答案，因此两项都应**真的判了**；
         # 若此处变成"不适用"，说明适用性判据写错了，而它会把门禁悄悄放空。
         assert metric.verdict is not MetricVerdict.NOT_APPLICABLE, f"{name.value} 意外不适用"
-        assert metric.score is not None
+        assert metric.score is not None, f"{name.value} 未测出结果：{metric.detail}"
 
-    assert scored.judge_raw, "裁判原始输出未留痕（§9.2 要求可判'样例错还是模型错'）"
+    assert scored.judge_raw, "RAGAS 原始输出未留痕（§9.2 要求可判'样例错还是模型错'）"
+
+
+async def test_citation_judge_returns_parsed_verdict(
+    eval_deps: RunnerDeps, smoke_case: GoldenCase, graph_result: CaseResult
+) -> None:
+    """引用裁判路由存在，且输出能被解析成逐条判定。
+
+    无引用的答案走 ``NOT_APPLICABLE`` 且不调用模型；有引用时必须是可解析的分数，
+    ``ERROR`` 意味着网关或结构约定坏了——两种情形都要与"引用不支持"区分开。
+    """
+    judge = CitationJudge(
+        build_chat_model(
+            eval_deps.settings,
+            logical_name=eval_deps.settings.judge_model,
+            use_fallback=False,
+        ),
+        logical_name=eval_deps.settings.judge_model,
+        upstream_model=eval_deps.settings.judge_upstream_model,
+        cache_dir=eval_deps.settings.eval_judge_cache_dir,
+        cache_enabled=False,
+    )
+    scored = await judge.score(smoke_case, graph_result)
+    metric = next(
+        (item for item in scored.metrics if item.name is MetricName.CITATION_ACCURACY), None
+    )
+
+    assert metric is not None, "引用裁判未产出 citation_accuracy"
+    assert metric.verdict is not MetricVerdict.ERROR, metric.detail
+    if graph_result.citations:
+        assert metric.score is not None
+        assert scored.judge_raw, "裁判原始输出未留痕（§9.2 要求可判'样例错还是模型错'）"
+    else:
+        assert metric.verdict is MetricVerdict.NOT_APPLICABLE

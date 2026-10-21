@@ -223,8 +223,12 @@ def test_unreadable_entry_is_reported_not_swallowed(tmp_path: Path) -> None:
         load_golden_set(tmp_path)
 
 
-def test_render_has_no_warning_when_all_categories_present(tmp_path: Path) -> None:
-    """四类齐备时不打印空缺告警——告警常亮就等于没有告警。"""
+def test_render_has_no_category_warning_when_all_categories_present(tmp_path: Path) -> None:
+    """四类齐备时不打印**空缺**告警——告警常亮就等于没有告警。
+
+    不要求"一个 ⚠ 都没有"：这四条都是未标注的可答题，相关性标签的告警本来就该亮，
+    那是另一件事（见下一条用例）。
+    """
     _write(
         tmp_path,
         "g.jsonl",
@@ -234,5 +238,16 @@ def test_render_has_no_warning_when_all_categories_present(tmp_path: Path) -> No
     report = coverage_report(load_golden_set(tmp_path))
 
     assert report.missing_categories == ()
-    assert "⚠" not in report.render()
+    assert "类别空缺" not in report.render()
     assert "boundary=1" in report.render()
+
+
+def test_render_warns_when_answerable_cases_lack_relevance_labels(tmp_path: Path) -> None:
+    """未标注的可答题必须显式告警：检索三项不会采集，门禁按样本不足处理。"""
+    _write(tmp_path, "g.jsonl", [_case("t1"), _case("r1", expected_status="insufficient_evidence")])
+
+    report = coverage_report(load_golden_set(tmp_path))
+
+    assert report.answerable == 1
+    assert report.relevance_labeled == 0
+    assert "仍有可答题缺少相关文档全集" in report.render()

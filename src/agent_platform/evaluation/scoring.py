@@ -57,38 +57,79 @@ _NO_INDEX_LIMIT = 10**9
 """
 
 
-def score_retrieval_hit(case: GoldenCase, result: CaseResult) -> MetricResult:
-    """证据是否命中了全部 ``must_hit`` 期望文档。
+def score_retrieval_metrics(case: GoldenCase, result: CaseResult, *, k: int) -> list[MetricResult]:
+    """检索三项（Recall@K / Precision@K / MRR）与文档级诊断（ADR-0006）。
 
-    按**文件名**比对（去目录、大小写归一），不做语义相似、不看片段内容。
-    这样判据与"是否命中同一片段"解耦：重解析入库会改变 ``chunk_id``，
-    但不该改变"这份文档被检索到了"这一事实。
+    文档一律按**文件名**比对（去目录、大小写归一）。``relevant_documents`` 是
+    人工签署的**全集**，不是某次检索结果的摘抄——否则 Recall 恒为满分。
+    证据取前 ``k`` 条（runner 按本次 ``EVIDENCE_TOP_K`` 传入），因此指标名里的
+    K 与本次运行实际生效的策略一致，不会出现"配置改了、分数还按旧 K 记"。
+
+    逐例判定宽松：分数 > 0 记 ``PASS``，整体质量由聚合阈值负责。这样一条
+    Recall 0.5 的样例不会把整轮 verdict 拖红——它会在聚合分上如实体现。
 
     Args:
         case: 黄金集样例。
         result: 该样例的执行结果。
+        k: 本次运行进入上下文的证据条数上限（``EVIDENCE_TOP_K``）。
 
     Returns:
-        ``NOT_APPLICABLE``（没有 must_hit 期望，如拒答题）；否则为命中比例，
-        全部命中记 ``PASS``。
+        四项指标，顺序固定为 Recall、Precision、MRR、文档级精确率：
+        非可答题或缺少签署标签时四项全为 ``NOT_APPLICABLE``；证据为空时
+        Recall 与 MRR 记 ``FAIL 0.0``，两项 Precision 记 ``NOT_APPLICABLE``。
     """
-    required = [doc.name for doc in case.expected_documents if doc.must_hit]
-    if not required:
-        return _na(MetricName.RETRIEVAL_HIT, "本题未声明必须命中的文档")
+    if not case.is_answerable:
+        return _retrieval_all_na("本题不是可答题（期望状态非 answered），检索三项不适用")
+    if not case.has_relevance_labels:
+        return _retrieval_all_na("本题未签署相关文档全集，检索三项不采集（缺样本不得判通过）")
 
-    found = {_normalize_name(item.document_name) for item in result.evidence}
-    found |= {_normalize_name(item.source_uri) for item in result.evidence}
-    missing = [name for name in required if _normalize_name(name) not in found]
-    hit = len(required) - len(missing)
-    score = hit / len(required)
-    if not missing:
-        return _metric(MetricName.RETRIEVAL_HIT, MetricVerdict.PASS, score, f"全部命中（{hit} 份）")
-    return _metric(
-        MetricName.RETRIEVAL_HIT,
-        MetricVerdict.FAIL,
-        score,
-        f"未命中 {len(missing)}/{len(required)} 份：{'、'.join(missing)}",
+    relevant = {_normalize_name(doc.file_name) for doc in case.relevant_documents}
+    evidence = list(result.evidence[:k])
+    if not evidence:
+        return [
+            _metric(MetricName.RECALL_AT_K, MetricVerdict.FAIL, 0.0, "证据为空，未召回任何文档"),
+            _na(MetricName.PRECISION_AT_K, "证据为空，没有可做分母的返回块"),
+            _metric(MetricName.MRR, MetricVerdict.FAIL, 0.0, "证据为空，不存在首条相关证据"),
+            _na(MetricName.DOCUMENT_PRECISION_AT_K, "证据为空，没有可做分母的文档集合"),
+        ]
+
+    chunk_docs = [_evidence_document(item) for item in evidence]
+    covered = relevant & {name for name in chunk_docs if name}
+    missing = sorted(relevant - covered)
+    recall = len(covered) / len(relevant)
+    recall_detail = f"覆盖 {len(covered)}/{len(relevant)} 份相关文档"
+    if missing:
+        recall_detail += f"；未覆盖：{'、'.join(missing)}"
+
+    hits = sum(1 for name in chunk_docs if name in relevant)
+    precision = hits / len(evidence)
+
+    rank = next((i for i, name in enumerate(chunk_docs, start=1) if name in relevant), None)
+    mrr = 1.0 / rank if rank is not None else 0.0
+    mrr_detail = (
+        f"首条相关证据位次 {rank}（1/{rank}）"
+        if rank is not None
+        else f"前 {len(evidence)} 条证据均不来自相关文档"
     )
+
+    documents = {name for name in chunk_docs if name}
+    related_documents = documents & relevant
+    return [
+        _graded(MetricName.RECALL_AT_K, recall, recall_detail),
+        _graded(
+            MetricName.PRECISION_AT_K,
+            precision,
+            f"{hits}/{len(evidence)} 块证据来自相关文档",
+        ),
+        _graded(MetricName.MRR, mrr, mrr_detail),
+        _graded(
+            MetricName.DOCUMENT_PRECISION_AT_K,
+            len(related_documents) / len(documents),
+            f"证据涉及 {len(documents)} 份文档，其中 {len(related_documents)} 份相关（仅监控）",
+        )
+        if documents
+        else _na(MetricName.DOCUMENT_PRECISION_AT_K, "证据均无文档名，无法做文档级诊断"),
+    ]
 
 
 def score_image_evidence_hit(case: GoldenCase, result: CaseResult) -> MetricResult:
@@ -187,20 +228,6 @@ def score_image_citation_integrity(case: GoldenCase, result: CaseResult) -> Metr
         MetricVerdict.PASS,
         1.0,
         f"{checked} 条带图引用与证据一致",
-    )
-
-
-def score_status(case: GoldenCase, result: CaseResult) -> MetricResult:
-    """实际答案状态是否等于期望状态。"""
-    actual = result.answer_status
-    expected = case.expected_status.value
-    if actual == expected:
-        return _metric(MetricName.STATUS_ACCURACY, MetricVerdict.PASS, 1.0, f"状态为 {actual}")
-    return _metric(
-        MetricName.STATUS_ACCURACY,
-        MetricVerdict.FAIL,
-        0.0,
-        f"期望 {expected}，实际 {actual or '<空>'}",
     )
 
 
@@ -353,17 +380,20 @@ def score_case(
     case: GoldenCase,
     result: CaseResult,
     *,
+    k: int,
     foreign_evidence: Iterable[EvidenceItem] = (),
     rendered_prompt: str | None = None,
 ) -> CaseResult:
     """对一条样例跑完全部适用指标，返回**附加了 metrics** 的新结果。
 
-    以"骨架是否具备"决定哪些指标进入：检索层只判命中，图/裁判层才判状态、引用与拒答。
+    以"骨架是否具备"决定哪些指标进入：检索层只判检索与图片命中，
+    图/裁判层才判引用与拒答（其余生成侧指标由裁判层判定后并入）。
     这样同一条样例在不同 ``--layer`` 下的指标集合是可预期的，聚合口径才稳定。
 
     Args:
         case: 黄金集样例。
         result: 该样例的执行结果。
+        k: 进入上下文的证据条数上限（``EVIDENCE_TOP_K``），检索三项的 K。
         foreign_evidence: 跨租户探针证据（仅安全类样例由 runner 提供）。
         rendered_prompt: 生产渲染路径的提示词文本；``None`` 表示未渲染（跳过该指标）。
 
@@ -371,11 +401,10 @@ def score_case(
         新的 ``CaseResult``（原对象不被修改——`frozen=True` 的模型本就不能原地改）。
     """
     metrics: list[MetricResult] = [
-        score_retrieval_hit(case, result),
+        *score_retrieval_metrics(case, result, k=k),
         score_image_evidence_hit(case, result),
     ]
     if result.layer is not EvalLayer.RETRIEVAL:
-        metrics.append(score_status(case, result))
         metrics.append(score_citations(case, result))
         metrics.append(score_refusal(case, result))
         metrics.append(score_image_citation_integrity(case, result))
@@ -387,6 +416,27 @@ def score_case(
         metric for metric in result.metrics if metric.name not in {m.name for m in metrics}
     )
     return result.model_copy(update={"metrics": metrics})
+
+
+def _evidence_document(item: EvidenceItem) -> str:
+    """证据块对应的文档名（``document_name`` 优先，缺失时退回 ``source_uri``）。"""
+    return _normalize_name(item.document_name or item.source_uri)
+
+
+def _retrieval_all_na(detail: str) -> list[MetricResult]:
+    """检索四项统一记为不适用（同一理由，避免四条 detail 各写一遍）。"""
+    return [
+        _na(MetricName.RECALL_AT_K, detail),
+        _na(MetricName.PRECISION_AT_K, detail),
+        _na(MetricName.MRR, detail),
+        _na(MetricName.DOCUMENT_PRECISION_AT_K, detail),
+    ]
+
+
+def _graded(name: MetricName, score: float, detail: str) -> MetricResult:
+    """带分数的指标：> 0 即 ``PASS``，0 即 ``FAIL``（聚合阈值负责整体质量）。"""
+    verdict = MetricVerdict.PASS if score > 0 else MetricVerdict.FAIL
+    return _metric(name, verdict, score, detail)
 
 
 def _find_misplaced_citations(result: CaseResult) -> list[str]:
@@ -451,7 +501,6 @@ __all__: list[str] = [
     "score_image_evidence_hit",
     "score_prompt_hygiene",
     "score_refusal",
-    "score_retrieval_hit",
-    "score_status",
+    "score_retrieval_metrics",
     "score_tenant_isolation",
 ]

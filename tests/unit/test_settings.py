@@ -41,6 +41,26 @@ def test_defaults_and_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.agent_api_bearer_token.get_secret_value() == "tok"
 
 
+def test_judge_upstream_model_defaults_empty_and_reads_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """裁判上游型号只作留痕：默认空串（不写死型号），可由环境变量注入。
+
+    默认**不能**给一个型号：那等于替没配置的环境编造"谁在判"，而留痕字段造假的
+    后果是产物看上去可追溯、实际追溯不到。型号由部署配置决定（NO-03）。
+    """
+    monkeypatch.setenv("AGENT_API_BEARER_TOKEN", "tok")
+    monkeypatch.setenv("POSTGRES_DSN", "postgresql://u:p@h:5432/d")
+    monkeypatch.setenv("LITELLM_API_KEY", "lk")
+    monkeypatch.setenv("RAGFLOW_API_KEY", "rk")
+    monkeypatch.delenv("JUDGE_UPSTREAM_MODEL", raising=False)
+
+    assert load_settings(env_file=None).judge_upstream_model == ""
+
+    monkeypatch.setenv("JUDGE_UPSTREAM_MODEL", "Qwen/Qwen3.5-122B-A10B")
+    assert load_settings(env_file=None).judge_upstream_model == "Qwen/Qwen3.5-122B-A10B"
+
+
 def test_invalid_value_fails_fast(monkeypatch: pytest.MonkeyPatch) -> None:
     """非法取值（超范围）启动即失败，并指出变量名。"""
     monkeypatch.setenv("AGENT_API_BEARER_TOKEN", "tok")

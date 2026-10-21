@@ -57,6 +57,8 @@ from agent_platform.evaluation.schemas import (
 # ---------------------------------------------------------------------------
 
 _THRESHOLDS_TOML = """\
+schema_version = 2
+
 [thresholds]
 citation_integrity = 1.00
 faithfulness = 0.80
@@ -65,6 +67,17 @@ faithfulness = 0.80
 citation_integrity = 2
 faithfulness = 1
 """
+
+
+def _write_thresholds(tmp_path: Path, body: str) -> Path:
+    """写一份带当前结构版本的阈值文件；``body`` 只放用例真正关心的段落。
+
+    版本号由这里统一加：``load_thresholds`` 先校验版本、后校验内容，漏掉它时
+    任何"未知指标名""值不合法"的用例都会先撞上版本错误，测的就不是它想测的。
+    """
+    path = tmp_path / "thresholds.toml"
+    path.write_text(f"schema_version = {SCHEMA_VERSION}\n\n{body}", encoding="utf-8")
+    return path
 
 
 def _metric(name: MetricName, verdict: MetricVerdict, score: float | None) -> MetricResult:
@@ -145,7 +158,7 @@ def test_aggregate_excludes_not_applicable_from_the_denominator() -> None:
             ],
         ),
     ]
-    assert aggregate(cases) == {"faithfulness": 1.0}
+    assert aggregate(cases) == {"faithfulness": 1.0, "hallucination_rate": 0.0}
     assert metric_samples(cases) == {"faithfulness": 1}
 
 
@@ -156,7 +169,39 @@ def test_aggregate_rounds_to_four_places() -> None:
         _case("b", metrics=[_metric(MetricName.FAITHFULNESS, MetricVerdict.FAIL, 0.0)]),
         _case("c", metrics=[_metric(MetricName.FAITHFULNESS, MetricVerdict.FAIL, 0.0)]),
     ]
-    assert aggregate(cases) == {"faithfulness": 0.3333}
+    assert aggregate(cases) == {"faithfulness": 0.3333, "hallucination_rate": 0.6667}
+
+
+def test_aggregate_derives_hallucination_rate_from_faithfulness() -> None:
+    """幻觉率不是第七个判分器：它是 ``1 − faithfulness`` 的派生量（ADR-0006）。
+
+    只监控、不设门禁，因此它出现在聚合分里，但**不进** ``metric_samples``——
+    样本数属于 faithfulness，给派生量再记一个"适用条数"会让分母出现两份口径。
+    """
+    cases = [
+        _case("a", metrics=[_metric(MetricName.FAITHFULNESS, MetricVerdict.PASS, 0.8)]),
+        _case("b", metrics=[_metric(MetricName.FAITHFULNESS, MetricVerdict.PASS, 1.0)]),
+    ]
+
+    scores = aggregate(cases)
+    assert scores["hallucination_rate"] == 0.1
+    assert "hallucination_rate" not in metric_samples(cases)
+
+
+def test_aggregate_omits_hallucination_rate_without_faithfulness_samples() -> None:
+    """没有 faithfulness 样本时省略而不是记 0：0 幻觉率读起来是"完美"。
+
+    事实是"这一轮没有可核的证据"，与 NO-12 的"没证据不得给结论"同一条道理。
+    """
+    cases = [
+        _case(
+            "a",
+            metrics=[_metric(MetricName.FAITHFULNESS, MetricVerdict.NOT_APPLICABLE, None)],
+        ),
+        _case("b", metrics=[_metric(MetricName.FAITHFULNESS, MetricVerdict.ERROR, None)]),
+    ]
+
+    assert "hallucination_rate" not in aggregate(cases)
 
 
 def test_aggregate_ignores_cases_that_failed_to_execute() -> None:
@@ -216,9 +261,8 @@ def test_insufficient_samples_is_not_a_pass(thresholds: Any) -> None:
 
 def test_render_gate_marks_unsampled_metric_with_a_dash_not_zero(tmp_path: Path) -> None:
     """没测出来的指标要显示 ``—``：渲染成 0.0000 会被读成"考了零分"。"""
-    path = tmp_path / "thresholds.toml"
-    path.write_text(
-        "[thresholds]\nfaithfulness = 0.80\ncitation_integrity = 1.00\n", encoding="utf-8"
+    path = _write_thresholds(
+        tmp_path, "[thresholds]\nfaithfulness = 0.80\ncitation_integrity = 1.00\n"
     )
     gate = evaluate_gate(
         [_case("a", metrics=[_metric(MetricName.CITATION_INTEGRITY, MetricVerdict.PASS, 1.0)])],
@@ -286,8 +330,7 @@ def test_a_metric_that_errored_everywhere_is_not_reported_as_a_zero(tmp_path: Pa
     忠实，实际该查的是裁判为什么解析不出结构。而"压根没跑这项"（例如只跑了检索层）
     仍走原口径判跌破——本条**不得**把那一条也放走。
     """
-    path = tmp_path / "thresholds.toml"
-    path.write_text("[thresholds]\nfaithfulness = 0.80\n", encoding="utf-8")
+    path = _write_thresholds(tmp_path, "[thresholds]\nfaithfulness = 0.80\n")
     only_errors = evaluate_gate(
         [_case("a", metrics=[_metric(MetricName.FAITHFULNESS, MetricVerdict.ERROR, None)])],
         load_thresholds(path),
@@ -299,6 +342,28 @@ def test_a_metric_that_errored_everywhere_is_not_reported_as_a_zero(tmp_path: Pa
     never_ran = evaluate_gate([_case("a", metrics=[])], load_thresholds(path))
     assert [breach.metric for breach in never_ran.breaches] == [MetricName.FAITHFULNESS]
     assert never_ran.measurement_failures == []
+
+
+def test_render_gate_keeps_monitor_only_metrics_out_of_the_verdict_table(
+    thresholds: Any,
+) -> None:
+    """幻觉率要可见，但**不得**出现在带"达标/跌破"的判定表里。
+
+    它没有阈值，混进门禁表会让读者以为它被考核了；单独一段"监控指标（不设门禁）"
+    既保住了可见性，又把语义说清楚。
+    """
+    metrics = [
+        _metric(MetricName.CITATION_INTEGRITY, MetricVerdict.PASS, 1.0),
+        _metric(MetricName.FAITHFULNESS, MetricVerdict.PASS, 0.9),
+    ]
+    rendered = render_gate(
+        evaluate_gate([_case("a", metrics=metrics), _case("b", metrics=metrics)], thresholds)
+    )
+
+    assert "监控指标（不设门禁）：" in rendered
+    assert "hallucination_rate: 0.1000" in rendered
+    verdict_rows = rendered.split("监控指标（不设门禁）：")[0]
+    assert "hallucination_rate" not in verdict_rows
 
 
 def test_comparison_reports_an_unmeasured_metric_without_a_phantom_drop(thresholds: Any) -> None:
@@ -321,6 +386,31 @@ def test_comparison_reports_an_unmeasured_metric_without_a_phantom_drop(threshol
     rendered = render_comparison(comparison)
     assert "未测全" in rendered
     assert "未采集到结果" in rendered
+
+
+def test_render_comparison_marks_monitor_metrics_without_a_floor_or_samples(
+    thresholds: Any,
+) -> None:
+    """监控指标在对比表里：判定栏写"监控"，阈值列与样本列都是占位符。
+
+    ``hallucination_rate`` 没有"适用样例数"这回事（由 faithfulness 派生）；
+    显示 0 会让人以为一条都没测，显示阈值则会让人以为它被考核。
+    """
+    metrics = [
+        _metric(MetricName.CITATION_INTEGRITY, MetricVerdict.PASS, 1.0),
+        _metric(MetricName.FAITHFULNESS, MetricVerdict.PASS, 0.9),
+        _metric(MetricName.DOCUMENT_PRECISION_AT_K, MetricVerdict.PASS, 0.5),
+    ]
+    artifact = _artifact([_case("a", metrics=metrics), _case("b", metrics=metrics)])
+    rendered = render_comparison(compare(artifact, artifact, thresholds))
+
+    def row(name: str) -> str:
+        return next(line for line in rendered.splitlines() if line.startswith(name))
+
+    assert "监控" in row("hallucination_rate")
+    assert "—" in row("hallucination_rate"), "派生的幻觉率没有样本数，不得渲染成 0"
+    assert "监控" in row("document_precision_at_k")
+    assert "—" in row("document_precision_at_k"), "监控指标不设阈值，阈值列必须是占位符"
 
 
 # ---------------------------------------------------------------------------
@@ -589,11 +679,16 @@ _JUDGE_SCORE = [
 ]
 
 
-def _with_judge_model(artifact: EvalArtifact, name: str) -> EvalArtifact:
+def _with_judge_model(
+    artifact: EvalArtifact, name: str, *, ragas_version: str = ""
+) -> EvalArtifact:
     return artifact.model_copy(
         update={
             "run": artifact.run.model_copy(
-                update={"models": _run_meta().models.model_copy(update={"judge": name})}
+                update={
+                    "models": _run_meta().models.model_copy(update={"judge": name}),
+                    "judge": artifact.run.judge.model_copy(update={"ragas_version": ragas_version}),
+                }
             )
         }
     )
@@ -613,7 +708,38 @@ def test_judge_traceability_gap_flags_scores_with_no_judge_model() -> None:
 
 
 def test_judge_traceability_gap_is_quiet_when_the_judge_is_recorded() -> None:
+    artifact = _with_judge_model(
+        _artifact([_case("a", metrics=list(_JUDGE_SCORE))]), "judge", ragas_version="0.4.3"
+    )
+    assert detect_judge_traceability_gap(artifact) == ""
+
+
+def test_judge_traceability_gap_flags_ragas_scores_without_a_version() -> None:
+    """RAGAS 的分数会随版本漂移：记了裁判模型、没记 RAGAS 版本，同样无法复现。
+
+    ``models.judge`` 只能回答"哪个模型判的"，回答不了"用哪套判分库判的"——
+    0.4.3 的 Answer Correctness 与后续版本的行为差异不在模型身上。
+    """
     artifact = _with_judge_model(_artifact([_case("a", metrics=list(_JUDGE_SCORE))]), "judge")
+
+    gap = detect_judge_traceability_gap(artifact)
+    assert "ragas_version" in gap
+
+
+def test_judge_traceability_gap_does_not_require_ragas_version_for_citation_scores() -> None:
+    """引用准确率是自研裁判，只要求 ``models.judge``，不得被 RAGAS 的检查误伤。"""
+    artifact = _with_judge_model(
+        _artifact(
+            [
+                _case(
+                    "a",
+                    metrics=[_metric(MetricName.CITATION_ACCURACY, MetricVerdict.PASS, 1.0)],
+                )
+            ]
+        ),
+        "judge",
+    )
+
     assert detect_judge_traceability_gap(artifact) == ""
 
 
@@ -629,7 +755,7 @@ def test_judge_traceability_gap_ignores_runs_without_judge_metrics() -> None:
                 "a",
                 metrics=[
                     _metric(MetricName.CITATION_INTEGRITY, MetricVerdict.PASS, 1.0),
-                    _metric(MetricName.STATUS_ACCURACY, MetricVerdict.PASS, 1.0),
+                    _metric(MetricName.RECALL_AT_K, MetricVerdict.PASS, 1.0),
                 ],
             )
         ]
@@ -653,8 +779,22 @@ def test_judge_traceability_gap_does_not_count_not_applicable_as_a_score() -> No
     assert detect_judge_traceability_gap(artifact) == ""
 
 
-def _baselines() -> list[Path]:
+def _baseline_paths() -> list[Path]:
     return sorted(Path("tests/evals/baselines").glob("*.json"))
+
+
+def _baseline_schema_version(path: Path) -> object:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    return payload.get("schema_version") if isinstance(payload, dict) else None
+
+
+def _baselines() -> list[Path]:
+    """当前结构版本的基线。
+
+    schema v1 的基线（2026-10-16 phase7）保留为历史：新代码读了会当场报
+    "结构版本不兼容"，把它们混入对比测试只会让每条用例都变成版本错误。
+    """
+    return [path for path in _baseline_paths() if _baseline_schema_version(path) == SCHEMA_VERSION]
 
 
 def test_committed_baselines_are_readable_and_traceable() -> None:
@@ -668,7 +808,8 @@ def test_committed_baselines_are_readable_and_traceable() -> None:
     所以这条测试不看构造出来的样本，只看**仓库里真正躺着的那几份文件**。
     """
     found = _baselines()
-    assert found, "tests/evals/baselines/ 下没有任何基线"
+    if not found:
+        pytest.skip("尚未生成 schema v2 基线；旧 v1 基线只作历史")
     for path in found:
         artifact = read_artifact(path)
         assert not detect_judge_traceability_gap(artifact), path
@@ -677,12 +818,31 @@ def test_committed_baselines_are_readable_and_traceable() -> None:
 
 def test_the_committed_baseline_keeps_the_audit_trail_without_the_corpus() -> None:
     """基线的两个方向都要在真实文件上成立：剥离了正文，但留住了命中文档与页码。"""
-    for path in _baselines():
+    found = _baselines()
+    if not found:
+        pytest.skip("尚未生成 schema v2 基线")
+    for path in found:
         evidence = [item for case in read_artifact(path).cases for item in case.evidence]
         assert evidence, f"{path} 里没有任何证据条目"
         assert all(item.content == STRIPPED_EVIDENCE_CONTENT for item in evidence), path
         assert all(item.chunk_id for item in evidence), f"{path} 丢了 chunk_id"
         assert all("受版权" not in item.content for item in evidence)
+
+
+def test_legacy_baselines_are_rejected_instead_of_silently_compared() -> None:
+    """旧 v1 基线不得被新代码读来对比：指标集、黄金集与裁判都变了。
+
+    它们留在仓库里只为人翻阅历史；``--baseline`` 指向它们时必须立刻报
+    "结构版本不兼容"，而不是让两套不同语义的数字并排出现。
+    """
+    legacy = [
+        path for path in _baseline_paths() if _baseline_schema_version(path) != SCHEMA_VERSION
+    ]
+    if not legacy:
+        pytest.skip("仓库中没有旧版基线")
+    for path in legacy:
+        with pytest.raises(ArtifactIncompatibleError, match="结构版本"):
+            read_artifact(path)
 
 
 def test_judge_traceability_gap_recognizes_a_real_artifact() -> None:
@@ -857,17 +1017,53 @@ def test_render_case_detail_shows_no_score_for_a_not_applicable_metric() -> None
 # ---------------------------------------------------------------------------
 def test_load_thresholds_rejects_an_unknown_metric_name(tmp_path: Path) -> None:
     """指标改名而阈值没跟着改时，必须显式失败——静默忽略会让它无声退出所有门禁。"""
-    path = tmp_path / "thresholds.toml"
-    path.write_text("[thresholds]\nfaithfulnes = 0.8\n", encoding="utf-8")
+    path = _write_thresholds(tmp_path, "[thresholds]\nfaithfulnes = 0.8\n")
     with pytest.raises(ConfigurationError, match="未知指标名"):
         load_thresholds(path)
 
 
 def test_load_thresholds_rejects_a_missing_thresholds_section(tmp_path: Path) -> None:
     """没有阈值等于没有门禁，不能默认放行。"""
-    path = tmp_path / "thresholds.toml"
-    path.write_text("[min_samples]\nfaithfulness = 3\n", encoding="utf-8")
+    path = _write_thresholds(tmp_path, "[min_samples]\nfaithfulness = 3\n")
     with pytest.raises(ConfigurationError, match="thresholds"):
+        load_thresholds(path)
+
+
+@pytest.mark.parametrize("version", ["", "schema_version = 1\n"])
+def test_load_thresholds_rejects_a_schema_version_mismatch(tmp_path: Path, version: str) -> None:
+    """旧阈值文件（含压根没有版本号的）不得被新代码静默沿用。
+
+    新指标表与旧门禁不是同一套语义：旧文件里没列出的新指标会"没列出＝不设门禁"，
+    悄悄放掉一整类能力。缺版本号与写错版本号必须是同一条错误。
+    """
+    path = tmp_path / "thresholds.toml"
+    path.write_text(f"{version}[thresholds]\nfaithfulness = 0.9\n", encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="结构版本不匹配"):
+        load_thresholds(path)
+
+
+@pytest.mark.parametrize("metric", ["hallucination_rate", "document_precision_at_k"])
+def test_load_thresholds_rejects_a_monitor_only_metric_as_a_threshold(
+    tmp_path: Path, metric: str
+) -> None:
+    """仅监控指标不得设下限：一个观察量有了门禁就会被读成质量要求。"""
+    path = _write_thresholds(tmp_path, f"[thresholds]\n{metric} = 0.5\n")
+
+    with pytest.raises(ConfigurationError, match="仅监控指标"):
+        load_thresholds(path)
+
+
+@pytest.mark.parametrize("metric", ["hallucination_rate", "document_precision_at_k"])
+def test_load_thresholds_rejects_a_monitor_only_metric_as_a_sample_floor(
+    tmp_path: Path, metric: str
+) -> None:
+    """``[min_samples]`` 同样拒绝：样本量下限也是门禁的一半。"""
+    path = _write_thresholds(
+        tmp_path, f"[thresholds]\nfaithfulness = 0.9\n[min_samples]\n{metric} = 3\n"
+    )
+
+    with pytest.raises(ConfigurationError, match="仅监控指标"):
         load_thresholds(path)
 
 
@@ -886,8 +1082,7 @@ def test_load_thresholds_rejects_malformed_toml(tmp_path: Path) -> None:
 
 def test_load_thresholds_rejects_a_non_numeric_value(tmp_path: Path) -> None:
     """值必须是数字：写成 ``"80%"`` 时要当场说清是哪个键，而不是等比较时才崩。"""
-    path = tmp_path / "thresholds.toml"
-    path.write_text('[thresholds]\nfaithfulness = "80%"\n', encoding="utf-8")
+    path = _write_thresholds(tmp_path, '[thresholds]\nfaithfulness = "80%"\n')
     with pytest.raises(ConfigurationError, match="不是合法数值"):
         load_thresholds(path)
 
@@ -900,8 +1095,9 @@ def test_load_thresholds_rejects_an_invalid_sample_floor(tmp_path: Path, value: 
     "至少 3 条"无人察觉地变成了同一件事。这类"配置敲错一点、门禁悄悄松一档"与
     ``test_insufficient_samples_is_not_a_pass`` 守的正是同一条底线，只是入口不同。
     """
-    path = tmp_path / "thresholds.toml"
-    path.write_text(f"[thresholds]\nfaithfulness = 0.8\n[min_samples]\nfaithfulness = {value}\n")
+    path = _write_thresholds(
+        tmp_path, f"[thresholds]\nfaithfulness = 0.8\n[min_samples]\nfaithfulness = {value}\n"
+    )
     with pytest.raises(ConfigurationError, match="不小于 1 的整数"):
         load_thresholds(path)
 
@@ -911,7 +1107,6 @@ def test_load_thresholds_rejects_a_threshold_outside_the_unit_interval(
     tmp_path: Path, value: str
 ) -> None:
     """阈值的定义域是 [0,1]：负阈值等于**取消**这条门禁，且不会留下任何痕迹。"""
-    path = tmp_path / "thresholds.toml"
-    path.write_text(f"[thresholds]\nfaithfulness = {value}\n", encoding="utf-8")
+    path = _write_thresholds(tmp_path, f"[thresholds]\nfaithfulness = {value}\n")
     with pytest.raises(ConfigurationError, match=r"超出 \[0,1\]"):
         load_thresholds(path)

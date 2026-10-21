@@ -1,31 +1,25 @@
-"""裁判层（C 层）：用网关裁判模型给答案打分（CLAUDE.md 9.2 / 5.8）。
+"""引用裁判（C 层）：逐条判定被引用证据是否支持对应断言（ADR-0006）。
+
+生成侧的 faithfulness / relevancy / correctness 已交给 RAGAS（``ragas_judge.py``）；
+本模块只负责**引用准确率**——RAGAS 不提供这项，且它需要"引用编号 → 被引用证据"
+的对应关系，只能在本仓的产物结构上判。
 
 **为什么裁判要单独一个逻辑模型名**：裁判与生成必须能各自换型。评测集评分要固定
 版本以便跨版本比较，生成侧却要随产品迭代调型；共用一个逻辑名会让"只换生成模型、
 不动裁判"做不到，分数因此失去可比性。网关侧的 ``judge`` 路由即为此存在。
 
-**已知偏置，如实登记而不得掩饰**（见 ``SAME_SOURCE_CAVEAT``）：当前 ``judge`` 与
-``primary-chat`` 指向同一上游，裁判与被评者是同一模型家族，存在自偏好
-（self-preference）偏置，faithfulness / answer_relevancy 会偏乐观。这不是可以
-"先忽略、以后再补"的细节——它直接决定这些分数能不能被拿来下结论。因此：
+**已知偏置与出域，如实登记而不得掩饰**（见 ``CLOUD_JUDGE_CAVEAT``）：网关
+``judge`` 路由指向硅基流动的 Qwen，与生成模型 ``primary-chat``（DeepSeek）不同家族，
+没有同源自偏好偏置。但 RAGAS 与本裁判**共用同一个 Qwen**，两者互相印证只能说明
+"换一套判分法结论不变"，不能说明分数本身中立。评估数据会出域，仅限公开演示语料。
 
-- 偏置说明写进每一份产物的 ``run.judge.caveat``；
-- 报告里与分数并排展示；
-- ADR-0003 登记为经授权的演示期偏离。
+**缓存键必须含裁判身份与库版本**：``model_key`` 覆盖引用裁判的逻辑名与上游型号；
+RAGAS 的缓存身份还含 RAGAS 版本与嵌入模型（见 ``ragas_judge.py``）。任何一项变化
+都必须让旧判定失效，而不是依赖谁记得去清缓存。
 
-三处刻意的设计：
-
-1. **faithfulness 的分数由断言清单算出，不采信模型自报的总分**。让模型逐条判
-   "这条断言有没有证据支撑"，分数 = 有支撑条数 ÷ 总条数。模型可以自报一个好看的
-   总分，却很难让每一条断言都撒得圆——分数因此有可核查的推导链，``judge_raw``
-   里每一条断言都能被人复核。故 ``FaithfulnessVerdict`` **没有** ``score`` 字段。
-2. **解析失败必须响**。裁判输出解析不了时不做"默认给个中间分"的处理，而是判失败
-   并把原始输出完整留痕：那说明"这次没测出来"，与"测出来是 0 分"是两件事，
-   混在一起会悄悄污染聚合分。
-3. **逐例 verdict 对裁判指标刻意宽松**。faithfulness / relevancy 是分级分，"本次
-   0.7"不是失败；逐例只把"完全无支撑 / 完全无关"判为 FAIL。是否达标交给聚合阈值
-   （``tests/evals/config/thresholds.toml``）——若逐例以 0.8 划线，报告里会堆满
-   名为"失败"的中间分，真正的失败反而看不见。
+**解析失败必须响**：裁判输出解析不了时不做"默认给个中间分"的处理，而是记
+``ERROR`` 并把原始输出完整留痕——那说明"这次没测出来"，与"测出来是 0 分"是两件事，
+混在一起会悄悄污染聚合分（ADR-0003 的教训）。
 """
 
 from __future__ import annotations
@@ -44,12 +38,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from agent_platform.agents.gov_policy_qa.state import message_text
 from agent_platform.core.logging import get_logger
 from agent_platform.core.models import ChatModel
-from agent_platform.evaluation.prompts import (
-    FAITHFULNESS_JUDGE_PROMPT,
-    JUDGE_PROMPT_NAMES,
-    RELEVANCY_JUDGE_PROMPT,
-    render_prompt,
-)
+from agent_platform.evaluation.prompts import CITATION_JUDGE_PROMPT, render_prompt
 from agent_platform.evaluation.schemas import (
     CaseResult,
     GoldenCase,
@@ -63,11 +52,14 @@ from agent_platform.knowledge.schemas import EvidenceItem
 
 logger = get_logger(__name__)
 
-SAME_SOURCE_CAVEAT = (
-    "裁判与生成共用同一上游模型（网关 judge 与 primary-chat 指向同一型号，"
-    "见 deploy/docker/litellm/config.yaml），存在自偏好（self-preference）偏置："
-    "faithfulness / answer_relevancy 会偏乐观，**不得当中性分数**使用。"
-    "生产须换独立家族的私有化裁判模型（CLAUDE.md 5.8，登记于 ADR-0003）。"
+CLOUD_JUDGE_CAVEAT = (
+    "裁判为云端的 Qwen 模型（网关 judge 路由指向 https://api.siliconflow.cn/v1），"
+    "与生成模型 primary-chat（DeepSeek）不同家族，不再有同源自偏好偏置；"
+    "但 RAGAS 判分与本引用裁判**共用同一个 Qwen**，两份结果互相印证的独立性"
+    "只在判分方法，不在模型。评估数据（问题、检索证据、答案、参考答案）会出域到 "
+    "SiliconFlow，仅限公开演示语料，客户数据与生产环境不得使用。"
+    "裁判是模型判定而非人工金标准，分数仍应按“有偏测量”解读；"
+    "生产须换私有化裁判（CLAUDE.md 5.8 / 10.1，ADR-0005 / ADR-0006）。"
 )
 
 _REPAIR_INSTRUCTION = (
@@ -75,8 +67,13 @@ _REPAIR_INSTRUCTION = (
     "不要任何解释、前后缀或代码块标记。"
 )
 
-_CACHE_SCHEMA_VERSION = 1
-"""缓存条目结构版本；判分契约变化时旧缓存自动失效。"""
+_CACHE_SCHEMA_VERSION = 2
+"""缓存条目结构版本；判分契约变化时旧缓存自动失效。
+
+v2（2026-10-21）：缓存键加入 ``model_key``（裁判逻辑名 + 上游型号），
+换裁判型号不再复用旧判定。RAGAS 条目沿用同一结构，身份串由
+``RagasBackend.cache_identity`` 提供（含库版本、嵌入模型与指标配置）。
+"""
 
 V = TypeVar("V", bound=BaseModel)
 
@@ -85,48 +82,22 @@ class JudgeParseError(Exception):
     """裁判输出无法解析为约定结构（内部异常，不外泄到 HTTP 边界）。"""
 
 
-class FaithfulnessClaim(BaseModel):
-    """裁判拆出的一条断言及其判定。"""
+class CitationJudgement(BaseModel):
+    """裁判对一条引用的判定。"""
 
     model_config = ConfigDict(frozen=True)
 
-    claim: str = Field(min_length=1, description="断言原文")
-    supported: bool = Field(description="能否由证据支撑")
-    evidence_index: int | None = Field(
-        default=None, ge=1, description="支撑证据编号（1 起）；无支撑时为 None"
-    )
+    index: int = Field(ge=1, description="对应答案中的引用编号")
+    supported: bool = Field(description="该引用指向的证据是否支持对应断言")
+    reason: str = Field(default="", max_length=1000, description="一句话判定依据")
 
 
-class FaithfulnessVerdict(BaseModel):
-    """faithfulness 的裁判结构（**无** ``score`` 字段，见模块 docstring 第 1 条）。"""
+class CitationVerdict(BaseModel):
+    """引用裁判的结构；索引集合由 ``_parse_citations`` 校验。"""
 
     model_config = ConfigDict(frozen=True)
 
-    claims: list[FaithfulnessClaim] = Field(default_factory=list)
-    reason: str = Field(default="", description="判定依据（人读）")
-
-    def score(self) -> float:
-        """有支撑断言占比。``claims`` 非空由 ``_parse_faithfulness`` 保证。"""
-        supported = sum(1 for item in self.claims if item.supported)
-        return supported / len(self.claims)
-
-
-class RelevancyVerdict(BaseModel):
-    """relevancy 的裁判结构（相关程度无法从子项推导，只能采信模型给的分数）。"""
-
-    model_config = ConfigDict(frozen=True)
-
-    score: float = Field(ge=0.0, le=1.0, description="0=完全不相关，1=完全切题并正面回答")
-    reason: str = Field(default="", description="判定理由（人读）")
-
-
-@dataclass(frozen=True)
-class JudgeOutcome:
-    """一次判分的产物（指标 + 可复核的原始输出）。"""
-
-    metrics: tuple[MetricResult, ...]
-    raw: str
-    cache_hit: bool = False
+    citations: list[CitationJudgement] = Field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -136,8 +107,7 @@ class _AskResult(Generic[V]):  # noqa: UP046 —— PEP 695 泛型语法需 3.12
     """裁判调用的结果载体。
 
     ``verdict is None`` 表示两次都没解析出来，**同时**带着 ``raw``——
-    失败路径也必须交出原始输出，否则"详见 judge_raw"就成了一句空话
-    （人工排查最需要看到的恰恰是解析失败那一次的输出）。
+    失败路径也必须交出原始输出，否则"详见 judge_raw"就成了一句空话。
     """
 
     verdict: V | None
@@ -199,75 +169,83 @@ def _load_object(fragment: str) -> dict[str, Any]:
     return parsed
 
 
-def _evidence_blocks(evidence: Sequence[EvidenceItem]) -> list[dict[str, Any]]:
-    """把证据转成模板变量；正文与文档名一律先中和（CLAUDE.md 10.3）。
+def _parse_citations(payload: dict[str, Any], expected: frozenset[int]) -> CitationVerdict:
+    """校验引用裁判结构：索引集合必须与产物中的引用**完全一致**。
 
-    裁判同样是注入目标：让裁判去判断"证据里有没有注入指令"，不能成为
-    "裁判可以被注入"的理由。
-    """
-    return [
-        {
-            "index": position,
-            "document_name": neutralize_untrusted(item.document_name),
-            "content": neutralize_untrusted(item.content),
-        }
-        for position, item in enumerate(evidence, start=1)
-    ]
-
-
-def _parse_faithfulness(payload: dict[str, Any]) -> FaithfulnessVerdict:
-    """校验 faithfulness 裁判结构。
-
-    Raises:
-        JudgeParseError: 结构不符，或**一条断言都没拆出来**。后者按解析失败处理
-            而不是"得 0 分"：没拆出断言说明裁判没照做，不是答案全无依据；
-            放进评分会把它错记成一次内容缺陷。
+    缺项、多项、重复都按解析失败处理——那说明裁判没照做，不是"没被引用的那条
+    不支持"。把缺失项默认成 false 会凭空造一个失败判定，默认成 true 更糟。
     """
     try:
-        verdict = FaithfulnessVerdict.model_validate(payload)
+        verdict = CitationVerdict.model_validate(payload)
     except ValidationError as exc:
-        raise JudgeParseError(f"faithfulness 裁判结构不符: {exc.error_count()} 处") from exc
-    if not verdict.claims:
-        raise JudgeParseError("faithfulness 裁判未拆出任何事实性断言")
+        raise JudgeParseError(f"引用裁判结构不符: {exc.error_count()} 处") from exc
+    indices = [item.index for item in verdict.citations]
+    if len(indices) != len(set(indices)):
+        raise JudgeParseError(f"引用裁判返回了重复索引: {sorted(indices)}")
+    if set(indices) != set(expected):
+        raise JudgeParseError(
+            f"引用裁判索引集合 {sorted(set(indices))} 与引用清单 {sorted(expected)} 不一致"
+        )
     return verdict
 
 
-def _parse_relevancy(payload: dict[str, Any]) -> RelevancyVerdict:
-    """校验 relevancy 裁判结构。
+def _cited_blocks(result: CaseResult) -> tuple[list[dict[str, Any]], list[int]]:
+    """按 ``chunk_id`` 把引用映射到证据块；返回 ``(块列表, 找不到的引用编号)``。
 
-    Raises:
-        JudgeParseError: 结构不符（含 score 越界）。
+    正文与文档名一律先中和（CLAUDE.md 10.3）：裁判同样是注入目标，让裁判去判断
+    "证据里有没有注入指令"，不能成为"裁判可以被注入"的理由。
     """
-    try:
-        return RelevancyVerdict.model_validate(payload)
-    except ValidationError as exc:
-        raise JudgeParseError(f"relevancy 裁判结构不符: {exc.error_count()} 处") from exc
+    by_chunk = {item.chunk_id: item for item in result.evidence}
+    blocks: list[dict[str, Any]] = []
+    missing: list[int] = []
+    for citation in result.citations:
+        target = by_chunk.get(citation.chunk_id)
+        if target is None:
+            missing.append(citation.index)
+            continue
+        blocks.append(_block(citation.index, target))
+    return blocks, missing
+
+
+def _block(index: int, item: EvidenceItem) -> dict[str, Any]:
+    """一条被引用证据的模板变量。"""
+    return {
+        "index": index,
+        "document_name": neutralize_untrusted(item.document_name),
+        "pages": item.page_numbers,
+        "content": neutralize_untrusted(item.content),
+    }
 
 
 class JudgeCache:
-    """判分缓存：键 = 提示词名 + **渲染后完整提示词**的指纹（``local_data/``，不入仓）。
+    """判分缓存：键 = 提示词名 + **裁判身份** + **渲染后完整提示词**的指纹。
+
+    存储位置在 ``local_data/``，不入仓。引用裁判与 RAGAS 共用这一实现：
+    前者的键材料是渲染后的提示词，后者是规范化 JSON 请求。
 
     为什么要缓存：裁判调用是整条评估链上最贵的一步，而"改了一条黄金集题目却要
-    重判全部 28 条"会让人不敢动评测集。
+    重判全部样例"会让人不敢动评测集。
 
-    键为什么是"渲染后的完整提示词"而不是"样例 ID + 答案"：**答案不决定分数**。
-    faithfulness 的判定输入是（问题 + 证据 + 答案），relevancy 是（问题 + 答案）；
-    若按答案指纹缓存，两条答案文字相同、问题或证据不同的样例会撞键，后者会直接
-    拿到前者算出的分——一个安静、且只出现在巧合场景下的错误分数。渲染后的提示词
-    是判定输入的超集，用它做键不含歧义。附带好处：提示词模板改一个字（``v1`` → 内容
-    变更但文件名未变）也会命中不了旧缓存。
+    键为什么是"判定输入"而不是"样例 ID + 答案"：**答案不决定分数**。引用裁判的
+    判定输入是（问题 + 答案 + 引用 + 被引用证据），RAGAS 是（问题 + 答案 + 证据
+    [+ 参考答案]）；按答案指纹缓存会让输入不同的样例撞键，后者直接拿到前者的分。
+    判定输入的超集做键不含歧义；提示词模板改一个字也会命中不了旧缓存。
 
-    命中缓存时显式标记（``JudgeOutcome.cache_hit``）——"这次分数是真跑出来的还是
-    从缓存里翻出来的"必须能从留痕里读出来。
+    ``model_key`` 含裁判身份（逻辑名 @ 上游型号）；RAGAS 还含库版本与嵌入模型。
+    同一输入换测量工具后不得复用旧判定——把它并入键材料，比"换型号时记得清缓存"
+    可靠。
+
+    命中缓存时显式标记（``JudgeOutcome.cache_hit`` / 指标 detail）——"这次分数是
+    真跑出来的还是从缓存里翻出来的"必须能从留痕里读出来。
     """
 
     def __init__(self, directory: Path) -> None:
         self._directory = directory
 
     @staticmethod
-    def key(*, prompt_name: str, prompt: str) -> str:
+    def key(*, prompt_name: str, model_key: str, prompt: str) -> str:
         """算出缓存键（各段用 ``\\x1f`` 分隔，避免拼接歧义）。"""
-        material = "\x1f".join((prompt_name, prompt))
+        material = "\x1f".join((prompt_name, model_key, prompt))
         return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
     def path_for(self, key: str) -> Path:
@@ -321,8 +299,8 @@ def _write_text(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
 
 
-class Judge:
-    """网关裁判模型的封装（CLAUDE.md 9.2）。"""
+class CitationJudge:
+    """引用准确性裁判（CLAUDE.md 9.2 / ADR-0006）。"""
 
     def __init__(
         self,
@@ -330,176 +308,125 @@ class Judge:
         *,
         logical_name: str,
         cache_dir: Path,
+        upstream_model: str = "",
         max_tokens: int = 4096,
+        cache_enabled: bool = True,
     ) -> None:
         """
         Args:
             model: 经网关构造的裁判模型（``temperature=0``，CLAUDE.md 5.3）。
             logical_name: 网关逻辑模型名（埋点与快照记录用；不得写死型号，NO-03）。
             cache_dir: 判分缓存目录。
-            max_tokens: 单次裁判输出上限。
-
-                **补记（2026-10-16）**：原值 1024，实测偏小——faithfulness 的裁判
-                要为答案里的**每一条断言**输出一条判定，答案长（实测 1138 字）时
-                JSON 会在半途被截断，表现为"括号未配平"→ 两次都解析不出来。
-                2048 仍会在更长答案上撞墙，故直接给 4096：裁判输出是结构化短句，
-                上限给宽不增加正常开销，只把撞墙点推远；真撞上也不会静默——
-                解析失败会记 ``MetricVerdict.ERROR`` 并在报告里显式列出。
+            upstream_model: 网关 judge 路由背后的上游型号（仅留痕与缓存键用，
+                不参与路由）。型号只来自配置 ``JUDGE_UPSTREAM_MODEL``。
+            max_tokens: 单次裁判输出上限。引用裁判按"每条引用一句理由"输出，
+                上限给宽不增加正常开销，只把截断风险推远（D8 的教训）。
+            cache_enabled: ``False`` 时完全绕过缓存（``--no-judge-cache``），
+                用于核对缓存是否污染了本轮分数。
         """
         self._model = model
         self._logical_name = logical_name
+        self._upstream_model = upstream_model
+        self._model_key = f"{logical_name}@{upstream_model}"
         self._cache = JudgeCache(cache_dir)
+        self._cache_enabled = cache_enabled
         self._max_tokens = max_tokens
 
     @property
     def logical_name(self) -> str:
-        """``logical_name``：网关逻辑模型名（写进 ``ModelSnapshot.judge``）。
-
-        §9.2 要求"裁判模型与标准固定并记录版本"，两者都得到产物里，缺一不可。
-        这个名字必须由**这里**提供而不是调用方另写一遍：调用方另写一份的话，
-        产物里的"谁在判"与真正判分的那个模型就可能悄悄分家，而那正是最需要
-        追溯的情形。
-
-        **补记（2026-10-16）**：此前本属性不存在，``_logical_name`` 存下后无人读取，
-        于是 ``ModelSnapshot.judge`` 一直留空——已入库的首份基线里就有三列裁判分数
-        而 ``models.judge=""``。它还会让首次基线对比凭空报一条
-        ``models.judge: "" → "judge"`` 的配置漂移（见 tests/evals/README.md 第五节）。
-        """
+        """网关逻辑模型名（写进 ``ModelSnapshot.judge``）。"""
         return self._logical_name
 
     def snapshot(self) -> JudgeSnapshot:
-        """本次裁判配置的快照（写进产物，保证分数可追溯到"哪版裁判"）。
-
-        ``max_tokens`` 一并记录（2026-10-17 补）：它是 D8 的诱因之一，而"输出上限"
-        这种旋钮**改了不会体现在任何一处分数上**——只有当某条样例恰好被截断、
-        从 ``pass`` 变成 ``error`` 时才会显形，而那时离"该改哪一个参数"已经隔了
-        一次排查。记进快照后，改上限会在下一次 ``--baseline`` 对比里报成一条配置
-        漂移，与改提示词、改温度同等可见（tests/evals/README.md 第五节 D9）。
-        """
+        """引用裁判的配置快照；RAGAS 字段由调用方合并进同一份快照。"""
         return JudgeSnapshot(
             backend="in-house",
             library_version="",
             temperature=0.0,
             max_tokens=self._max_tokens,
-            prompt_version="+".join(JUDGE_PROMPT_NAMES),
-            caveat=SAME_SOURCE_CAVEAT,
+            prompt_version=CITATION_JUDGE_PROMPT,
+            upstream_model=self._upstream_model,
+            caveat=CLOUD_JUDGE_CAVEAT,
         )
 
     async def score(self, case: GoldenCase, result: CaseResult) -> CaseResult:
-        """对一条样例补上裁判指标，返回**追加了指标**的新结果。
-
-        适用性由内容决定而非类别：没有证据就判不了 faithfulness（无据可核），
-        没有答案就判不了 relevancy。不适用时记 ``NOT_APPLICABLE``——
-        那是一等结果，不需要硬凑一个分数。
+        """对一条样例补上 ``citation_accuracy``，返回追加了指标的新结果。
 
         Args:
             case: 黄金集样例（提供问题原文）。
-            result: 图/检索层的执行结果。
+            result: 图层的执行结果。
 
         Returns:
-            新的 ``CaseResult``：``metrics`` 追加裁判指标，``judge_raw`` 填原始输出。
+            新的 ``CaseResult``；``judge_raw`` 追加本次裁判的原始输出。
         """
-        metrics: list[MetricResult] = []
-        raws: list[str] = []
-
-        if result.evidence:
-            outcome = await self._judge_faithfulness(case.question, result)
-        else:
-            outcome = JudgeOutcome(
-                metrics=(
-                    MetricResult(
-                        name=MetricName.FAITHFULNESS,
-                        verdict=MetricVerdict.NOT_APPLICABLE,
-                        detail="本题无检索证据，无据可核",
-                    ),
-                ),
-                raw="",
+        if not result.citations:
+            metric = MetricResult(
+                name=MetricName.CITATION_ACCURACY,
+                verdict=MetricVerdict.NOT_APPLICABLE,
+                detail="本题没有引用，引用准确率不适用（结构红线由 citation_integrity 判）",
             )
-        metrics.extend(outcome.metrics)
-        raws.append(_raw_section(FAITHFULNESS_JUDGE_PROMPT, outcome.raw))
+            return _with_metrics(result, [metric])
 
-        if result.answer:
-            outcome = await self._judge_relevancy(case.question, result.answer)
-        else:
-            outcome = JudgeOutcome(
-                metrics=(
-                    MetricResult(
-                        name=MetricName.ANSWER_RELEVANCY,
-                        verdict=MetricVerdict.NOT_APPLICABLE,
-                        detail="本题无答案产出，无可判内容",
-                    ),
-                ),
-                raw="",
+        blocks, missing = _cited_blocks(result)
+        if missing:
+            metric = MetricResult(
+                name=MetricName.CITATION_ACCURACY,
+                verdict=MetricVerdict.FAIL,
+                score=0.0,
+                detail=f"引用 {sorted(missing)} 无法按 chunk_id 对应到任何证据块，无法判定",
             )
-        metrics.extend(outcome.metrics)
-        raws.append(_raw_section(RELEVANCY_JUDGE_PROMPT, outcome.raw))
+            return _with_metrics(result, [metric])
 
-        handled = {metric.name for metric in metrics}
-        preserved = [metric for metric in result.metrics if metric.name not in handled]
-        return result.model_copy(
-            update={
-                "metrics": [*preserved, *metrics],
-                "judge_raw": "\n\n".join(section for section in raws if section),
-            }
-        )
-
-    async def _judge_faithfulness(self, question: str, result: CaseResult) -> JudgeOutcome:
-        """逐条核对断言是否有证据支撑，分数 = 有支撑条数 ÷ 总条数。"""
         rendered = render_prompt(
-            FAITHFULNESS_JUDGE_PROMPT,
-            question=neutralize_untrusted(question),
-            evidence=_evidence_blocks(result.evidence),
+            CITATION_JUDGE_PROMPT,
+            question=neutralize_untrusted(case.question),
             answer=neutralize_untrusted(result.answer),
+            citations=[
+                {
+                    "index": citation.index,
+                    "document_name": neutralize_untrusted(citation.document_name),
+                    "pages": citation.page_numbers,
+                }
+                for citation in result.citations
+            ],
+            evidence=blocks,
         )
+        expected = frozenset(citation.index for citation in result.citations)
         ask = await self._ask(
-            prompt_name=FAITHFULNESS_JUDGE_PROMPT,
+            prompt_name=CITATION_JUDGE_PROMPT,
             prompt=rendered,
-            parse=_parse_faithfulness,
+            parse=lambda payload: _parse_citations(payload, expected),
         )
         if ask.verdict is None:
-            return _unparseable_outcome(
-                MetricName.FAITHFULNESS, FAITHFULNESS_JUDGE_PROMPT, raw=ask.raw
+            return _with_metrics(
+                result,
+                [
+                    MetricResult(
+                        name=MetricName.CITATION_ACCURACY,
+                        verdict=MetricVerdict.ERROR,
+                        detail=(
+                            "引用裁判输出两次均无法解析为约定结构：此项**未采集到结果**，"
+                            "已从聚合中排除，本样例因此判不通过。原始输出见 judge_raw。"
+                        ),
+                    )
+                ],
+                raw=_raw_section(CITATION_JUDGE_PROMPT, ask.raw),
             )
 
-        claims = ask.verdict.claims
-        supported = sum(1 for claim in claims if claim.supported)
-        unsupported = [claim.claim for claim in claims if not claim.supported][:3]
-        detail = f"{supported}/{len(claims)} 条断言有证据支撑"
+        total = len(ask.verdict.citations)
+        supported = sum(1 for item in ask.verdict.citations if item.supported)
+        unsupported = [
+            f"[{item.index}] {item.reason or '裁判未给出理由'}"
+            for item in ask.verdict.citations
+            if not item.supported
+        ]
+        detail = f"{supported}/{total} 条引用的证据支持对应断言"
         if unsupported:
-            detail += f"；无支撑示例：{'；'.join(unsupported)}"
-        return JudgeOutcome(
-            metrics=(_graded_metric(MetricName.FAITHFULNESS, ask.verdict.score(), detail=detail),),
-            raw=ask.raw,
-            cache_hit=ask.cache_hit,
-        )
-
-    async def _judge_relevancy(self, question: str, answer: str) -> JudgeOutcome:
-        """判定答案是否正面回答了问题。"""
-        rendered = render_prompt(
-            RELEVANCY_JUDGE_PROMPT,
-            question=neutralize_untrusted(question),
-            answer=neutralize_untrusted(answer),
-        )
-        ask = await self._ask(
-            prompt_name=RELEVANCY_JUDGE_PROMPT,
-            prompt=rendered,
-            parse=_parse_relevancy,
-        )
-        if ask.verdict is None:
-            return _unparseable_outcome(
-                MetricName.ANSWER_RELEVANCY, RELEVANCY_JUDGE_PROMPT, raw=ask.raw
-            )
-        return JudgeOutcome(
-            metrics=(
-                _graded_metric(
-                    MetricName.ANSWER_RELEVANCY,
-                    ask.verdict.score,
-                    detail=ask.verdict.reason or "裁判未给出理由",
-                ),
-            ),
-            raw=ask.raw,
-            cache_hit=ask.cache_hit,
-        )
+            detail += "；不支持：" + "；".join(unsupported[:3])
+        if ask.cache_hit:
+            detail += "（缓存命中）"
+        metric = _graded_metric(MetricName.CITATION_ACCURACY, supported / total, detail=detail)
+        return _with_metrics(result, [metric], raw=_raw_section(CITATION_JUDGE_PROMPT, ask.raw))
 
     async def _ask(
         self,
@@ -512,23 +439,20 @@ class Judge:
 
         重试只有**一次**：第二次仍失败说明问题不在"偶发的格式抖动"，再试下去
         只是把一次调试事故拖成一条慢链路，并掩盖真正该看的原始输出。
-
-        Returns:
-            ``_AskResult``；``verdict is None`` 时 ``raw`` 仍完整携带两次的输出。
         """
-        key = JudgeCache.key(prompt_name=prompt_name, prompt=prompt)
-        cached = await self._cache.load(key)
-        if cached is not None:
-            try:
-                cached_verdict = parse(cached["verdict"])
-            except JudgeParseError:
-                # 缓存内容解析不了说明它已失效，落到真实调用而不是当成失败
-                logger.warning(
-                    "eval.judge_cache_unusable",
-                    extra={"event": "eval.judge_cache_unusable", "prompt": prompt_name},
-                )
-            else:
-                return _AskResult(verdict=cached_verdict, raw=cached["raw"], cache_hit=True)
+        key = JudgeCache.key(prompt_name=prompt_name, model_key=self._model_key, prompt=prompt)
+        if self._cache_enabled:
+            cached = await self._cache.load(key)
+            if cached is not None:
+                try:
+                    cached_verdict = parse(cached["verdict"])
+                except JudgeParseError:
+                    logger.warning(
+                        "eval.judge_cache_unusable",
+                        extra={"event": "eval.judge_cache_unusable", "prompt": prompt_name},
+                    )
+                else:
+                    return _AskResult(verdict=cached_verdict, raw=cached["raw"], cache_hit=True)
 
         first = await self._invoke(prompt)
         verdict: V | None = _try_parse(first, parse, prompt_name)
@@ -544,7 +468,8 @@ class Judge:
         if verdict is None:
             return _AskResult(verdict=None, raw=raw, cache_hit=False)
 
-        await self._cache.store(key, verdict=verdict.model_dump(mode="json"), raw=raw)
+        if self._cache_enabled:
+            await self._cache.store(key, verdict=verdict.model_dump(mode="json"), raw=raw)
         return _AskResult(verdict=verdict, raw=raw, cache_hit=False)
 
     async def _invoke(self, prompt: str, *, repair: bool = False) -> str:
@@ -575,57 +500,30 @@ def _raw_section(prompt_name: str, raw: str) -> str:
     return f"[{prompt_name}]\n{raw}" if raw else ""
 
 
-def _graded_metric(name: MetricName, score: float, *, detail: str) -> MetricResult:
-    """构造裁判指标（分级分）。
+def _with_metrics(
+    result: CaseResult, metrics: Sequence[MetricResult], *, raw: str = ""
+) -> CaseResult:
+    """把新指标并入结果（替换同名项），并按需追加 ``judge_raw``。"""
+    names = {metric.name for metric in metrics}
+    preserved = [metric for metric in result.metrics if metric.name not in names]
+    judge_raw = result.judge_raw
+    if raw:
+        judge_raw = f"{judge_raw}\n\n{raw}" if judge_raw else raw
+    return result.model_copy(update={"metrics": [*preserved, *metrics], "judge_raw": judge_raw})
 
-    逐例 verdict 刻意宽松（见模块 docstring 第 3 条）：只有**完全没有**支撑或
-    完全无关才判 FAIL，其余记 PASS，是否达标由聚合阈值判定。若在此处以 0.8
-    划线，报告里会堆满名为"失败"的中间分，把真正的失败淹掉。
-    """
+
+def _graded_metric(name: MetricName, score: float, *, detail: str) -> MetricResult:
+    """构造分级分：逐例只把"完全没有"判 FAIL，是否达标交给聚合阈值。"""
     verdict = MetricVerdict.PASS if score > 0.0 else MetricVerdict.FAIL
     return MetricResult(name=name, verdict=verdict, score=score, detail=detail)
 
 
-def _unparseable_outcome(name: MetricName, prompt_name: str, *, raw: str) -> JudgeOutcome:
-    """裁判输出两次都无法解析时的结果：记 ``ERROR``（**没测出来**），不默认给分。
-
-    **补记（2026-10-16）**：这里早先是 ``FAIL`` + ``score=0.0``，理由是"没测出来
-    必须是可见的坏消息，放过它会让裁判故障表现成'这轮没考这项'、聚合分反而更好看"。
-    该理由的前提是对的，**手段是错的**：``0.0`` 是一个测量结果，把它写进产物等于
-    凭空造了一个数据点。首次真实基线对比就撞上了——一条样例的 faithfulness 因
-    裁判输出括号不配平被判 ``0.0000``，聚合分被压低 1/23，报告里读作
-    "faithfulness 0.9392 → 0.8770，跌破"，该样例还进了"新失败样例"，而模型
-    什么都没做错。**一次测量故障伪装成了一次质量回归**，正是这套留痕机制要防的事。
-
-    现改为 ``MetricVerdict.ERROR``：不带分数、不计入聚合（所以聚合分不被污染），
-    但**照样让该样例判不通过**（``CaseResult.passed`` 把 ERROR 算作未通过）——
-    可见性一分不减，伪造的数据点没有了。
-
-    ``raw`` 原样携带两次的输出——人工排查最需要看到的恰恰是解析失败那一次的结果。
-    """
-    return JudgeOutcome(
-        metrics=(
-            MetricResult(
-                name=name,
-                verdict=MetricVerdict.ERROR,
-                detail=(
-                    f"裁判输出两次均无法解析为约定结构（{prompt_name}）：此项**未采集到结果**，"
-                    "已从聚合中排除，本样例因此判不通过。原始输出见 judge_raw。"
-                ),
-            ),
-        ),
-        raw=raw,
-    )
-
-
 __all__: list[str] = [
-    "SAME_SOURCE_CAVEAT",
-    "FaithfulnessClaim",
-    "FaithfulnessVerdict",
-    "Judge",
+    "CLOUD_JUDGE_CAVEAT",
+    "CitationJudge",
+    "CitationJudgement",
+    "CitationVerdict",
     "JudgeCache",
-    "JudgeOutcome",
     "JudgeParseError",
-    "RelevancyVerdict",
     "extract_json_object",
 ]

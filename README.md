@@ -25,39 +25,36 @@ Milvus（v2.6）管检索，稠密向量与 BM25 混合检索、Rerank、引用�
 
 ## 快速开始
 
-前置条件：Docker Desktop（WSL2 后端）、[uv](https://docs.astral.sh/uv/)、Python 3.12
+需要 Docker Desktop（WSL2 后端）、[uv](https://docs.astral.sh/uv/) 和 Python 3.12
 （`uv python install 3.12`）。
 
 ```bash
-# 1) 配置环境。.env 严禁入库（NO-17），必填项见 .env.example 末尾，缺一项就起不来
+# 1) 配置与依赖。.env 严禁入库（NO-17），按 .env.example 的注释补齐必填项
 cp .env.example .env
+uv sync
 
-# 2) 启动基础设施：Postgres / Redis / Milvus / LiteLLM
+# 2) 起基础设施：Postgres / Redis / Milvus / LiteLLM
 docker compose up -d
 docker compose ps           # 等全部 healthy
 
-# 3) 第一次用 RAGFlow，先按 docs/runbooks/ragflow_setup.md 初始化并生成 API Key，
-#    再核实 SiliconFlow 的模型 ID 和嵌入维度，并设置默认的 vision 模型（多模态解析必需）
+# 3) 初始化 RAGFlow：生成 API Key、核实模型 ID、设默认 vision 模型
+#    步骤见 docs/runbooks/ragflow_setup.md
 
-# 4) 同步依赖
-uv sync
-
-# 5) 入库语料。先 dry-run 看清单，再真入库；语料目录本身不进仓库
-uv run python scripts/ingest.py --source "e:\BaiduNetdiskDownload\gov_doc" --subset scripts/energy_subset.txt --dry-run
+# 4) 入库语料。先加 --dry-run 看清单；能源文本与多模态演示集分别跑一遍
 uv run python scripts/ingest.py --source "e:\BaiduNetdiskDownload\gov_doc" --subset scripts/energy_subset.txt
-#    多模态演示集单独跑一遍（扫描件 + 图表报告），细节见 docs/runbooks/multimodal_evidence.md
 uv run python scripts/ingest.py --source "e:\BaiduNetdiskDownload\gov_doc" --subset scripts/multimodal_subset.txt
 
-# 6) 启动 API。main.py 刻意没有模块级 app，所以这里用工厂形态
+# 5) 起 API。main.py 没有模块级 app，所以用工厂形态
 uv run uvicorn --factory agent_platform.main:create_app \
     --loop asyncio:SelectorEventLoop --host 127.0.0.1 --port 8000
-#    Windows 上必须带 --loop asyncio:SelectorEventLoop：asyncio 默认的 ProactorEventLoop
-#    不被 psycopg 的异步模式支持，少了这个参数会在启动时抛 InterfaceError。Linux 和容器
-#    默认就是 Selector，不必加。详见 docs/runbooks/local_env_setup.md 的「已知坑」。
+#    Windows 必须带 --loop asyncio:SelectorEventLoop，否则 psycopg 异步连接会抛
+#    InterfaceError；Linux 默认就是 Selector。
 
-# 7) 端到端冒烟，另开一个终端
+# 6) 另开终端冒烟
 uv run python scripts/demo_chat.py --question "2025年新能源电价机制的主要内容？"
 ```
+
+多模态入库与取图的细节见 [multimodal_evidence.md](docs/runbooks/multimodal_evidence.md)。
 
 ## 多模态证据
 
@@ -88,22 +85,27 @@ uv run ruff format --check && uv run ruff check && uv run mypy && uv run pytest
 RUN_INTEGRATION_TESTS=true uv run pytest -m integration   # 需要 compose 已经起来
 
 # 评估：需要 postgres / milvus / litellm 就绪，且网关已加载 judge 路由
-uv run python -X utf8 scripts/eval_run.py --validate-only                  # 只校验黄金集，不碰基础设施
-uv run python -X utf8 scripts/eval_run.py --layer all                      # 全量跑一轮，产出产物
-uv run python -X utf8 scripts/eval_run.py --layer all \
-  --baseline tests/evals/baselines/2026-10-16-phase7-signed.json           # 与基线对比，检出回归
+# RAGAS 在 eval 依赖组里，评估命令一律 --group eval（默认 uv sync 不安装）
+uv run --group eval python -X utf8 scripts/eval_run.py --validate-only       # 只校验黄金集，不碰基础设施
+uv run --group eval python -X utf8 scripts/eval_run.py --layer all           # 全量：检索 + 生成 + 裁判
+uv run --group eval python -X utf8 scripts/eval_run.py --layer all \
+  --baseline tests/evals/baselines/<file>.json                               # 与基线对比
 ```
 
-评估眼下处在观察期：报告、判定、留痕照常产出，`--baseline` 也照常检出回归，只是退出码
-还不接进 pre-commit。评估不进 pre-commit，因为它慢、要密钥、还要整套基础设施；硬塞进去
-只会让人养成加 `--no-verify` 的习惯。评审协议和缺陷登记在 `tests/evals/README.md`，框架
-选型以及 RAGAS 违反了哪几条，写在 [ADR-0003](docs/adr/0003-evaluation-framework-and-judge.md)。
+评估处在观察期：报告、判定、留痕照常产出，`--baseline` 也照常检出回归，只是退出码还不接进
+pre-commit。评估不进 pre-commit，因为它慢、要密钥、还要整套基础设施；硬塞进去只会让人养成加
+`--no-verify` 的习惯。评审协议和缺陷登记在 `tests/evals/README.md`，指标口径、RAGAS 依赖组
+与旧指标退役写在 [ADR-0006](docs/adr/0006-ragas-in-process-evaluation.md)。
 
-黄金集 28 条已经全部人工签署，`--require-reviewed` 能过。已入库的基线有两份，彼此不可比：
-`2026-10-16-phase7-initial.json` 记的是「28 条草稿」时期的真实结果，
-`2026-10-16-phase7-signed.json` 是签署之后现行的参照。两份文件的黄金集指纹不同，拿它们
-互相对比会直接报出来。两份都记录了当时 D1、D2、D3 造成的失败，**都不代表达标**；
-D1、D2 已于 2026-10-17 修复，D3 未修。
+2026-10-21 起指标方案已整体更换：检索看 Recall@8 / Precision@8 / MRR，生成看 RAGAS 的
+Faithfulness / Answer Relevancy / Answer Correctness，另加引用准确率与拒答准确率；幻觉率
+单独监控。`retrieval_hit` 与 `status_accuracy` 已退役。产物结构升到 schema v2，两份旧基线
+（`2026-10-16-phase7-*.json`）只作历史，新代码读入即报不可读。
+
+**检索三项的前置条件已具备**：21 条可答题的 `relevant_documents` 由 AI 起草（共 31 条），
+并经 `ks` 于 2026-10-21 核对签署，`--require-relevance-labels` 已通过。逐题摘录与签署记录
+在 `local_data/evals/relevance-label-review.md`（本地产物，不入库）。仍没有 v2 基线：全量与
+引用人工抽检还没跑，先跑完再谈基线。
 
 提交信息按 Conventional Commits 写，不得用 `--no-verify` 跳过钩子。AI 协作的规矩见
 CLAUDE.md 12.4。
@@ -125,9 +127,11 @@ CLAUDE.md 12.4。
 
 ## 进度与边界
 
-评估层已经做完，代码在 `src/agent_platform/evaluation/`，入口是 `scripts/eval_run.py`：
-28 条黄金集、六个确定性判分器、一层网关裁判，产物留痕和基线对比都能用。细节见
-`tests/evals/README.md`。
+评估层的代码在 `src/agent_platform/evaluation/`，入口是 `scripts/eval_run.py`：
+32 条黄金集、七个确定性判分器、RAGAS 三项进程内判分、引用裁判，产物留痕和基线对比都能用。
+代码与离线单测已完成，**尚未在真实基础设施上跑过 v2 全量**——语料与标签均已就绪
+（200 份文档 / 2004 条切分，21 份黄金集文档全部在库；21 条相关性标签已签署），但全量
+还没跑，所以也没有 v2 基线。细节见 `tests/evals/README.md`。
 
 还有几处只有接口、没有实现，引用时请按占位对待：Langfuse 和 OpenTelemetry 的追踪
 （`core/tracing.py` 写好了但没接线）；NeMo Guardrails 与 Presidio 护栏
@@ -136,16 +140,18 @@ K8s 部署（`deploy/k8s/` 只有一个占位 README）；HITL 中断恢复（�
 所以黄金集里这个类别是 0 条，没有编造）。
 
 演示期的偏离都写在 ADR 里。嵌入、重排与视觉理解经网关指向云端 API（ADR-0002、ADR-0004）；
-裁判和生成共用同一个上游模型，存在自偏好偏置（ADR-0003）；图片存本地文件系统而不是对象存储
-（ADR-0004）。生产环境必须换成私有化的 Qwen3 与 VLM、独立家族的本地裁判模型，图片迁到
+裁判经网关指向云端 SiliconFlow 的 Qwen，与生成模型 DeepSeek 不同家族，自偏好偏置随之消失，
+但评估数据（问题、证据、答案）仍会出域（ADR-0005）；图片存本地文件系统而不是对象存储
+（ADR-0004）。生产环境必须换成私有化的 Qwen3 与 VLM、私有化的本地裁判模型，图片迁到
 MinIO/S3，前三项届时只改网关映射与存储实现，业务代码不用动。语料不得出域，演示期只用
 公开语料。
 
 剩下的质量缺口是 D3：三条边界题的检索没取到支持答案的段落，模型照着现有证据拒答，
-黄金集期望仍是 `answered`。D1（生成侧没有「模型自称无法回答」的分支）与 D2（裁判
-提示词少了「即使答得出也必须拒答」这一档）已在 2026-10-17 修复，回归结果见
-`tests/evals/README.md` 5.7。另有一处评估口径问题：拒答文案没有可核对的事实性断言，
-faithfulness 被记成测量失败，所以最近一份产物里 9 条样例显示「未通过」，内容判定
-其实已经通过。
+黄金集期望仍是 `answered`。旧 `retrieval_hit` 只核对文档名，看不出段落是否相关；
+v2 的 Recall / Precision / MRR 要等相关性标签补齐后才能给出更细的证据。D1（生成侧
+没有「模型自称无法回答」的分支）与 D2（裁判提示词少了「即使答得出也必须拒答」这一档）
+已在 2026-10-17 修复。旧评估的 D11（拒答文案的 faithfulness 被记成测量失败）随自研
+生成指标一并退役：v2 对非 `answered` 样例的 RAGAS 三项直接记「不适用」，由
+`refusal_correctness` 兜底。
 
-更完整的边界见 `CHANGELOG.md` 的 `v1.3.0` 和「未发布 · 阶段七」两条。
+更完整的边界见 `CHANGELOG.md` 的 `v1.3.0`、`v1.6.0` 和「未发布 · 阶段七」三条。

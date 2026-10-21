@@ -35,6 +35,10 @@ dev = [
     "pytest-cov>=6",
     "pre-commit>=4",
 ]
+eval = [
+    "langchain-community>=0.3.31,<0.4",
+    "ragas==0.4.3",
+]
 
 [tool.uv.workspace]
 # 预留子包位（CLAUDE.md 2.1 uv workspace monorepo）；当前为单包，不得在无 ADR 时拆分
@@ -128,12 +132,11 @@ module = ["pymilvus.*", "langgraph.checkpoint.postgres.*", "jinja2.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-# ragas **不是**项目依赖（ADR-0003：它无条件依赖已归档的 langchain-community，
-# 违反 NO-14），因此环境里根本没有它的类型信息。它只被 scripts/eval_ragas.py 在
-# **隔离环境**里 import，那里同样解析不到 stub。
+# ragas 是 **eval 依赖组**的库（ADR-0006：进程内判分），不带类型信息；默认环境
+# （``uv sync``）不安装它，mypy 因此解析不到 stub。
 #
-# 为什么这条不算"扩大豁免"：被放宽的对象是**一个本仓永不依赖的库**，放宽之后
-# 也不会掩盖本仓自己的类型错误；而另一条路——给那 4 处 import 各贴一个
+# 为什么这条不算"扩大豁免"：被放宽的对象是**一个只在评估组出现的库**，放宽之后
+# 也不会掩盖本仓自己的类型错误；而另一条路——给每处 import 各贴一个
 # `# type: ignore`——反而更差：它会一并吞掉"ragas 改了 API 导致 import 名字不再
 # 存在"这类真实故障。范围仅此一项，不得再加。
 module = ["ragas.*"]

@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from agent_platform.core.models import build_chat_model
+from agent_platform.evaluation.judge import extract_json_object
 from agent_platform.knowledge.gateway_client import GatewayHttpClient
 from tests.integration._support import require_http
 
@@ -54,14 +55,38 @@ async def gateway(integration_settings: Settings) -> AsyncIterator[GatewayHttpCl
 async def test_logical_names_are_registered(
     gateway: GatewayHttpClient, integration_settings: Settings
 ) -> None:
-    """三个逻辑名都必须已注册：业务代码只认逻辑名，缺一个就是部署缺陷。"""
+    """全部逻辑名都必须已注册：业务代码只认逻辑名，缺一个就是部署缺陷。"""
     models = await gateway.list_models()
     for logical_name in (
         integration_settings.primary_chat_model,
         integration_settings.embedding_model,
         integration_settings.rerank_model,
+        # judge 漏掉过：它在评估链路里最晚被用到，注册表缺了它只在跑裁判时才炸。
+        integration_settings.judge_model,
     ):
         assert logical_name in models, f"网关未注册逻辑名 {logical_name}，实际: {sorted(models)}"
+
+
+@pytest.mark.usefixtures("gateway")
+async def test_judge_route_returns_parseable_json(integration_settings: Settings) -> None:
+    """judge 逻辑名必须真的能判：一次真实 JSON 往返（2026-10-21 换型后的证据）。
+
+    只验证"注册了"不够——路由存在但上游型号写错、密钥失效或上游拒答时，模型清单
+    照样有这一项，而评估会跑到裁判阶段才整轮失败。这里用最小提示词换一次真实调用，
+    并断言输出能被裁判自己的解析器读成对象。
+
+    裁判**不挂 fallback**（``use_fallback=False``）：判分换模型等于换测量工具，
+    这里也按生产构造方式调用，避免测的和跑的不是一条路。
+    """
+    model = build_chat_model(
+        integration_settings,
+        logical_name=integration_settings.judge_model,
+        max_tokens=128,
+        use_fallback=False,
+    )
+    reply = await model.ainvoke('只输出一个 JSON 对象：{"ok": true}。不要任何其他文字。')
+    payload = extract_json_object(str(reply.content))
+    assert payload.get("ok") is True, f"裁判未按约定返回 JSON：{reply.content!r}"
 
 
 async def test_embedding_dimension_matches_milvus_config(

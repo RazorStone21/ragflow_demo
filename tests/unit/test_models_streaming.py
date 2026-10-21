@@ -236,6 +236,18 @@ def test_build_chat_model_with_fallback_satisfies_protocol() -> None:
     assert isinstance(model, ChatModel)
 
 
+def test_build_chat_model_can_refuse_the_fallback_chain() -> None:
+    """``use_fallback=False`` 时即使配置了备选也返回主模型。
+
+    裁判必须走这条路：换裁判型号等于换测量工具，不能由一次网关抖动悄悄换成
+    另一个模型来判分（CLAUDE.md 9.2 固定裁判版本）。
+    """
+    model = build_chat_model(_settings(fallback_chat_model="fallback-chat"), use_fallback=False)
+
+    assert isinstance(model, ChatModel)
+    assert not isinstance(model, _RunnableChatModelAdapter)
+
+
 def test_build_chat_model_ignores_fallback_equal_to_primary() -> None:
     """备选与主模型同名时不构造自我 fallback 链，直接返回主模型。"""
     model = build_chat_model(_settings(fallback_chat_model="primary-chat"))

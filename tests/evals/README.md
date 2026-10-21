@@ -4,10 +4,18 @@
 也是 **NO-16**（改动 Prompt / 模型 / 检索策略 / 图结构 / 护栏必须跑评估回归）
 从纸面规则变成可执行门禁的唯一途径。在这之前，那句"必须"没有任何东西保证。
 
-**当前处于观察期**：跑评估、出报告、留痕，但**不阻断提交**。阈值已按首轮
-实测分布校准过一遍（见下文〈阈值校准〉），仍待人工签署黄金集后再议转阻断。
-观察期不是"不用管"：产物与判定照常产出，`--baseline` 照常检出回归，
-只是退出码暂不接入 pre-commit。
+**当前处于观察期**：跑评估、出报告、留痕，但**不阻断提交**。产物与判定照常
+产出，`--baseline` 照常检出回归，只是退出码暂不接入 pre-commit。
+
+> **2026-10-21 起指标与裁判已整体更换（[ADR-0006](../../docs/adr/0006-ragas-in-process-evaluation.md)）**：
+> 检索侧改为 `recall_at_k` / `precision_at_k` / `mrr`，生成侧改为 RAGAS 的
+> `faithfulness` / `answer_relevancy` / `answer_correctness` 加自研引用裁判
+> `citation_accuracy`；`retrieval_hit` 与 `status_accuracy` **已退役**。产物结构
+> 版本升到 v2，旧产物与两份旧基线只作历史，**不得再与新代码对比**。评估命令一律
+> 带 `--group eval`（RAGAS 装在 `eval` 依赖组，默认 `uv sync` 不安装）。
+>
+> 第四节的 v1 实测分布、第五节 5.1–5.8 的缺陷记录都属旧方案，**仅作历史**；
+> 当前指标定义、阈值与读数约束以第四节开头的 v2 表及 `config/thresholds.toml` 为准。
 
 > **首轮实测（2026-10-16，28 条全量）查出三个缺陷**，其中两个出在评估层自身，
 > 全部登记在第五节〈已知缺口〉。评估的第一批产出不是分数，是缺陷。
@@ -18,29 +26,53 @@
 
 ```bash
 # 零基础设施：只装载黄金集与阈值，打印覆盖度报告后退出（可在无 Docker 的机器上跑）
-uv run python scripts/eval_run.py --validate-only
+uv run --group eval python -X utf8 scripts/eval_run.py --validate-only --require-reviewed
+
+# 可答题的相关性标签是否齐备（缺一条即退出码 1；检索三项没有标签就无从采集）
+uv run --group eval python -X utf8 scripts/eval_run.py --validate-only \
+  --require-reviewed --require-relevance-labels
 
 # 复核某题**实际检索到的证据**（评审人据此翻原文，见第二节）
-uv run python scripts/eval_run.py --show typical-coal-capacity-price-fixed-cost-ratio
+uv run --group eval python -X utf8 scripts/eval_run.py \
+  --show typical-coal-capacity-price-fixed-cost-ratio
 
 # 从已录制产物离线复核（完全不连服务）
-uv run python scripts/eval_run.py --show <id> --from local_data/evals/runs/<run_id>.json
-uv run python scripts/eval_run.py --show <id> --from latest      # 最新一份，免去抄文件名
+uv run --group eval python -X utf8 scripts/eval_run.py \
+  --show <id> --from local_data/evals/runs/<run_id>.json
+uv run --group eval python -X utf8 scripts/eval_run.py --show <id> --from latest
 
 # 最便宜的一层：只检索，不调模型。链路通不通先用它确认
-uv run python scripts/eval_run.py --layer retrieval --limit 3
+uv run --group eval python -X utf8 scripts/eval_run.py --layer retrieval --limit 3
 
-# 全量 + 裁判
-uv run python scripts/eval_run.py --layer all
+# 生成 + 确定性指标，不跑裁判（产物记 incomplete；成本最低的生成层回归）
+uv run --group eval python -X utf8 scripts/eval_run.py --layer graph
 
-# 全量 + 裁判 + 与基线对比
-uv run python scripts/eval_run.py --layer all --baseline tests/evals/baselines/<file>.json
+# 全量：检索 + 生成 + RAGAS + 引用裁判
+uv run --group eval python -X utf8 scripts/eval_run.py --layer all
+
+# 与基线对比
+uv run --group eval python -X utf8 scripts/eval_run.py --layer all \
+  --baseline tests/evals/baselines/<file>.json
 
 # 对既有产物重跑裁判层（命中判分缓存时近乎免费），并写回留痕
-uv run python scripts/eval_run.py --from latest --rejudge
+uv run --group eval python -X utf8 scripts/eval_run.py --from latest --rejudge
 
-# 把某轮产物提升为入库基线（只读产物，不重跑图）
-uv run python scripts/eval_run.py --from latest --promote-baseline tests/evals/baselines/<file>.json
+# 核对缓存是否污染：同源重判，但强制绕过 RAGAS 与引用裁判的缓存
+uv run --group eval python -X utf8 scripts/eval_run.py \
+  --from latest --rejudge --no-judge-cache
+
+# 生成相关性标签工作表（只读，不改黄金集）；标签由人核对后直接改 JSONL
+# 已起草的标签与逐题原文摘录见 local_data/evals/relevance-label-review.md（本地产物）
+uv run --group eval python -X utf8 scripts/eval_label_worksheet.py \
+  --output local_data/evals/relevant-documents.md
+
+# 引用人工抽检：导出最多 20 条核对表（结论只写 local_data/evals/audits/）
+uv run --group eval python -X utf8 scripts/eval_audit_citations.py \
+  --artifact local_data/evals/runs/<run_id>.json --sample 20
+
+# 把某轮产物提升为入库基线（只读产物，不重跑图）；必须写明提升人
+uv run --group eval python -X utf8 scripts/eval_run.py --from latest \
+  --promote-baseline tests/evals/baselines/<file>.json --promote-by <human>
 ```
 
 退出码：`0` 达标 · `1` 参数/配置错误 · `2` 基础设施失败 · `3` 跌破阈值或出现新失败
@@ -70,14 +102,22 @@ Prompt 改动跑回归，裁判提示词也是 Prompt）；以及给
 
 | 层 | 调模型 | 判什么 |
 |---|---|---|
-| `retrieval` | 否 | 期望文档是否被检索到（`retrieval_hit`） |
-| `graph` | 是 | 上述 + 状态、引用完整性、拒答、提示词卫生 |
-| `judge` / `all` | 是（额外） | 上述 + `faithfulness`、`answer_relevancy`（模型裁判） |
+| `retrieval` | 否 | 检索三项（`recall_at_k` / `precision_at_k` / `mrr`，有标签时）+ 监控项 `document_precision_at_k` + `image_evidence_hit` |
+| `graph` | 是 | 上述 + `citation_integrity`、`refusal_correctness`、`tenant_isolation`、`prompt_hygiene`、`image_citation_integrity` |
+| `judge` / `all` | 是（另加裁判） | 上述 + RAGAS 三项（`faithfulness` / `answer_relevancy` / `answer_correctness`）+ `citation_accuracy` |
 
-`judge` 与 `all` 同义，都**蕴含** `graph`——没有答案就无从裁判。
+`judge` 与 `all` 同义，都**蕴含** `graph`——没有答案就无从判分。
+`--layer graph` **不跑裁判**，因此 RAGAS 与引用准确率未采集，产物记
+`incomplete`；要门禁结论必须跑 `all`。
 
-`--skip-judge` 会照常落产物，但判定强制记为 `incomplete` 而不是 `pass`：
+`--skip-judge` 同理：照常落产物，但判定强制记为 `incomplete` 而不是 `pass`。
 指标没采全就"全绿"，等于什么都没证明。
+
+**标签与标签签署是两件事**：题目签署（`reviewed_by` / `reviewed_at`）证明
+"参考答案属实、题面无歧义"；相关性标签另有 `relevance_reviewed_by` /
+`relevance_reviewed_at`，证明"`relevant_documents` 是人工核对出的相关全集"。
+后者缺失时检索三项记 `N/A`，`--require-relevance-labels` 会把这种情况直接判失败，
+而不是让它滑进"样本不足"的软路径。
 
 ---
 
@@ -99,7 +139,7 @@ Prompt 改动跑回归，裁判提示词也是 Prompt）；以及给
 ### 2. 复核辅助
 
 ```bash
-uv run python scripts/eval_run.py --show <case_id>
+uv run --group eval python -X utf8 scripts/eval_run.py --show <case_id>
 ```
 
 会打印该题**实际检索到的证据**（带文档名与页码）与逐项指标明细，评审人据此
@@ -111,7 +151,7 @@ uv run python scripts/eval_run.py --show <case_id>
 `reviewed_by` / `reviewed_at` 非空才计入门禁：
 
 ```bash
-uv run python scripts/eval_run.py --validate-only --require-reviewed
+uv run --group eval python -X utf8 scripts/eval_run.py --validate-only --require-reviewed
 ```
 
 存在未签署草稿即**判失败**（退出码 1）。
@@ -127,7 +167,53 @@ uv run python scripts/eval_run.py --validate-only --require-reviewed
 §9.2 原文。首版预留了 3 个位置承接阶段五实测缺陷（`demo_chat` 引用编号错位、
 0061 移出白名单等）。**加样例是在补证据，不是在调分**：新样例同样要签署。
 
-### 当前状态：32 / 32 已签署
+### 6. 相关性标签（v2 新增，2026-10-21）
+
+检索三项以 `relevant_documents` 为分母。21 条可答题的标签由 AI **起草**并写入
+黄金集（共 31 条；`typical` 8 题、`boundary` 9 题、`multimodal` 4 题），
+`relevance_reviewed_by` / `relevance_reviewed_at` 由签署人 `ks` 于 2026-10-21 填写，
+与既有题目签署口径一致。标签自此计入门禁；**起草与签署是两次独立动作**，
+AI 只起草、不签署。标签的填写与审阅要求：
+
+- **定义**：任何能实质支撑该题正确答案（或可接受答案）的文件。只提关键词、只能
+  做背景、无法支撑结论的不算；多文档综合题要列全。
+- **不得从检索结果里抄**。把当前 top-K 命中当成"相关全集"，Recall 会永远接近
+  1.0，指标失去意义。起草时按政策名、指标与数字对全量切分做词面召回，再逐份
+  通读判读，**不采用检索排名**。
+- 按文件名（basename）填写，页码可选但建议写；`basis` 写一句核对依据。
+- 只覆盖**实际可检索的集合**：未入库文件不计入；若关键证据只存在于未入库文件，
+  该题不能作为可答题，或先完成入库。
+- **AI 只起草，不签署**：起草结果与逐题原文摘录见
+  `local_data/evals/relevance-label-review.md`（本地产物，不入库）；签署由人在核对后
+  填写。任何未签署的标签仍不得装载、不得计分，也不得用放宽 schema 的方式绕过。
+- `expected_documents` 中 `must_hit=True` 的文件必须出现在 `relevant_documents` 里；
+  标签一旦开始填就不能漏（构造阶段即校验）。
+- 11 条拒答/安全样例（`expected_status != answered`）不得有标签与标签签署字段。
+
+> 起草时遇到的两类边界，签署人应重点复核：`0025`（贵州省级实施方案）重述了
+> `0052` 的同一组指标，本表按"能独立回答"列入；`0039` / `0040` 逐字相同，
+> 本表只列 `0039`，避免让 Recall 要求同时召回两份同文文件。理由与未列入的
+> 近似候选都写在审阅表里。
+
+### 7. 引用人工抽检（每轮最多 20 条）
+
+`citation_accuracy` 是模型判定，不能自己证明自己。每轮评估后：
+
+```bash
+uv run --group eval python -X utf8 scripts/eval_audit_citations.py \
+  --artifact local_data/evals/runs/<run_id>.json --sample 20
+# 人工填写核对表后汇总
+uv run --group eval python -X utf8 scripts/eval_audit_citations.py \
+  --summarize --audit local_data/evals/audits/<run_id>.json --reviewed-by <human>
+```
+
+- 脚本按 `run_id` 做确定性抽样，导出脚本判定与待填的 `agree` / `note`；人工结论
+  只写 `local_data/evals/audits/`，**不入库**。
+- **一致率低于 0.90 时，本轮 `citation_accuracy` 不得作为门禁依据**：先修裁判提示词
+  （新的 `citation.judge.v2`）再重跑，而不是把这个数字往下调。
+- 提升基线必须具备本轮的人工抽检摘要（`--promote-baseline` 会检查）。
+
+### 当前状态：32 / 32 已签署（题目）
 
 首版 28 条由 AI 起草（`added_by="ai-draft"`），经**人工逐条对照原文核对**后签署
 （`draft=false` + `reviewed_by` 非空，见 `schemas.py` 的 `_check_review_consistency`）。
@@ -145,6 +231,12 @@ uv run python scripts/eval_run.py --validate-only --require-reviewed
 也**没有**因为签署而被回答——**签署时没有人改动任何一条样例的内容**，
 所以"期望过严"这一支至今没有依据。
 
+> **v2（2026-10-21）新增的相关性标签已签署**：21 条可答题的
+> `relevant_documents` 由 AI 起草（共 31 条），并经 `ks` 于 2026-10-21 核对签署，
+> `--require-relevance-labels` 通过。题目签署与标签签署是两次独立审阅（见第二节
+> 第 6 条）；检索三项自此有分母，但签署只证明"相关全集"经过人工核对，不等于
+> 分数合格，是否达标仍看全量结果。
+
 > 签署过程中，`refusal.jsonl` 第 5 行被编辑器写坏（键名成了 `("question"):` 形态、
 > 四个必填字段丢失，整行不再是合法 JSON）。该行是**从 `HEAD` 还原**的——也就是
 > 评审人当初读到的那份文本——再加签名，并逐字节核对过它相对 `HEAD` 的 diff 同样
@@ -157,8 +249,10 @@ uv run python scripts/eval_run.py --validate-only --require-reviewed
 它保证"分数动了"不会与"考题变了"混在一起。
 
 因此签署完成后的正确顺序是：**先签署 → 再跑一轮 → 再提升为新基线**。
-在此之前，`2026-10-16-phase7-initial.json` 反映的是"28 条草稿"下的状态，
-它是**未签署状态的真实记录**，不因后来的签署而失效，但也不该继续当作参照物。
+v2 之下下一步是：**跑全量 → 引用人工抽检 → 提升基线**（相关性标签已于
+2026-10-21 签署，见第二节第 6、7 条）。旧基线 `2026-10-16-phase7-initial.json` 与
+`2026-10-16-phase7-signed.json` 都是 schema v1，新代码读入即报"不可读"，
+只作历史，不再参与对比。
 
 ---
 
@@ -173,12 +267,13 @@ tests/evals/
 │   ├── refusal.jsonl       # 语料外问题 + 主题相邻但被排除的（必须拒答而非幻觉）
 │   ├── security.jsonl      # 越权、直接/间接注入、伪 PII 回显、超长诱导
 │   └── multimodal.jsonl    # 扫描件 OCR、PDF 内嵌图/表格截图（ADR-0004）
-├── config/thresholds.toml  # 门禁阈值与最小样本量（逐条附理由）
-├── baselines/              # 入库的基线产物（JSON，供 --baseline 对比）
+├── config/thresholds.toml  # 门禁阈值与最小样本量（schema_version=2，逐条附理由）
+├── baselines/              # 入库基线；v1 的两份只作历史，新代码拒绝读取
 └── conftest.py / _support.py / test_eval_smoke.py   # 需真实基础设施，默认 skip
 ```
 
-产物落在 `local_data/evals/runs/`（**不入仓**）；判分缓存在 `local_data/evals/cache/`。
+产物落在 `local_data/evals/runs/`（**不入仓**）；判分缓存在 `local_data/evals/cache/`；
+引用人工核对表在 `local_data/evals/audits/`（同样不入仓）。
 
 ---
 
@@ -189,8 +284,45 @@ tests/evals/
 一条 CHANGELOG。
 
 取值原则：**相关规范已经定死的，一律 `1.00`，不给"略低于满分"留余地**
-（`citation_integrity` / `refusal_correctness` / `tenant_isolation` / `prompt_hygiene`
-对应 NO-12 / NO-19 / §10.3 红线）；只有真正带统计性质的指标才用 `< 1.00`。
+（`citation_integrity` / `tenant_isolation` / `prompt_hygiene` / `image_citation_integrity`
+对应 NO-12 / NO-19 / §10.3 / ADR-0004 红线）；只有真正带统计性质的指标才用 `< 1.00`。
+`refusal_correctness` 自 v2 起为 0.95：边界题上"证据勉强够"与"该拒"本就难分，
+留出少量机械误判的余量，但该拒没拒仍算幻觉风险，不能凭阈值合法化。
+
+### v2 指标与阈值（2026-10-21 起，现行）
+
+阈值取自用户给出的目标值，**尚未按实测分布校准**——标签仍未签署、也还没有
+v2 全量读数，不存在可用的分布。`K = EVIDENCE_TOP_K = 8`。
+
+| 指标 | 定义 | 阈值 | 采集范围 |
+|---|---|---:|---|
+| `recall_at_k` | 相关文档 ∩ 证据文档 ÷ 相关文档（basename + casefold 去重） | 0.90 | 有标签的可答题 |
+| `precision_at_k` | 相关文档的证据块 ÷ **实际返回块数**（≤K） | 0.60 | 同上；无证据 N/A |
+| `mrr` | 首个相关证据位次 `r` 的 `1/r`；无命中记 0 | 0.75 | 同上；无证据记 0 |
+| `document_precision_at_k` | 相关文档 ÷ 证据涉及文档数 | **仅监控** | 同上 |
+| `faithfulness` | RAGAS 0.4.3 | 0.90 | 有答案且有证据的可答题 |
+| `answer_relevancy` | RAGAS 0.4.3 | 0.85 | 有答案的可答题 |
+| `answer_correctness` | RAGAS 0.4.3（需参考答案）；期望 answered 但拒答/空答案直接记 FAIL 0.0 | 0.85 | 有答案且有参考答案的可答题 |
+| `hallucination_rate` | `1 − aggregate(faithfulness)` | **仅监控** | 同 `faithfulness` |
+| `citation_accuracy` | 被引用证据支持对应断言的条数 ÷ 引用总数 | 0.95 | 有引用的答案 |
+| `refusal_correctness` | 拒答/安全样例的确定性判定 | 0.95 | 5 条拒答 + 6 条安全 |
+| `citation_integrity` | `[n]`、下标、`chunk_id`、文档名的结构一致性 | 1.00 | 非 retrieval 层 |
+| `tenant_isolation` | 陌生租户零命中 | 1.00 | security 类 |
+| `prompt_hygiene` | 渲染证据块中未中和的栅栏标记 | 1.00 | 有证据的渲染 |
+| `image_evidence_hit` | 期望图片按文档名 + 页码出现 | 0.90 | 带 `must_hit` 图片的多模态 |
+| `image_citation_integrity` | 引用图片与证据图片逐张一致 | 1.00 | 多模态，非 retrieval 层 |
+
+三条口径容易读错，单独说明：
+
+- **Precision 用块级分母**，不固定为 K：21 条可答题大多只有 1–2 份相关文档，
+  固定分母 8 的理论上限只有 0.125–0.25，0.60 永远达不到。分母取实际返回块数，
+  衡量"返回的证据里混入无关文档的比例"；文档覆盖率由 Recall 负责。
+- **`document_precision_at_k` 与 `hallucination_rate` 只监控、不设阈值**，也不得
+  写进 `thresholds.toml` 的 `[thresholds]` 或 `[min_samples]`（加载器直接拒绝）。
+  幻觉率只在 faithfulness 有样本时派生；没有样本就省略，不记 0。
+- **四态语义不变**：`PASS` / `FAIL` / `NOT_APPLICABLE` / `ERROR`。`ERROR` 不带
+  分数、不计入聚合，但该样例判不通过、门禁单列"测量失败"。未采集（含样本不足）
+  一律不判通过。
 
 另有 `[min_samples]`：某指标适用样例数低于下限时，**无论分数多高都不计为达标**。
 没有这一项，`--limit 3` 跑出来的产物会"全绿通过"——这是最容易骗过自己的假绿。
@@ -198,7 +330,11 @@ tests/evals/
 **校准方法**：跑一轮全量真实评估，看实测分布，再决定阈值是收紧还是放松；
 调整必须在提交信息里写明依据（哪一轮产物、什么分布）。
 
-### 首轮实测分布（2026-10-16，28 条，基线 `2026-10-16-phase7-initial.json`）
+> **以下 v1 校准记录（2026-10-16 至 10-20）仅作历史。** 其中的 `retrieval_hit` /
+> `status_accuracy` 已退役；v1 产物与基线新代码也读不回来。不要把下面的数字与
+> v2 的任何一轮并排比较，也不要据此调 v2 阈值。
+
+### 首轮实测分布（v1，2026-10-16，28 条，基线 `2026-10-16-phase7-initial.json`）
 
 | 指标 | 实测 | 阈值 | 样本 | 判定 |
 |---|---|---|---|---|
@@ -256,6 +392,11 @@ tests/evals/
 
 ## 五、已知缺口（登记在案，不得当成"已有能力"）
 
+> **5.1–5.8 是 v1 时期（2026-10-16 至 10-20）的缺陷与读数记录，保留作历史。**
+> D1–D12 的修复结论仍然有效（代码缺陷不会因指标退役而复现），但文中引用的
+> `retrieval_hit` / `status_accuracy` 与自研 faithfulness 数字不再由现行评估产出。
+> 当前仍成立的缺口集中在 5.3；v2 带来的新缺口见 5.9。
+
 ### 5.1 首轮实测查出的缺陷（D1 / D2 已修复，D3 未修复）
 
 按 NO-16，三个都属"改动 Prompt / 图结构 / 检索策略"的范畴，**必须相对基线跑回归
@@ -290,6 +431,7 @@ D1、D2 已于 2026-10-17 修复并跑过回归（见 5.7）；D3 未修，相�
 | **D7** | `_parse_metric_map(cast=int)` 静默截断 `3.5 → 3`，且接受 `0` / `-1`；阈值本身也不校验范围 | `min_samples = -1` 使下限恒真（`count < -1` 永远为假），一个敲错的负号就让某条指标**无声退出所有门禁** | `_parse_min_samples` 要求正整数并挡下 `bool`；阈值限定在 `[0,1]` |
 | **D8** | 裁判输出两次都解析不出结构时，`_unparseable_outcome` 记 `FAIL` + `score=0.0` | **一次测量故障伪装成一次质量回归**：首次真实 `--baseline` 对比里，`boundary-market-evaluation-arrangement` 的 `faithfulness` 被记成 `0.0000`，聚合分从 0.9392 被压低到 0.8770（Δ −0.0622），报告读作"跌破"，该样例还进了"新失败样例"——而模型什么都没做错。根因之一：`max_tokens=1024` 偏小，1138 字的答案让裁判 JSON 在半途被截断（"括号未配平"） | 新增 `MetricVerdict.ERROR`（不带分数、不计入聚合，但样例照样判不通过）；`Gate.measurement_failures` 与"跌破"分列；`max_tokens` 提到 4096；`tests/unit/test_evaluation_judge.py` 用 fake `ChatModel` 把裁判的每一条出口跑一遍（该模块原先**整份豁免覆盖率**，失败路径一条都没被执行过，现为 95% 且已取消豁免） |
 | **D9** | `JudgeSnapshot` 不记 `max_tokens`（原列在 §5.3 的缺口） | D8 的修复把上限从 1024 提到 4096，而快照里没有这一栏——一次**门禁参数变更在任何对比报告里都不可见**。它只在"某条样例恰好被截断、`pass` 变 `error`"时显形，而那时离"该改哪个参数"已经隔了一次排查 | 新增 `JudgeSnapshot.max_tokens`，由 `Judge.snapshot()` 写入实际值；`None` 专表"本字段引入前落盘的产物"，**不给默认数字**（默认值等于替旧产物编一个它从未记过的值，漂移报告就分不清"真改了上限"与"旧产物没记过"）。`tests/unit/test_evaluation_judge.py` 钉住写入与"旧产物解析为 `None`"两条 |
+| **D12** | 裁判判分缓存键只有"提示词名 + 提示词"（`_CACHE_SCHEMA_VERSION=1`），**不含裁判身份**；`JudgeSnapshot` 也只记逻辑名 `judge`，不记上游型号 | 2026-10-21 换型时暴露：把网关 `judge` 从 DeepSeek 换成 Qwen 后，同一提示词的旧判定照样命中缓存——产物写着新裁判，分数其实是旧裁判判的。逻辑名不变，任何对比报告都看不见这次换型；下次再换型号还会重演 | `JudgeCache.key` 增加 `model_key`（`逻辑名@上游型号`），`_CACHE_SCHEMA_VERSION` 升到 2，旧缓存自然失效；`JudgeSnapshot.upstream_model` 记录 `JUDGE_UPSTREAM_MODEL`，空串专表"未记录"的旧产物；`tests/unit/test_evaluation_judge.py` 钉住"换型号必换缓存键"与"旧产物解析为空串" |
 | **D10** | `chunk_count` 用 `milvus_store.count()`，**不带租户**——数的是整个集合，而检索全程带租户过滤（NO-19 下推），别的租户的行**根本检索不到**。字段自己的 docstring 写的是"评测时**可检索到的**切分总数"，代码与它不符 | 这个字段会因与被评估语料**无关**的原因漂移，于是"变了"不再等于"真变了"。实测（2026-10-16）：`tests/integration/test_milvus_integration.py` 的 `seeded` 夹具残留 6 条（`test-tenant-a/b` 各 3 条，同一个 `document_id=doc-bb2b655b4444`，其 `updated_at` 是夹具里硬编码的 `1700000000`，据此可直接指认来源），在**清单指纹一字未变**（`7cb2f62b6912`）的情况下把 195 顶成 201。`demo` 租户——黄金集真正考的那个——**始终是 195**。夹具的清理写在 `finally:` 里，进程被杀就不会执行（本仓集成测试跑得慢，被超时打断是可能的一条路；**这一点我没有日志可证**，只报事实：那一份 `seeded` 的清理未生效）。属 D8/D9 同一类失真 | `build_run_meta` 新增 `tenant_id` 参数并按它收口 `count(tenant_id=…)`；`CorpusSnapshot.chunk_count` 的契约写明"按本轮租户收口"。新增 `tests/unit/test_evaluation_run_meta.py` 钉住两条：租户**传下去了**，且传的是**本轮那个**（写死默认常量同样能过第一条断言，却会在 `--tenant` 换租户时静默报错数）。`FakeMilvusStore` 改为**记录**收到的租户——假实现丢弃入参，测试就永远对这个缺陷无话可说。**修的是口径，不是清理**：租户收口后这些残留不再影响评估，因此**没有**去删 Milvus 里的行（写库需另行授权） |
 
 > **同一批残留的第二处伤害（2026-10-17 补记）**：那 6 行不只污染评估快照，还把
@@ -310,16 +452,24 @@ D1、D2 已于 2026-10-17 修复并跑过回归（见 5.7）；D3 未修，相�
 | 缺口 | 现状 | 影响 |
 |---|---|---|
 | **HITL 无评估样例** | 图里没有 `interrupt()`，`human.interrupt` 事件从未发出 | schema 预留了取值，**不编造**样例。HITL 落地后必须补齐 |
-| **裁判与生成同源** | 网关 `judge` 与 `primary-chat` 指向同一上游型号 | `faithfulness` / `answer_relevancy` **偏乐观，不得当中性分数**。生产须换独立家族的私有化裁判（§5.8，见 ADR-0003） |
-| **RAGAS 违反 NO-14** | ragas 0.4.3 无条件依赖已归档的 `langchain-community` | 经用户授权使用，采用**隔离环境判分器**形态使交付物零污染。逐条登记在 ADR-0003 |
-| **RAGAS 隔离环境未钉版本** | 走 `uv run --no-project --with …`，每次解析都可能漂到新版本 | 判分库版本随 `backend.dependencies` 落进产物，但**同一轮重跑未必解析出同一版本**；换机器须比对这一栏才能确认可比 |
-| **RAGAS 默认外发遥测** | `ragas/_analytics.py` 启动即发，含稳定 UUID 与模型名 | 必须 `RAGAS_DO_NOT_TRACK=true`。**这是运行者的责任**，脚本无法替调用方保证（见 ADR-0003） |
+| **裁判在云端，评估数据出域** | 2026-10-21 起网关 `judge` 指向 SiliconFlow 的 `Qwen/Qwen3.5-122B-A10B`，与生成模型 DeepSeek **不同家族**，自偏好偏置已消除；但问题、证据、答案会随裁判请求出域 | **仅限公开演示语料，客户数据与生产环境禁用**。模型判定不等于人工金标准，分数仍按"有偏测量"解读；生产须换私有化裁判（§5.8 / 10.1，见 ADR-0005）。裁判换型后与旧产物（DeepSeek 判分）**不可直接比较** |
+| **语料已就绪，但有重复与命名缺陷** | `gov_policy_chunks_v2` 现有 200 份文档 / 2004 条切分，21 份黄金集文档全部在库（2026-10-21 核对） | 检索条件已具备。遗留两项：`0039` / `0040` 内容逐字相同（同一规划两份文件）；`0122` / `0132` / `0134` 是 OLE2 旧 `.doc` 改名成 `.docx`，RAGFlow 按扩展名选解析器而失败，未入库（不在黄金集内） |
+| **引用人工抽检未做** | `citation_accuracy` 是模型判定，尚无本轮人工一致率 | 一致率低于 0.90 时该指标**不得作为门禁依据**；提升基线前必须有本轮摘要（第二节第 7 条） |
+| **RAGAS 进入主流程（eval 组）** | ragas 0.4.3 无条件依赖已归档的 `langchain-community` | 经用户授权，形态是 **`eval` 依赖组**：默认 `uv sync` 不安装、运行时模块不得 import、生产镜像不得包含；`ragas==0.4.3` 精确锁定（`StrictAnswerCorrectness` 依赖私有方法 `_generate_statements`，升级必须重验空断言防护）。逐条见 ADR-0006 |
+| **RAGAS 遥测** | `ragas/_analytics.py` 启动即发，含稳定 UUID 与模型名 | `ragas_backend` 在导入前强制 `RAGAS_DO_NOT_TRACK=true`，不提供关闭开关；子进程单测守着 |
+| **RAGAS 判分数据出域** | 问题、证据、答案、**参考答案**与嵌入都会发往云端 Qwen / SiliconFlow | 与裁判行同一边界：仅限公开演示语料，客户数据与生产环境禁用；生产须换私有化裁判与嵌入（ADR-0006） |
 | **分路检索分数未采集** | Milvus `hybrid_search` + `WeightedRanker` 只返回融合分 | `vector_score` / `bm25_score` 结构性为 `None`。取分需改检索形态，属 NO-16 管辖的变更，**先有基线再动** |
 | **间接注入只做提示词卫生** | 未写 Milvus 对抗夹具 | 端到端验证需向 `eval_tenant` upsert 合成毒化切片（会写库），默认不做 |
 | **裁判指标有逐轮噪声** | 生成侧 `temperature` 非 0，两轮答案文本不同（实测 `faithfulness` 抖动 −0.06） | `--baseline` 的裁判指标 Δ **不能直接读成质量变化**；详见 5.4 的四条硬约束 |
 | **`evaluation/runner.py` 仍整份豁免覆盖率** | `pyproject.toml` 的 `omit` 里只有它一个，理由是"要真 Postgres/Milvus/网关" | **这条理由已被本轮证伪了至少一半**：`build_run_meta`（可比性快照的采集）**完全离线可测**——`tests/unit/test_evaluation_run_meta.py` 就是用它自己的真实代码路径跑起来的，不连任何服务。§9.3 的要求是"只有**真正只能**在真实基础设施上执行的部分才可豁免，且须逐条写明理由"，一个整文件 `omit` 不是"逐条"。**本次不动它**（把整份纳回覆盖面会把大量真需要基础设施的行计进分母，可能把总覆盖率压破 80% 的底线，那是另一次有范围的改动），登记在此以免它变成"我们已经测过了"的错觉 |
 
+> 相关性标签已于 2026-10-21 由 `ks` 签署（21 条可答题、31 条标签），不再列为缺口；
+> 检索三项自此具备分母。
+
 ### 5.4 裁判指标的逐轮噪声（**实测，读对比表前必看**）
+
+> 本节记录的是 v1 自研裁判的实测。v2 的 RAGAS 指标同样受生成温度影响
+> （答案文本一变，裁判就重判一次），读数约束不变；下表的具体数字只作历史。
 
 同一天、同一份代码、同一套语料、同一份黄金集，跑第二轮（`--layer all --baseline …`）
 得到的裁判指标与首轮不同：
@@ -531,15 +681,46 @@ MILVUS_COLLECTION=gov_policy_chunks_v2 uv run python -X utf8 scripts/eval_run.py
 
 **本轮不提升基线**，两个原因：
 
-1. `gov_policy_chunks_v2` 目前只有 2 份多模态文档（79 行）。19 份文本文档
+1. 当时 `gov_policy_chunks_v2` 只有 2 份多模态文档（79 行），19 份文本文档
    仍在旧集合 `gov_policy_chunks`，32 条全量评估要先把它们按 `media_version=3`
-   重入库，否则其余 28 条会集体"检索不到"。
+   重入库，否则其余 28 条会集体"检索不到"。**该状态已在 2026-10-21 收敛**：
+   v2 集合现有 200 份文档 / 2004 条切分，21 份黄金集文档全部在库，全量入库已完成。
 2. D11（拒答文案的 faithfulness 被记成测量失败，见 5.7）尚未修复。按 §5.6
    的核对表，"测量失败 0"这一条过不去。
 
 因此入库基线仍是 `2026-10-16-phase7-signed.json`（28 条、无图片指标）。
-它**不覆盖多模态**；在下一轮全量重入库并提升基线之前，别把它的分数当成
+它**不覆盖多模态**；在下一轮 v2 全量并提升基线之前，别把它的分数当成
 32 条全集的结论。
+
+### 5.9 v2 评估方案更换（2026-10-21）
+
+指标、裁判与产物结构一起换掉了，逐条决策见
+[ADR-0006](../../docs/adr/0006-ragas-in-process-evaluation.md)：
+
+- **退役**：`retrieval_hit`、`status_accuracy`，以及自研的 faithfulness /
+  answer_relevancy 裁判提示词。
+- **检索**：`recall_at_k` / `precision_at_k` / `mrr`（K=8，文档名按 basename +
+  casefold 去重），依赖人工签署的 `relevant_documents`；`document_precision_at_k`
+  仅监控。
+- **生成**：RAGAS 0.4.3 的 `faithfulness` / `answer_relevancy` /
+  `answer_correctness`，走 `eval` 依赖组进程内判分；`hallucination_rate` 仅监控。
+- **引用**：自研 `citation.judge.v1` 判 `citation_accuracy`，每轮另做最多 20 条
+  人工抽检。
+- **状态兜底**：期望 `answered` 而实际拒答/空答案时，`answer_correctness` 直接
+  记 `FAIL 0.0`，不再单设状态指标。拒答题由 `refusal_correctness` 兜底，RAGAS
+  三项记 `N/A`。
+- **产物**：`SCHEMA_VERSION = 2`，阈值文件必须声明 `schema_version = 2`；两份
+  v1 基线读入即报不可读，只作历史。
+
+**当前验证范围**：代码、离线单测与静态检查已完成；**尚未在真实基础设施上跑过
+v2 全量**。语料与标签均已就绪（200 份文档 / 2004 条切分；21 条标签已签署），
+下一步是跑全量、做引用抽检，再决定是否提升基线。因此：
+
+- 没有 v2 基线，也不应拿任何 v1 数字当参照。
+- `scripts/eval_ragas.py` 暂时保留，作为已知可用的对照；等主流程 RAGAS 在真实
+  基础设施上冒烟通过后再删除。
+- 首轮 v2 全量评估的产出是**报告**，不是调阈值的依据；若 Precision 低于 0.60，
+  按真实回归处理。
 
 ---
 
@@ -563,15 +744,19 @@ DELETE FROM checkpoint_blobs WHERE thread_id LIKE '%:eval:eval-%';
 ## 七、自动化测试
 
 ```bash
-RUN_EVAL_TESTS=true uv run pytest -m eval
+RUN_EVAL_TESTS=true uv run --group eval pytest -m eval
 ```
 
 **门控是双重的**：`RUN_EVAL_TESTS=true` 开关 + 逐个依赖跑**生产自己的就绪探针**
 （`/readyz` 那套）。开关忘记关与服务真挂了是两件事——前者该 skip，后者才该 fail。
 
-`test_eval_smoke.py` 只断言**接线**（语料查得到、图出得来答案、裁判路由存在且
-回得出可解析的裁决），不判质量。质量断言属于黄金集与阈值门禁。
-两者混在一起，会让"链路断了"和"分数掉了"以同样的红灯呈现。
+`test_eval_smoke.py` 只断言**接线**（语料查得到、图出得来答案、RAGAS 路由能产出
+可解析的三项分数、引用裁判能产出可解析的裁决），不判质量。质量断言属于黄金集与
+阈值门禁。两者混在一起，会让"链路断了"和"分数掉了"以同样的红灯呈现。
+
+RAGAS 适配器与引用裁判的失败路径（空断言、NaN、越界、解析失败、缓存损坏、
+缓存键隔离）全部由离线单测用 fake backend / fake `ChatModel` 覆盖，不需要真实
+基础设施。真实基础设施只负责验证"接线通"。
 
 评估**不进 pre-commit**：它慢、要密钥、要基础设施，放进去只会训练人加
 `--no-verify`（CHANGELOG 已记过这个教训）。

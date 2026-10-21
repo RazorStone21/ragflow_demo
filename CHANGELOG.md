@@ -12,6 +12,63 @@
 
 本条以下为**平台侧**变更记录（按时间倒序），正式发布时归档为对应版本；**规范本身的版本演进以 `## [v1.3.0]`、`## [v1.2.0]` 与 `## [v1.1.1]` 三条为权威**。此处原列的「v1.2.0 待写清单」（变更 / ADR / 基线版本实测值 / 已知偏离 / 新增环境变量 / 占位与顺延）已由 v1.2.0 条落实，不再重复。
 
+### 未发布 · 重入库前 60 份与相关性标签签署（`test(evals)` / `docs(standards)`，2026-10-21）
+
+**日期**：2026-10-21　**规范版本**：CLAUDE.md **v1.6.0**（仅现状纠错，不升版本）　**关联**：`tests/evals/README.md` §6 / 5.3、审阅表 `local_data/evals/relevance-label-review.md`（本地产物，不入库）
+
+**变更摘要**：
+
+- 按 `(文件大小, 文件名)` 升序对前 60 份文档执行幂等入库（`scripts/size_asc_60.txt`）：57 份指纹一致跳过；3 份待入库文件（`0122` / `0132` / `0134`）实为 OLE2 旧 `.doc` 改名 `.docx`，RAGFlow 按扩展名选解析器报 “File is not a zip file”，全部失败且**未写入 manifest**。集合仍为 200 份文档 / 2004 条切分，manifest 199 条。
+- 21 条可答题的 `relevant_documents` 由 AI 起草并写入 `typical.jsonl`（8）/ `boundary.jsonl`（9）/ `multimodal.jsonl`（4），共 31 条；签署人 `ks` 于 2026-10-21 逐条核对后填写 `relevance_reviewed_by` / `relevance_reviewed_at`，与既有题目签署口径一致。11 条拒答/安全样例未动。
+- 语料口径更正：`gov_policy_chunks_v2` 已不是“只有 2 份多模态文档（79 行）”，而是 200 份文档 / 2004 条切分，21 份黄金集文档全部在库（`media_type`：text 1499 / table 479 / image 26；带图切分 1337）。
+- 文档同步：`tests/evals/README.md` §6 与 5.3、`README.md`、`CLAUDE.md` §2.2 改为“AI 起草、`ks` 已签署”；删去过时的“语料未就绪”。
+
+**动机**：用户授权按大小重入库前 60 份，并授权 AI 查看已入库文档后起草标签；用户核对后确认签署，签名由用户拍板。标签与签署分离，未签署标签不得进入门禁。
+
+**影响面**：
+
+- **黄金集签署前不可装载**（门禁语义，不得放宽 schema 绕过）；本轮签署完成后，`--require-relevance-labels` 通过，检索三项具备分母。
+- 检索三项已可采集；仍没有 v2 基线，须先跑全量并做引用人工抽检。
+- 3 份 OLE2 文件是源文件命名缺陷（非入库脚本），未入库；`0039` / `0040` 内容逐字相同，属语料重复，建议后续去重。
+- 无新增依赖、环境变量、目录或跨模块约定。
+
+**验证**：
+
+- 字段断言：21/21 可答题有标签、11/11 非可答题无标签、`must_hit ⊆ labels`；除 `relevant_documents` 与两个签署字段外无字段变化。
+- `uv run --group eval python -X utf8 scripts/eval_run.py --validate-only --require-reviewed --require-relevance-labels`：通过（32 条已签署、可答题 21 条、相关性标签已签署 21 条）。
+- 审阅表 21 题、31 条标签、31 条摘录全部定位成功，LF 换行。
+- **未做**：v2 全量评估、引用人工抽检、基线提升。
+
+### 未发布 · 评估方案更换（`docs(standards)` / `chore(adr)` / `feat(evaluation)`，2026-10-21）
+
+**日期**：2026-10-21　**规范版本**：CLAUDE.md **v1.6.0**　**关联**：[ADR-0006](docs/adr/0006-ragas-in-process-evaluation.md)、[ADR-0005](docs/adr/0005-cloud-qwen-judge.md)、[ADR-0003](docs/adr/0003-evaluation-framework-and-judge.md)（被 0006 部分取代）
+
+**变更摘要**：
+
+- 检索侧改为 `recall_at_k`（0.90）/ `precision_at_k`（0.60）/ `mrr`（0.75），`K = EVIDENCE_TOP_K = 8`，只对有**人工签署 `relevant_documents`** 的可答题采集；`document_precision_at_k` 为文档级诊断，仅监控。
+- 生成侧改用 **RAGAS 0.4.3 进程内判分**：`faithfulness`（0.90）、`answer_relevancy`（0.85）、`answer_correctness`（0.85）；`hallucination_rate = 1 − aggregate(faithfulness)` 仅监控。新增 `eval` 依赖组（`ragas==0.4.3`、`langchain-community>=0.3.31,<0.4`），`uv sync` 默认不安装。
+- 新增引用裁判（`citation.judge.v1`）产出 `citation_accuracy`（0.95），严格索引集合校验；配套 `scripts/eval_audit_citations.py` 每轮人工抽检至多 20 条引用，一致率 < 0.90 时该指标不得作为门禁依据。
+- 保留红线：`citation_integrity`、`tenant_isolation`、`prompt_hygiene`、`image_citation_integrity` 为 1.00，`image_evidence_hit` 为 0.90。**退役** `retrieval_hit`、`status_accuracy` 及其判分函数、`faithfulness.judge.v1` / `relevancy.judge.v1` / `relevancy.judge.v2` 提示词。
+- 产物 schema **v1 → v2**：新增相关性标签字段与签署、`CitationAudit`、`GoldenSnapshot.answerable_count` / `relevance_labeled_count`、`JudgeSnapshot` 的 RAGAS 版本 / 指标 / 嵌入型号 / 遥测关闭状态；阈值文件新增 `schema_version = 2`，监控指标写进阈值文件即报错。
+- 配置：删除 `Settings.eval_ragas_dir` 与 `.env.example` 的 `EVAL_RAGAS_DIR`（隔离脚本退役）。`RAGAS_DO_NOT_TRACK=true` 保留并由代码在导入前强制设置。
+
+**动机**：需求方给定新的指标表并明确"原来的测评不需要了"；RAGAS 须进入主流程。RAGAS 0.4.3 无条件依赖已归档的 `langchain-community`，与 NO-14 冲突，故新增 ADR-0006 登记偏离边界（eval 组隔离），并升规范至 v1.6.0（第 1 章评估行与脚注、§2.2 落地现状、§5.8 / §10.1 出域边界、§9.2 / §9.3 改写、NO-14 注）。
+
+**影响面**：
+
+- `uv.lock` 新增 `ragas` 与 `langchain-community`（传递依赖）；`openai` 由 3.31.0 降到 3.3.0（instructor 约束），属锁文件级变更，须重跑全量单测与网关集成测试。
+- **旧产物与旧基线（schema v1）新代码读入即报不可读**，只作历史；新基线须在 21 条标签签署、语料就绪、工作区干净、用户同意后重新生成。
+- **数据出域扩大**：RAGAS 会把问题、证据、答案、**参考答案**发往云端 Qwen 与云端嵌入；仅限公开演示语料。
+- 语料前置（2026-10-21 更新）：`gov_policy_chunks_v2` 已补齐至 200 份文档 / 2004 条切分，21 份黄金集文档全部在库，检索条件已具备。
+
+**验证**（2026-10-21，离线部分）：
+
+- `uv lock --check`：137 packages，锁文件一致。
+- `uv run ruff format --check`、`uv run ruff check`、`uv run mypy`（131 files）全过。
+- `uv run pytest`：**869 passed, 8 skipped**（170.71s）；RAGAS 适配器与引用裁判用 fake backend / fake `ChatModel`，不连真实服务。
+- `uv run --group eval python -X utf8 scripts/eval_run.py --validate-only --require-reviewed`：黄金集 32 条全部已签署、0 草稿；可答题 21 条、相关性标签已签署 **0 条**（预期告警，检索三项不采集）；`schema_version=2` 阈值正常载入。
+- **未做**：v2 全量真实基础设施评估与 `tests/evals/test_eval_smoke.py` 冒烟——依赖 21 条标签与语料入库（见上"影响面"）。因此没有 v2 基线，也没有新的质量分数；`scripts/eval_ragas.py` 作为对照暂时保留。
+
 ### 未发布 · 多模态黄金集签署与图片指标阈值（`test(evals)`）
 
 **日期**：2026-10-20　**规范版本**：CLAUDE.md **v1.5.1**（本次不改规范）　**关联**：[ADR-0004](docs/adr/0004-multimodal-document-evidence.md)、`tests/evals/README.md` 5.8
@@ -28,7 +85,7 @@
 
 - 门禁开始覆盖图片指标。`image_citation_integrity` 只在非 `retrieval` 层采集，`--layer retrieval` 下会显示"未采集"，按既有语义不判通过。
 - 观察期语义不变：不阻断提交，只报告。
-- **未提升基线**。`gov_policy_chunks_v2` 当前只有 2 份多模态文档（79 行），19 份文本文档仍在旧集合，32 条全量跑需先按 `media_version=3` 重入库；且 D11（拒答样例的 faithfulness 被记成测量失败）未修复，不满足 §5.6 的提升核对表。入库基线仍是 `2026-10-16-phase7-signed.json`（28 条、无图片指标），不覆盖多模态。
+- **未提升基线**。当时 `gov_policy_chunks_v2` 只有 2 份多模态文档（79 行），19 份文本文档仍在旧集合，32 条全量跑需先按 `media_version=3` 重入库（该状态已于 2026-10-21 收敛为 200 份文档 / 2004 条切分）；且 D11（拒答样例的 faithfulness 被记成测量失败）未修复，不满足 §5.6 的提升核对表。入库基线仍是 `2026-10-16-phase7-signed.json`（28 条、无图片指标），不覆盖多模态。
 
 **验证**（`eval-20261020T070508Z-23b2f4af`，4 条多模态，`--layer graph --skip-judge`）：4 条全部通过；`image_evidence_hit` / `image_citation_integrity` 均 1.0000（各 4 条）。`--validate-only --require-reviewed`：32 已签署、0 草稿。ruff / mypy / 单测全过。
 
@@ -604,6 +661,30 @@ LiteLLM 均无关；不同前向批的浮点归约顺序不同，故低位有差
 3. **追踪钩子仍未接线**。`core/tracing.build_tracing_hook` 已就绪，但 `build_graph` 未开放该注入点；与 Langfuse/OTel 一并顺延至基础设施阶段。
 
 **影响面**：新增对外 HTTP/SSE 契约（既定接口首次发布，尚无外部集成方）；新增 2 个环境变量（已同步 `.env.example`）；启动命令由 `agent_platform.main:app` 改为 `--factory agent_platform.main:create_app`。`CLAUDE.md` 本体尚未改动——按第 14 章，规则版本升级（v1.1.1 → v1.2.0）与基线表同步统一在阶段六提交（NO-20 的记账留痕见本条）。
+
+---
+
+## [v1.6.0] — 2026-10-21 — 规范升级：评估方案更换，RAGAS 进入主流程
+
+| 项 | 内容 |
+|---|---|
+| **版本** | v1.6.0（MINOR；`CLAUDE.md` 文件头版本号为准） |
+| **日期** | 2026-10-21 |
+| **变更摘要** | ① 第 1 章评估行改为「RAGAS 0.4.3（`eval` 依赖组，进程内判分）+ 自研确定性判分器」，脚注改按 ADR-0006 登记偏离；② 第 2.2 节评估落地范围更新为新指标、人工相关性标签、引用抽检与旧指标退役；③ 第 5.8 与 10.1 补充 RAGAS / 云端裁判的数据出域边界（含参考答案）；④ 第 9.2 节改写本仓评估形态（检索三项、RAGAS 三项、引用准确率、幻觉率仅监控、红线与退役指标、`StrictAnswerCorrectness` 空断言陷阱）；⑤ 第 9.3 节补充 RAGAS 适配器的覆盖率与遥测断言要求；⑥ NO-14 注改为 `eval` 依赖组的缓解形态。 |
+| **动机** | 需求方指定新指标表并要求 RAGAS 进入主流程、"原来的测评不需要了"。RAGAS 0.4.3 无条件依赖已归档的 `langchain-community`，与 NO-14 直接冲突；按第 14 章，偏离必须写进规则本身，不能只藏在 ADR 或锁文件里。 |
+| **影响面** | `CLAUDE.md` 第 1、2.2、5.8、9.2、9.3、10.1 节与 NO-14 注。判定为 **MINOR 而非 MAJOR**：检索与生成指标整体更换，但目录、依赖方向、四态语义、门禁判定链与多租户/安全策略均未改变；旧产物不可读是评估契约的版本升级（schema v2），不是平台架构破坏。ADR 新增：[ADR-0006](docs/adr/0006-ragas-in-process-evaluation.md)；ADR-0003 的隔离形态被其取代，ADR-0005 的裁判选型不变。 |
+
+**变更明细**：
+
+1. **第 1 章评估行**：RAGAS 从"隔离环境实测"改为"`eval` 依赖组、进程内判分"，并精确锁定 0.4.3。脚注明确 `langchain-community` 只作为 ragas 的传递依赖进入 `uv.lock`，`uv sync` 默认不安装、运行时不得 import、生产镜像不得包含；除该传递依赖外，NO-14 的效力不变。
+2. **第 9.2 节**：检索三项的公式与分母口径（Precision 用块级分母，文档级诊断仅监控）、RAGAS 三项的适用性与阈值兜底（期望 answered 但未答 → `answer_correctness = FAIL 0.0`；拒答题三项 N/A）、引用准确率的严格索引集合与人工抽检、幻觉率与文档级诊断不得设阈值、裁判身份与 RAGAS 版本入快照、旧产物不可比。原有四态语义、"没采够即无证据"、"测量失败不得带分数"三条原则原样保留。
+3. **第 5.8 / 10.1 节**：把"评估数据（含黄金集参考答案）经云端 Qwen 与云端嵌入出域"写进规范，仅限公开演示语料；生产须私有化裁判与嵌入，另立 ADR。
+4. **第 9.3 节**：RAGAS 适配器不得整体豁免覆盖率——`ragas_judge.py` 的适用性、错误隔离、缓存与三态语义用 fake backend 离线覆盖；遥测关闭用子进程断言，不得只在注释里声称。
+5. **第 2.2 节**：评估落地范围同步到新指标与新脚本；21 条可答题的人工 `relevant_documents` 标签明确列为**尚未具备**，待用户补齐并签署。
+
+**未做**：21 条可答题的相关性标签（用户人工步骤）；新基线（须标签齐备、语料就绪、工作区干净）；生产私有化 RAGAS 裁判与嵌入选型；旧基线迁移（不迁移，只作历史）。
+
+**关联**：[ADR-0006](docs/adr/0006-ragas-in-process-evaluation.md)；[ADR-0005](docs/adr/0005-cloud-qwen-judge.md)（云端裁判）；[ADR-0003](docs/adr/0003-evaluation-framework-and-judge.md)（被部分取代）。
 
 ---
 
