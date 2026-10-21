@@ -42,6 +42,8 @@ deploy/docker/*/volumes/
 .vscode/
 *.swp
 *.swo
+# PyCharm MCP 的端点带本机端口，换机器即失效，不入库
+.mcp.json
 
 # --- OS ---
 Thumbs.db
@@ -51,3 +53,6 @@ desktop.ini
 # --- 日志 ---
 *.log
 logs/
+草稿纸.txt
+# 演示稿二进制；文字版见 docs/introduce.md
+ragflow-demo-intro.pptx
