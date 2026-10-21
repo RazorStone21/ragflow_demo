@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,7 @@ from agent_platform.evaluation.schemas import (
     MetricResult,
     MetricVerdict,
 )
+from agent_platform.knowledge.schemas import EvidenceItem
 
 logger = get_logger(__name__)
 
@@ -161,7 +163,7 @@ class RagasJudge:
     ) -> list[MetricResult]:
         """正常作答路径：逐项判断适用性并独立执行（一项失败不拖累其他项）。"""
         metrics: list[MetricResult] = []
-        contexts = tuple(item.content for item in result.evidence)
+        contexts = _faithfulness_contexts(result.evidence)
 
         if contexts:
             request = RagasRequest(question=case.question, answer=answer, contexts=contexts)
@@ -237,6 +239,27 @@ class RagasJudge:
             )
         raws.append(_raw_section(metric, {"value": score.value, "cache_hit": False}))
         return _graded(metric, score.value, cache_hit=False)
+
+
+def _faithfulness_contexts(evidence: Sequence[EvidenceItem]) -> tuple[str, ...]:
+    """把证据还原成生成器实际看到的形态：编号 + 文档名 + 页码 + 正文。
+
+    ``answer.human.v1.jinja`` 给生成器的每条证据都带
+    ``[n] 文档：…（第 … 页）``；答案因此常以文档名或引用编号指称来源。
+    RAGAS 若只拿到 ``content``，这些**有据的**陈述会被 NLI 判成"上下文里
+    没写"——尺子与被量对象对不上，不是答案无据（D14，2026-10-21）。
+
+    编号沿用证据顺序（从 1 起），与 ``build_answer_messages`` 和引用编号
+    一致；元数据为空时仍保留同样的骨架，避免两套渲染口径悄悄分叉。
+    """
+    contexts: list[str] = []
+    for position, item in enumerate(evidence, start=1):
+        header = f"[{position}] 文档：{item.document_name}"
+        if item.page_numbers:
+            pages = "、".join(str(page) for page in item.page_numbers)
+            header += f"（第 {pages} 页）"
+        contexts.append(f"{header}\n\n{item.content}")
+    return tuple(contexts)
 
 
 def _na(name: MetricName, detail: str) -> MetricResult:

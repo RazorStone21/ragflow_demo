@@ -35,7 +35,11 @@ from agent_platform.evaluation.ragas_backend import (
     _strict_correctness_class,
     canonical_request,
 )
-from agent_platform.evaluation.ragas_judge import RagasJudge, _exception_diagnostics
+from agent_platform.evaluation.ragas_judge import (
+    RagasJudge,
+    _exception_diagnostics,
+    _faithfulness_contexts,
+)
 from agent_platform.evaluation.schemas import (
     CaseCategory,
     CaseResult,
@@ -258,6 +262,30 @@ async def test_answer_without_reference_skips_correctness(tmp_path: Path) -> Non
     ]
 
 
+def test_faithfulness_contexts_mirror_the_generator_evidence_block() -> None:
+    """上下文必须带编号、文档名与页码——只喂正文会让有据的指称被判无据（D14）。
+
+    生成器看到的是 ``[n] 文档：…（第 … 页）``（``answer.human.v1.jinja``），
+    答案里也照此指称来源；RAGAS 的 NLI 裁判缺了这些元数据，就会把
+    "某文件规定了…"判成上下文未写。编号必须从 1 起且与引用编号一致。
+    """
+    evidence = [
+        EvidenceItem(
+            chunk_id="chunk-1",
+            content="正文一",
+            score=0.9,
+            document_name=_DOC,
+            page_numbers=[2, 3],
+        ),
+        EvidenceItem(chunk_id="chunk-2", content="正文二", score=0.8),
+    ]
+
+    assert _faithfulness_contexts(evidence) == (
+        f"[1] 文档：{_DOC}（第 2、3 页）\n\n正文一",
+        "[2] 文档：\n\n正文二",
+    )
+
+
 async def test_full_answer_sends_the_right_request_shape(tmp_path: Path) -> None:
     """三项各用各的输入：faithfulness 带证据、relevancy 不带、correctness 带参考答案。
 
@@ -270,7 +298,7 @@ async def test_full_answer_sends_the_right_request_shape(tmp_path: Path) -> None
     assert requests[MetricName.FAITHFULNESS] == RagasRequest(
         question=_QUESTION,
         answer=_ANSWER,
-        contexts=("贵州燃煤发电基准价为 0.3515 元/千瓦时。",),
+        contexts=(f"[1] 文档：{_DOC}（第 2 页）\n\n贵州燃煤发电基准价为 0.3515 元/千瓦时。",),
     )
     assert requests[MetricName.ANSWER_RELEVANCY] == RagasRequest(question=_QUESTION, answer=_ANSWER)
     assert requests[MetricName.ANSWER_CORRECTNESS] == RagasRequest(
